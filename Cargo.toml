@@ -1,0 +1,30 @@
+[package]
+name = "daygleve-backend"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "DaygleVE hypervisor engine: KVM/QEMU + LXC + ZFS + networking + GPU passthrough, exposed as a versioned REST API."
+repository = "https://github.com/daygle/DaygleVE-backend"
+
+[dependencies]
+# Shared API contract. Types are imported from DaygleVE-schema — never
+# redefined here. Pinned to the architecture-setup branch for now; move to a
+# tagged release once the schema publishes one (see docs/VERSIONING.md there).
+daygleve-schema = { git = "https://github.com/daygle/DaygleVE-schema", branch = "claude/daygleve-architecture-setup-vj7ksa" }
+
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["time"] }
+futures = "0.3"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[lints.rust]
+unsafe_code = "forbid"
