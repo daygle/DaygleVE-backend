@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - name: Package binary
+        run: |
+          install -Dm755 target/release/daygleve-backend dist/daygleve-backend
+          tar -czf "daygleve-backend-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" -C dist daygleve-backend
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: daygleve-backend-*.tar.gz
+          generate_release_notes: true
