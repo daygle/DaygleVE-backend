@@ -1,9 +1,18 @@
-# DaygleVE-backend
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/daygleve-logo-dark.svg">
+    <img alt="DaygleVE" src="assets/brand/daygleve-logo.svg" width="320">
+  </picture>
+</p>
 
-The **hypervisor engine** for [DaygleVE](https://github.com/daygle) — a modern,
-single-node virtualization platform (a faster, safer, cleaner alternative to
-Proxmox). Written in Rust with [Axum](https://github.com/tokio-rs/axum) +
-[Tokio](https://tokio.rs).
+<h1 align="center">DaygleVE-backend</h1>
+
+<p align="center">
+The <strong>hypervisor engine</strong> for <a href="https://github.com/daygle">DaygleVE</a> —
+a modern, single-node virtualization platform (a faster, safer, cleaner
+alternative to Proxmox). Written in Rust with
+<a href="https://github.com/tokio-rs/axum">Axum</a> + <a href="https://tokio.rs">Tokio</a>.
+</p>
 
 ## Responsibilities
 

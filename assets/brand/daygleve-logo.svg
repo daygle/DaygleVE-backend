@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 72" width="300" height="72" role="img" aria-label="DaygleVE">
+  <defs>
+    <linearGradient id="tile2" x1="0" y1="0" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1E293B"/><stop offset="1" stop-color="#0F172A"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(6,8)">
+    <rect width="56" height="56" rx="13" fill="url(#tile2)"/>
+    <g transform="translate(28,29) scale(1.6) translate(-32,-33)"><polygon points="32.00,16.81 44.88,24.25 32.00,31.69 19.12,24.25" fill="#22D3EE" />
+  <polygon points="17.98,26.22 30.86,33.66 30.86,48.53 17.98,41.09" fill="#6366F1" />
+  <polygon points="33.14,33.66 46.02,26.22 46.02,41.09 33.14,48.53" fill="#7C3AED" /></g>
+  </g>
+  <text x="78" y="47" font-family="system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" font-size="38" font-weight="700" letter-spacing="-0.5">
+    <tspan fill="#0F172A">Daygle</tspan><tspan fill="#0891B2">VE</tspan>
+  </text>
+</svg>
