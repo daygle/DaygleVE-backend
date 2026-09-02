@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/brand/daygleve-logo-dark.svg">
-    <img alt="DaygleVE" src="assets/brand/daygleve-logo.svg" width="320">
+    <img alt="DaygleVE" src="assets/brand/daygleve-logo.svg" width="320" height="77">
   </picture>
 </p>
 
