@@ -1,6 +1,6 @@
 [package]
 name = "daygleve-backend"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "DaygleVE hypervisor engine: KVM/QEMU + LXC + ZFS + networking + GPU passthrough, exposed as a versioned REST API."
@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["time"] }
 futures = "0.3"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

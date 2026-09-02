@@ -17,6 +17,7 @@ pub mod auth;
 use axum::Router;
 use daygleve_schema::common::API_VERSION;
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
@@ -35,9 +36,20 @@ pub fn router(state: AppState) -> Router {
 
     let cors = cors_layer(&state.config.cors_origins);
 
-    Router::new()
-        .nest(&format!("/api/{API_VERSION}"), api)
-        .layer(TraceLayer::new_for_http())
+    let mut app = Router::new().nest(&format!("/api/{API_VERSION}"), api);
+
+    // On the appliance, serve the prebuilt frontend SPA for every non-API path,
+    // falling back to index.html so client-side routing works. In dev
+    // (`DAYGLEVE_WEB_ROOT` unset) this is skipped and the SvelteKit dev server
+    // serves the UI on its own port.
+    if let Some(web_root) = &state.config.web_root {
+        let index = web_root.join("index.html");
+        let serve = ServeDir::new(web_root).fallback(ServeFile::new(index));
+        app = app.fallback_service(serve);
+        tracing::info!(web_root = %web_root.display(), "serving frontend assets");
+    }
+
+    app.layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
 }

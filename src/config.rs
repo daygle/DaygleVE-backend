@@ -1,6 +1,7 @@
 //! Runtime configuration, sourced from the environment.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// Process configuration. Kept small and explicit; extend as subsystems grow.
 #[derive(Debug, Clone)]
@@ -12,6 +13,11 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     /// Default ZFS pool new datasets are created under. `DAYGLEVE_ZPOOL`.
     pub default_pool: String,
+    /// Directory of prebuilt frontend assets to serve as an SPA under `/`.
+    /// `DAYGLEVE_WEB_ROOT`. When unset (dev) only the API is served and the
+    /// SvelteKit dev server handles the UI. On the appliance this points at the
+    /// bundled frontend build (e.g. `/usr/share/daygleve/web`).
+    pub web_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -35,10 +41,16 @@ impl Config {
 
         let default_pool = std::env::var("DAYGLEVE_ZPOOL").unwrap_or_else(|_| "tank".to_string());
 
+        let web_root = std::env::var("DAYGLEVE_WEB_ROOT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         Self {
             listen_addr,
             cors_origins,
             default_pool,
+            web_root,
         }
     }
 }
