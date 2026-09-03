@@ -17,14 +17,17 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    /// Build the shared state and load persisted data (user accounts) from the
+    /// record store, seeding an initial admin on first boot.
+    pub async fn new(config: Config) -> crate::error::ApiResult<Self> {
         let config = Arc::new(config);
         let services = Arc::new(Services::new(config.clone()));
-        Self {
+        services.auth.load_or_seed().await?;
+        Ok(Self {
             config,
             services,
             started_at: Instant::now(),
-        }
+        })
     }
 
     /// Seconds since the process started.

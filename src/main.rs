@@ -33,7 +33,9 @@ async fn main() -> anyhow_lite::Result<()> {
     let config = Config::from_env();
     let addr: SocketAddr = config.listen_addr;
 
-    let state = AppState::new(config);
+    let state = AppState::new(config)
+        .await
+        .map_err(|e| anyhow_lite::err(format!("initialize state: {}", e.message())))?;
     let app = api::router(state);
 
     tracing::info!(%addr, "DaygleVE backend listening");
