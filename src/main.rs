@@ -38,6 +38,14 @@ async fn main() -> anyhow_lite::Result<()> {
         .map_err(|e| anyhow_lite::err(format!("initialize state: {}", e.message())))?;
     let app = api::router(state);
 
+    // Loudly flag a half-configured TLS setup: exactly one of cert/key set is
+    // almost always a mistake that would otherwise silently serve plaintext.
+    if config.tls_cert.is_some() != config.tls_key.is_some() {
+        tracing::error!(
+            "only one of DAYGLEVE_TLS_CERT/DAYGLEVE_TLS_KEY is set — TLS is DISABLED and the server will serve plaintext HTTP; set BOTH (or neither)"
+        );
+    }
+
     // Serve HTTPS when a certificate + key are configured, otherwise plain HTTP
     // (intended to sit behind a TLS-terminating proxy in that case).
     if let Some((cert, key)) = config.tls() {
