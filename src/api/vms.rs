@@ -12,7 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::vm::{
-    ConsoleTicket, CreateVmRequest, UpdateVmRequest, Vm, VmPowerRequest, VmSummary,
+    ConsoleTicket, CreateVmRequest, IsoImage, UpdateVmRequest, Vm, VmPowerRequest, VmSummary,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -25,6 +25,7 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/vms", get(list).post(create))
+        .route("/vms/iso-images", get(iso_images))
         .route("/vms/{id}", get(get_one).patch(update).delete(delete))
         .route("/vms/{id}/power", post(power))
         .route("/vms/{id}/console", post(console))
@@ -34,6 +35,15 @@ pub fn routes() -> Router<AppState> {
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<VmSummary>>> {
     user.require(Permission::VmRead)?;
     Ok(Json(state.services.kvm.list().await?))
+}
+
+/// Installer/live ISOs available to attach as VM install media.
+async fn iso_images(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<IsoImage>>> {
+    user.require(Permission::VmRead)?;
+    Ok(Json(state.services.kvm.list_isos().await?))
 }
 
 async fn create(

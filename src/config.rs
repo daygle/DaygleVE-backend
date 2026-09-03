@@ -21,6 +21,9 @@ pub struct Config {
     /// Directory for DaygleVE's own persistent state (VM/container/bridge
     /// records). `DAYGLEVE_STATE_DIR`, default `/var/lib/daygleve`.
     pub state_dir: PathBuf,
+    /// Directory holding installer/live ISO images offered as VM install media.
+    /// `DAYGLEVE_ISO_DIR`, default `<state_dir>/isos`.
+    pub iso_dir: PathBuf,
     /// Lifetime of an issued bearer token, in seconds. `DAYGLEVE_TOKEN_TTL_SECS`,
     /// default 12 hours.
     pub token_ttl_secs: u64,
@@ -61,6 +64,12 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/lib/daygleve"));
 
+        let iso_dir = std::env::var("DAYGLEVE_ISO_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("isos"));
+
         let token_ttl_secs = std::env::var("DAYGLEVE_TOKEN_TTL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -75,6 +84,7 @@ impl Config {
             default_pool,
             web_root,
             state_dir,
+            iso_dir,
             token_ttl_secs,
             admin_password,
         }

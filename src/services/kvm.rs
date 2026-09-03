@@ -17,8 +17,8 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use daygleve_schema::vm::{
-    ConsoleTicket, CreateVmRequest, DiskBus, Firmware, NicModel, UpdateVmRequest, Vm, VmDisk,
-    VmNic, VmPowerAction, VmState, VmSummary,
+    ConsoleTicket, CreateVmRequest, DiskBus, Firmware, IsoImage, NicModel, UpdateVmRequest, Vm,
+    VmDisk, VmNic, VmPowerAction, VmState, VmSummary,
 };
 
 use crate::config::Config;
@@ -80,6 +80,13 @@ impl KvmService {
             return Err(AppError::validation("memory_mib must be >= 1"));
         }
 
+        // Validate any requested install ISO against the node's library before
+        // it reaches libvirt (prevents pointing a VM at an arbitrary host file).
+        let cdrom = match req.cdrom {
+            Some(path) => Some(self.resolve_iso(&path).await?),
+            None => None,
+        };
+
         // Provision a zvol for each disk that names a size (best-effort: an
         // existing dataset is reused).
         for disk in &req.disks {
@@ -96,6 +103,7 @@ impl KvmService {
             disks: req.disks,
             nics: req.nics,
             gpus: req.gpus,
+            cdrom,
             description: req.description,
             created_at: now_ts(),
             updated_at: None,
@@ -135,6 +143,13 @@ impl KvmService {
         }
         if req.description.is_some() {
             vm.description = req.description;
+        }
+        // Eject takes precedence over attach; otherwise a provided cdrom path is
+        // validated against the ISO library and attached/replaced.
+        if req.eject_cdrom {
+            vm.cdrom = None;
+        } else if let Some(path) = req.cdrom {
+            vm.cdrom = Some(self.resolve_iso(&path).await?);
         }
 
         // A rename must happen before the redefine (libvirt keys the domain by
@@ -294,6 +309,83 @@ impl KvmService {
         command::run_ok("zfs", &["create", "-V", &size, &disk.dataset]).await
     }
 
+    /// Enumerate the installer/live ISOs available in the node's ISO library
+    /// (`config.iso_dir`, non-recursive). A missing directory yields an empty
+    /// list rather than an error, so a fresh node simply shows "no ISOs yet".
+    pub async fn list_isos(&self) -> ApiResult<Vec<IsoImage>> {
+        let mut dir = match tokio::fs::read_dir(&self.config.iso_dir).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(AppError::internal(format!(
+                    "cannot read ISO directory: {e}"
+                )))
+            }
+        };
+
+        let mut isos = Vec::new();
+        while let Some(entry) = dir
+            .next_entry()
+            .await
+            .map_err(|e| AppError::internal(format!("cannot list ISO directory: {e}")))?
+        {
+            let path = entry.path();
+            let is_iso = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("iso"));
+            if !is_iso {
+                continue;
+            }
+            // Only surface *regular files that live directly in the library*.
+            // Use the entry's own type (which does NOT follow symlinks) and
+            // reject anything that isn't a plain file, so a symlink planted in
+            // the directory can't point a VM at an arbitrary host file.
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let meta = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            isos.push(IsoImage {
+                name,
+                path: path.to_string_lossy().into_owned(),
+                size_bytes: meta.len(),
+            });
+        }
+        isos.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(isos)
+    }
+
+    /// Validate a requested install-media path: it must be one of the ISOs the
+    /// node actually offers. Returning the enumerated path (never the raw input)
+    /// keeps a VM from being pointed at an arbitrary host file.
+    async fn resolve_iso(&self, requested: &str) -> ApiResult<String> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return Err(AppError::validation("cdrom must not be empty"));
+        }
+        self.list_isos()
+            .await?
+            .into_iter()
+            .find(|iso| iso.path == requested)
+            .map(|iso| iso.path)
+            .ok_or_else(|| {
+                AppError::validation(
+                    "cdrom is not an available ISO image (see GET /vms/iso-images)",
+                )
+            })
+    }
+
     async fn virsh(&self, args: &[&str]) -> ApiResult<String> {
         let mut full = vec!["-c", CONNECT];
         full.extend_from_slice(args);
@@ -342,23 +434,37 @@ fn parse_vnc_display(display: &str) -> Option<String> {
 
 /// Render libvirt domain XML for a VM.
 fn domain_xml(vm: &Vm) -> String {
+    // When an install ISO is attached, boot order is expressed per-device
+    // (`<boot order=…>` on the cdrom and first disk) so the CD-ROM comes first;
+    // this is mutually exclusive with the `<os><boot dev=…></os>` form, so the
+    // os block only carries a fixed boot device when no CD-ROM is present.
+    let has_cdrom = vm.cdrom.is_some();
+    let os_boot = if has_cdrom {
+        "<bootmenu enable='yes'/>"
+    } else {
+        "<boot dev='hd'/>"
+    };
     let os = match vm.firmware {
-        Firmware::Uefi => {
-            "<os firmware='efi'>\n    <type arch='x86_64' machine='q35'>hvm</type>\n    <boot dev='hd'/>\n  </os>"
-                .to_string()
-        }
-        Firmware::Bios => {
-            "<os>\n    <type arch='x86_64' machine='q35'>hvm</type>\n    <boot dev='hd'/>\n  </os>"
-                .to_string()
-        }
+        Firmware::Uefi => format!(
+            "<os firmware='efi'>\n    <type arch='x86_64' machine='q35'>hvm</type>\n    {os_boot}\n  </os>"
+        ),
+        Firmware::Bios => format!(
+            "<os>\n    <type arch='x86_64' machine='q35'>hvm</type>\n    {os_boot}\n  </os>"
+        ),
     };
 
+    // The first disk gets boot priority 2 (after the CD-ROM at 1) when
+    // installing; otherwise no explicit per-device order.
     let disks: String = vm
         .disks
         .iter()
         .enumerate()
-        .map(|(i, d)| disk_xml(i, d))
+        .map(|(i, d)| {
+            let boot = if has_cdrom && i == 0 { Some(2) } else { None };
+            disk_xml(i, d, boot)
+        })
         .collect();
+    let cdrom: String = vm.cdrom.as_deref().map(cdrom_xml).unwrap_or_default();
     let nics: String = vm.nics.iter().map(nic_xml).collect();
     let hostdevs: String = vm
         .gpus
@@ -389,7 +495,7 @@ fn domain_xml(vm: &Vm) -> String {
         <on_crash>destroy</on_crash>\n  \
         <devices>\n    \
         <emulator>/usr/bin/qemu-system-x86_64</emulator>\n\
-        {disks}{nics}{hostdevs}    \
+        {disks}{cdrom}{nics}{hostdevs}    \
         <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>\n    \
         <video><model type='virtio' heads='1'/></video>\n    \
         <memballoon model='virtio'/>\n    \
@@ -403,20 +509,42 @@ fn domain_xml(vm: &Vm) -> String {
         vcpus = vm.vcpus,
         os = os,
         disks = disks,
+        cdrom = cdrom,
         nics = nics,
         hostdevs = hostdevs,
     )
 }
 
-fn disk_xml(index: usize, disk: &VmDisk) -> String {
+fn disk_xml(index: usize, disk: &VmDisk, boot_order: Option<u32>) -> String {
     let (target, bus) = disk_target(disk.bus, index);
+    let boot = boot_order
+        .map(|o| format!("      <boot order='{o}'/>\n"))
+        .unwrap_or_default();
     format!(
         "    <disk type='block' device='disk'>\n      \
         <driver name='qemu' type='raw' cache='none' io='native'/>\n      \
         <source dev='/dev/zvol/{dataset}'/>\n      \
-        <target dev='{target}' bus='{bus}'/>\n    \
+        <target dev='{target}' bus='{bus}'/>\n\
+        {boot}    \
         </disk>\n",
         dataset = xml_escape(&disk.dataset),
+    )
+}
+
+/// A virtual CD-ROM holding an install ISO. Boots first (`<boot order='1'/>`)
+/// so a guest OS can be installed onto the (empty) primary disk. Uses a
+/// two-letter SATA target (`sdaa`) that sits outside the single-letter scheme
+/// data disks use (`sda`..`sdz`), so it can never collide with a data disk.
+fn cdrom_xml(iso_path: &str) -> String {
+    format!(
+        "    <disk type='file' device='cdrom'>\n      \
+        <driver name='qemu' type='raw'/>\n      \
+        <source file='{iso}'/>\n      \
+        <target dev='sdaa' bus='sata'/>\n      \
+        <readonly/>\n      \
+        <boot order='1'/>\n    \
+        </disk>\n",
+        iso = xml_escape(iso_path),
     )
 }
 
@@ -473,4 +601,81 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_vm() -> Vm {
+        Vm {
+            id: new_id(),
+            name: "web01".to_string(),
+            state: VmState::Stopped,
+            vcpus: 2,
+            memory_mib: 2048,
+            firmware: Firmware::Uefi,
+            disks: vec![VmDisk {
+                dataset: "tank/vms/web01-disk0".to_string(),
+                size_gib: 20,
+                bus: DiskBus::Virtio,
+            }],
+            nics: vec![],
+            gpus: vec![],
+            cdrom: None,
+            description: None,
+            created_at: now_ts(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn domain_xml_without_cdrom_boots_from_disk() {
+        let xml = domain_xml(&sample_vm());
+        assert!(xml.contains("<boot dev='hd'/>"), "should boot from disk");
+        assert!(!xml.contains("device='cdrom'"), "no cdrom device");
+        assert!(!xml.contains("<boot order="), "no per-device boot order");
+    }
+
+    #[test]
+    fn domain_xml_with_cdrom_boots_from_media_then_disk() {
+        let mut vm = sample_vm();
+        vm.cdrom = Some("/var/lib/daygleve/isos/debian.iso".to_string());
+        let xml = domain_xml(&vm);
+
+        // Per-device boot order replaces the fixed <os><boot dev=…>.
+        assert!(!xml.contains("<boot dev='hd'/>"));
+        assert!(xml.contains("<bootmenu enable='yes'/>"));
+
+        // The CD-ROM is present, read-only, and first in the boot order.
+        assert!(xml.contains("device='cdrom'"));
+        assert!(xml.contains("<source file='/var/lib/daygleve/isos/debian.iso'/>"));
+        assert!(xml.contains("<readonly/>"));
+        // The CD-ROM target sits outside the single-letter data-disk scheme.
+        assert!(xml.contains("<target dev='sdaa' bus='sata'/>"));
+        assert!(xml.contains("<boot order='1'/>"), "cdrom boots first");
+        // The primary disk boots second.
+        assert!(xml.contains("<boot order='2'/>"), "disk boots second");
+    }
+
+    #[test]
+    fn domain_xml_bios_firmware_boot_paths() {
+        // BIOS without media: legacy <os> block boots from disk.
+        let mut vm = sample_vm();
+        vm.firmware = Firmware::Bios;
+        let xml = domain_xml(&vm);
+        assert!(xml.contains("<os>\n"), "BIOS uses the plain <os> block");
+        assert!(!xml.contains("firmware='efi'"), "BIOS is not EFI");
+        assert!(xml.contains("<boot dev='hd'/>"), "BIOS boots from disk");
+
+        // BIOS with media: switches to the boot menu + per-device order.
+        vm.cdrom = Some("/var/lib/daygleve/isos/debian.iso".to_string());
+        let xml = domain_xml(&vm);
+        assert!(!xml.contains("firmware='efi'"), "still BIOS");
+        assert!(!xml.contains("<boot dev='hd'/>"));
+        assert!(xml.contains("<bootmenu enable='yes'/>"));
+        assert!(xml.contains("device='cdrom'"));
+        assert!(xml.contains("<boot order='1'/>"));
+        assert!(xml.contains("<boot order='2'/>"));
+    }
 }
