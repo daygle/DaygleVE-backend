@@ -33,19 +33,33 @@ async fn main() -> anyhow_lite::Result<()> {
     let config = Config::from_env();
     let addr: SocketAddr = config.listen_addr;
 
-    let state = AppState::new(config)
+    let state = AppState::new(config.clone())
         .await
         .map_err(|e| anyhow_lite::err(format!("initialize state: {}", e.message())))?;
     let app = api::router(state);
 
-    tracing::info!(%addr, "DaygleVE backend listening");
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow_lite::err(format!("bind {addr}: {e}")))?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow_lite::err(format!("serve: {e}")))?;
+    // Serve HTTPS when a certificate + key are configured, otherwise plain HTTP
+    // (intended to sit behind a TLS-terminating proxy in that case).
+    if let Some((cert, key)) = config.tls() {
+        // rustls 0.23 needs an explicit process-level crypto provider.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .map_err(|e| anyhow_lite::err(format!("load TLS cert/key: {e}")))?;
+        tracing::info!(%addr, "DaygleVE backend listening (HTTPS)");
+        axum_server::bind_rustls(addr, tls)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| anyhow_lite::err(format!("serve https: {e}")))?;
+    } else {
+        tracing::warn!(%addr, "DaygleVE backend listening (HTTP; set DAYGLEVE_TLS_CERT/DAYGLEVE_TLS_KEY or front with a TLS proxy)");
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow_lite::err(format!("bind {addr}: {e}")))?;
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| anyhow_lite::err(format!("serve: {e}")))?;
+    }
 
     Ok(())
 }
