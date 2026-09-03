@@ -57,7 +57,11 @@ impl Services {
 /// forbids the empty string, `.` and `..`. This is the sanitizer guarding every
 /// user-influenced path in the service layer (VM/container tmp files, the JSON
 /// record store, LXC config paths).
-pub(crate) fn ensure_safe_id(id: &str) -> crate::error::ApiResult<()> {
+///
+/// On success it **returns the validated id**, so callers build paths from the
+/// sanitizer's output rather than the raw input — making the barrier explicit
+/// to both readers and static analysis (breaks path-injection taint).
+pub(crate) fn ensure_safe_id(id: &str) -> crate::error::ApiResult<&str> {
     let safe = !id.is_empty()
         && id != "."
         && id != ".."
@@ -67,7 +71,7 @@ pub(crate) fn ensure_safe_id(id: &str) -> crate::error::ApiResult<()> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
     if safe {
-        Ok(())
+        Ok(id)
     } else {
         Err(crate::error::AppError::validation(format!(
             "invalid identifier: {id:?}"
