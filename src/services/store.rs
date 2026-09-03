@@ -29,11 +29,11 @@ impl JsonStore {
         }
     }
 
-    fn path_for(&self, id: &str) -> PathBuf {
-        // ids are backend-minted UUIDs or validated names; still, refuse any id
-        // that could escape the store directory.
-        self.dir
-            .join(format!("{}.json", id.replace(['/', '\\'], "_")))
+    /// Build the record path for `id`, refusing any id that could escape the
+    /// store directory (allowlist-validated via [`ensure_safe_id`]).
+    fn path_for(&self, id: &str) -> ApiResult<PathBuf> {
+        crate::services::ensure_safe_id(id)?;
+        Ok(self.dir.join(format!("{id}.json")))
     }
 
     async fn ensure_dir(&self) -> ApiResult<()> {
@@ -45,7 +45,7 @@ impl JsonStore {
     /// Write (or overwrite) the record for `id`.
     pub async fn put<T: Serialize>(&self, id: &str, value: &T) -> ApiResult<()> {
         self.ensure_dir().await?;
-        let path = self.path_for(id);
+        let path = self.path_for(id)?;
         let bytes = serde_json::to_vec_pretty(value)
             .map_err(|e| AppError::internal(format!("serialize record: {e}")))?;
         fs::write(&path, bytes)
@@ -55,7 +55,7 @@ impl JsonStore {
 
     /// Read the record for `id`, or `None` if it does not exist.
     pub async fn get<T: DeserializeOwned>(&self, id: &str) -> ApiResult<Option<T>> {
-        let path = self.path_for(id);
+        let path = self.path_for(id)?;
         match fs::read(&path).await {
             Ok(bytes) => {
                 let value = serde_json::from_slice(&bytes)
@@ -69,7 +69,7 @@ impl JsonStore {
 
     /// Remove the record for `id`; returns whether a record existed.
     pub async fn delete(&self, id: &str) -> ApiResult<bool> {
-        let path = self.path_for(id);
+        let path = self.path_for(id)?;
         match fs::remove_file(&path).await {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -98,10 +98,19 @@ impl JsonStore {
             .await
             .map_err(|e| AppError::internal(format!("read_dir entry: {e}")))?
         {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            let entry_path = entry.path();
+            if entry_path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            // Only read files whose stem is a valid id, and read them through
+            // the sanitized path builder rather than the raw dir entry.
+            let Some(stem) = entry_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let path = match self.path_for(stem) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
             let bytes = fs::read(&path)
                 .await
                 .map_err(|e| AppError::internal(format!("read {}: {e}", path.display())))?;

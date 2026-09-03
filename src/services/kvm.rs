@@ -71,6 +71,8 @@ impl KvmService {
         if req.name.trim().is_empty() {
             return Err(AppError::validation("name must not be empty"));
         }
+        // The name becomes the libvirt domain name; keep it path/shell-safe.
+        crate::services::ensure_safe_id(&req.name)?;
         if req.vcpus == 0 {
             return Err(AppError::validation("vcpus must be >= 1"));
         }
@@ -241,6 +243,8 @@ impl KvmService {
 
     /// Write the domain XML and (re)define it in libvirt.
     async fn define(&self, vm: &Vm) -> ApiResult<()> {
+        // vm.id is a backend-minted UUID, but validate before it reaches a path.
+        crate::services::ensure_safe_id(&vm.id)?;
         let xml = domain_xml(vm);
         let dir = self.config.state_dir.join("tmp");
         tokio::fs::create_dir_all(&dir)

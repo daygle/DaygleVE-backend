@@ -46,6 +46,27 @@ impl Services {
     }
 }
 
+/// Reject any id/name that could escape or traverse a filesystem path before
+/// it is used to build one. Allows ASCII alphanumerics plus `.`, `-`, `_`;
+/// forbids the empty string, `.` and `..`. This is the sanitizer guarding every
+/// user-influenced path in the service layer (VM/container tmp files, the JSON
+/// record store, LXC config paths).
+pub(crate) fn ensure_safe_id(id: &str) -> crate::error::ApiResult<()> {
+    let safe = !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if safe {
+        Ok(())
+    } else {
+        Err(crate::error::AppError::validation(format!(
+            "invalid identifier: {id:?}"
+        )))
+    }
+}
+
 /// Current time as the schema's RFC-3339 string alias.
 pub(crate) fn now_ts() -> daygleve_schema::common::Timestamp {
     chrono::Utc::now().to_rfc3339()

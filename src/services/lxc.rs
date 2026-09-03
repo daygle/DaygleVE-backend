@@ -54,6 +54,8 @@ impl LxcService {
         if req.name.trim().is_empty() {
             return Err(AppError::validation("name must not be empty"));
         }
+        // The name becomes the container name and its config path; keep it safe.
+        crate::services::ensure_safe_id(&req.name)?;
         if req.vcpus == 0 {
             return Err(AppError::validation("vcpus must be >= 1"));
         }
