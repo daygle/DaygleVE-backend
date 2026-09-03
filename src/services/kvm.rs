@@ -155,7 +155,10 @@ impl KvmService {
         let hardware_change = req.firmware.is_some() || req.disks.is_some() || req.nics.is_some();
         if hardware_change {
             let state = self.live_state(&vm.id).await.unwrap_or(vm.state);
-            if state == VmState::Running {
+            // Any non-stopped domain (running, paused, mid-transition, or errored)
+            // has live hardware libvirt will not let us redefine, so require a
+            // fully stopped VM rather than only excluding `Running`.
+            if state != VmState::Stopped {
                 return Err(AppError::conflict(
                     "stop the VM before changing its firmware, disks or NICs",
                 ));
@@ -168,8 +171,10 @@ impl KvmService {
             vm.nics = nics;
         }
         if let Some(disks) = req.disks {
-            // Provision a zvol for any newly-added disk (an existing dataset is
-            // reused; removing a disk from the set never destroys its data).
+            // `ensure_zvol` is idempotent: it reuses a dataset that already exists
+            // and only creates a zvol for a genuinely new disk, so calling it for
+            // every disk in the set provisions the additions and leaves existing
+            // disks untouched. Removing a disk from the set never destroys its data.
             for disk in &disks {
                 self.ensure_zvol(disk).await?;
             }
