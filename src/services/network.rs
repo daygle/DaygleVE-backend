@@ -95,21 +95,13 @@ impl NetworkService {
         }
         command::run_ok("ip", &add).await?;
 
-        // Enslave ports and bring them up (explicit `dev` so a leading-dash
-        // name can't be read as an option).
-        for port in &req.ports {
-            command::run_ok("ip", &["link", "set", "dev", port, "master", &req.name]).await?;
-            command::run_ok("ip", &["link", "set", "dev", port, "up"]).await?;
+        // Configure the bridge (ports, MTU, address, up). On ANY failure after
+        // the device was created, roll it back so the host keeps no orphan
+        // bridge without a matching DaygleVE record.
+        if let Err(e) = self.configure_bridge(&req).await {
+            let _ = command::run_optional("ip", &["link", "del", "dev", &req.name]).await;
+            return Err(e);
         }
-
-        if let Some(mtu) = req.mtu {
-            let mtu = mtu.to_string();
-            command::run_ok("ip", &["link", "set", "dev", &req.name, "mtu", &mtu]).await?;
-        }
-        if let Some(addr) = &req.address {
-            command::run_ok("ip", &["addr", "add", addr, "dev", &req.name]).await?;
-        }
-        command::run_ok("ip", &["link", "set", "dev", &req.name, "up"]).await?;
 
         let bridge = Bridge {
             id: req.name.clone(),
@@ -121,13 +113,29 @@ impl NetworkService {
             mtu: req.mtu.unwrap_or(1500),
             created_at: now_ts(),
         };
-        // If persisting the record fails, the bridge already exists on the host
-        // — roll it back so DaygleVE state and the host don't diverge.
+        // Same rollback if persisting the record fails.
         if let Err(e) = self.bridges.put(&bridge.name, &bridge).await {
             let _ = command::run_optional("ip", &["link", "del", "dev", &bridge.name]).await;
             return Err(e);
         }
         Ok(bridge)
+    }
+
+    /// Enslave ports and apply MTU/address, then bring the bridge up. Explicit
+    /// `dev` keywords keep a leading-dash name from being read as an option.
+    async fn configure_bridge(&self, req: &CreateBridgeRequest) -> ApiResult<()> {
+        for port in &req.ports {
+            command::run_ok("ip", &["link", "set", "dev", port, "master", &req.name]).await?;
+            command::run_ok("ip", &["link", "set", "dev", port, "up"]).await?;
+        }
+        if let Some(mtu) = req.mtu {
+            let mtu = mtu.to_string();
+            command::run_ok("ip", &["link", "set", "dev", &req.name, "mtu", &mtu]).await?;
+        }
+        if let Some(addr) = &req.address {
+            command::run_ok("ip", &["addr", "add", addr, "dev", &req.name]).await?;
+        }
+        command::run_ok("ip", &["link", "set", "dev", &req.name, "up"]).await
     }
 
     pub async fn list_vlans(&self) -> ApiResult<Vec<Vlan>> {
@@ -154,7 +162,16 @@ impl NetworkService {
             tag: req.tag,
             name: req.name,
         };
-        self.vlans.put(&vlan.id, &vlan).await?;
+        // Roll the host VLAN back if we can't persist its record, so the
+        // configured VLAN and DaygleVE state don't diverge.
+        if let Err(e) = self.vlans.put(&vlan.id, &vlan).await {
+            let _ = command::run_optional(
+                "bridge",
+                &["vlan", "del", "vid", &tag, "dev", &vlan.bridge, "self"],
+            )
+            .await;
+            return Err(e);
+        }
         Ok(vlan)
     }
 

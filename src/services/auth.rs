@@ -92,8 +92,10 @@ impl AuthService {
         let user = {
             let mut users = self.users.write().expect("user lock");
             let stored = users
+                // A concurrent deletion between verify and here: keep the same
+                // "invalid credentials" message (don't hint at the race).
                 .get_mut(&user_id)
-                .ok_or_else(|| AppError::unauthorized("unknown user"))?;
+                .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
             stored.user.last_login_at = Some(now.to_rfc3339());
             stored.user.clone()
         };
