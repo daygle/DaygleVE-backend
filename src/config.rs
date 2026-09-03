@@ -31,9 +31,10 @@ pub struct Config {
     /// Lifetime of an issued bearer token, in seconds. `DAYGLEVE_TOKEN_TTL_SECS`,
     /// default 12 hours.
     pub token_ttl_secs: u64,
-    /// Password for the seeded `admin` account. `DAYGLEVE_ADMIN_PASSWORD`,
-    /// default `daygleve` (a warning is logged until it is overridden).
-    pub admin_password: String,
+    /// Password for the seeded `admin` account, from `DAYGLEVE_ADMIN_PASSWORD`.
+    /// When unset, the backend generates a random initial password on first
+    /// boot (there is deliberately no built-in default password).
+    pub admin_password: Option<String>,
 }
 
 impl Config {
@@ -85,8 +86,9 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(12 * 60 * 60);
 
-        let admin_password =
-            std::env::var("DAYGLEVE_ADMIN_PASSWORD").unwrap_or_else(|_| "daygleve".to_string());
+        let admin_password = std::env::var("DAYGLEVE_ADMIN_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         Self {
             listen_addr,

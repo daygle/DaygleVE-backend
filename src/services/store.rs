@@ -33,7 +33,9 @@ impl JsonStore {
     /// Build the record path for `id`, refusing any id that could escape the
     /// store directory (allowlist-validated via [`ensure_safe_id`]).
     fn path_for(&self, id: &str) -> ApiResult<PathBuf> {
-        crate::services::ensure_safe_id(id)?;
+        // Build the filename from the *sanitizer's returned value*, never the
+        // raw input, so the traversal barrier is explicit to static analysis.
+        let id = crate::services::ensure_safe_id(id)?;
         // Defence in depth: the record must be a single filename component, so
         // reject anything the OS would read as a nested path or traversal.
         let file = format!("{id}.json");

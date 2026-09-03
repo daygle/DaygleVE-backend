@@ -10,6 +10,7 @@ mod health;
 mod metrics;
 mod network;
 mod storage;
+mod users;
 mod vms;
 
 pub mod auth;
@@ -27,6 +28,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .merge(health::routes())
         .merge(auth::routes())
+        .merge(users::routes())
         .merge(vms::routes())
         .merge(containers::routes())
         .merge(storage::routes())
