@@ -82,6 +82,12 @@ impl NetworkService {
         // `ip` and then fail to persist its record (the name is also its id).
         crate::services::ensure_safe_id(&req.name)?;
 
+        // Validate every port name before any host change so a name that could
+        // be misparsed as an `ip` flag is rejected up front.
+        for port in &req.ports {
+            crate::services::ensure_safe_id(port)?;
+        }
+
         // Create the bridge device (optionally VLAN-aware).
         let mut add = vec!["link", "add", "name", &req.name, "type", "bridge"];
         if req.vlan_aware {
@@ -89,20 +95,21 @@ impl NetworkService {
         }
         command::run_ok("ip", &add).await?;
 
-        // Enslave ports and bring them up.
+        // Enslave ports and bring them up (explicit `dev` so a leading-dash
+        // name can't be read as an option).
         for port in &req.ports {
-            command::run_ok("ip", &["link", "set", port, "master", &req.name]).await?;
-            command::run_ok("ip", &["link", "set", port, "up"]).await?;
+            command::run_ok("ip", &["link", "set", "dev", port, "master", &req.name]).await?;
+            command::run_ok("ip", &["link", "set", "dev", port, "up"]).await?;
         }
 
         if let Some(mtu) = req.mtu {
             let mtu = mtu.to_string();
-            command::run_ok("ip", &["link", "set", &req.name, "mtu", &mtu]).await?;
+            command::run_ok("ip", &["link", "set", "dev", &req.name, "mtu", &mtu]).await?;
         }
         if let Some(addr) = &req.address {
             command::run_ok("ip", &["addr", "add", addr, "dev", &req.name]).await?;
         }
-        command::run_ok("ip", &["link", "set", &req.name, "up"]).await?;
+        command::run_ok("ip", &["link", "set", "dev", &req.name, "up"]).await?;
 
         let bridge = Bridge {
             id: req.name.clone(),
@@ -114,7 +121,12 @@ impl NetworkService {
             mtu: req.mtu.unwrap_or(1500),
             created_at: now_ts(),
         };
-        self.bridges.put(&bridge.name, &bridge).await?;
+        // If persisting the record fails, the bridge already exists on the host
+        // — roll it back so DaygleVE state and the host don't diverge.
+        if let Err(e) = self.bridges.put(&bridge.name, &bridge).await {
+            let _ = command::run_optional("ip", &["link", "del", "dev", &bridge.name]).await;
+            return Err(e);
+        }
         Ok(bridge)
     }
 
@@ -126,6 +138,8 @@ impl NetworkService {
         if !(1..=4094).contains(&req.tag) {
             return Err(AppError::validation("vlan tag must be in 1..=4094"));
         }
+        // The bridge name goes to the `bridge` CLI; reject flag-like values.
+        crate::services::ensure_safe_id(&req.bridge)?;
         let tag = req.tag.to_string();
         // Register the VLAN on the (VLAN-aware) bridge itself.
         command::run_ok(

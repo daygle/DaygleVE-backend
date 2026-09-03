@@ -19,14 +19,16 @@ const SAMPLE_WINDOW: Duration = Duration::from_millis(200);
 
 pub struct MetricsService {
     /// The last sample and when it was taken, shared so concurrent SSE streams
-    /// reuse one sampling pass instead of each paying the ~200ms window.
-    cache: std::sync::Mutex<Option<(Instant, NodeMetrics)>>,
+    /// reuse one sampling pass instead of each paying the ~200ms window. An
+    /// async mutex is held across the refresh so only one sampler runs at a
+    /// time (no thundering herd of concurrent samples).
+    cache: tokio::sync::Mutex<Option<(Instant, NodeMetrics)>>,
 }
 
 impl MetricsService {
     pub fn new() -> Self {
         Self {
-            cache: std::sync::Mutex::new(None),
+            cache: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -34,13 +36,17 @@ impl MetricsService {
     /// connected dashboards share one sampling pass per interval rather than N.
     pub async fn node(&self) -> NodeMetrics {
         const CACHE_TTL: Duration = Duration::from_millis(1500);
-        if let Some((at, sample)) = self.cache.lock().unwrap().as_ref() {
+        // Hold the lock across the refresh: a caller that arrives mid-sample
+        // waits, then finds the just-written fresh sample instead of starting
+        // its own.
+        let mut guard = self.cache.lock().await;
+        if let Some((at, sample)) = guard.as_ref() {
             if at.elapsed() < CACHE_TTL {
                 return sample.clone();
             }
         }
         let sample = self.sample_now().await;
-        *self.cache.lock().unwrap() = Some((Instant::now(), sample.clone()));
+        *guard = Some((Instant::now(), sample.clone()));
         sample
     }
 
