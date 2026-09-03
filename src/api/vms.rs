@@ -121,7 +121,12 @@ async fn console_ws(
 async fn proxy_vnc(socket: WebSocket, addr: String) {
     let tcp = match tokio::net::TcpStream::connect(&addr).await {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => {
+            // Close the browser socket cleanly instead of leaving it hanging.
+            let mut socket = socket;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
     };
     let (mut tcp_rd, mut tcp_wr) = tcp.into_split();
     let (mut ws_tx, mut ws_rx) = socket.split();

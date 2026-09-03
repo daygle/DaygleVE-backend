@@ -55,6 +55,8 @@ pub(crate) fn ensure_safe_id(id: &str) -> crate::error::ApiResult<()> {
     let safe = !id.is_empty()
         && id != "."
         && id != ".."
+        // A leading '-' could be parsed as a flag by host CLIs (zfs/virsh/ip).
+        && !id.starts_with('-')
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));

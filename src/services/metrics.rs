@@ -17,15 +17,35 @@ use crate::services::now_ts;
 /// Delta window for rate calculations.
 const SAMPLE_WINDOW: Duration = Duration::from_millis(200);
 
-pub struct MetricsService;
+pub struct MetricsService {
+    /// The last sample and when it was taken, shared so concurrent SSE streams
+    /// reuse one sampling pass instead of each paying the ~200ms window.
+    cache: std::sync::Mutex<Option<(Instant, NodeMetrics)>>,
+}
 
 impl MetricsService {
     pub fn new() -> Self {
-        Self
+        Self {
+            cache: std::sync::Mutex::new(None),
+        }
     }
 
-    /// Current node metrics snapshot (takes ~200ms for the rate window).
+    /// Current node metrics. A sample newer than `CACHE_TTL` is reused, so N
+    /// connected dashboards share one sampling pass per interval rather than N.
     pub async fn node(&self) -> NodeMetrics {
+        const CACHE_TTL: Duration = Duration::from_millis(1500);
+        if let Some((at, sample)) = self.cache.lock().unwrap().as_ref() {
+            if at.elapsed() < CACHE_TTL {
+                return sample.clone();
+            }
+        }
+        let sample = self.sample_now().await;
+        *self.cache.lock().unwrap() = Some((Instant::now(), sample.clone()));
+        sample
+    }
+
+    /// Take a fresh node sample (~200ms rate window).
+    async fn sample_now(&self) -> NodeMetrics {
         let disks = whole_disks().await;
 
         let a = Sample::take(&disks).await;

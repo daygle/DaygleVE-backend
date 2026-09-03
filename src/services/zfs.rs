@@ -71,9 +71,7 @@ impl ZfsService {
     }
 
     pub async fn create_dataset(&self, req: CreateDatasetRequest) -> ApiResult<Dataset> {
-        if req.name.trim().is_empty() {
-            return Err(AppError::validation("dataset name must not be empty"));
-        }
+        ensure_zfs_ref(&req.name)?;
         if matches!(req.kind, DatasetKind::Volume) && req.size_gib.is_none() {
             return Err(AppError::validation("size_gib is required for volumes"));
         }
@@ -96,6 +94,9 @@ impl ZfsService {
     }
 
     pub async fn list_snapshots(&self, dataset_id: &str) -> ApiResult<Vec<Snapshot>> {
+        ensure_zfs_ref(dataset_id)?;
+        // No `-r`: we only want this dataset's own snapshots, so recursing into
+        // descendants and filtering them back out is wasted work on large trees.
         let out = match command::run_optional(
             "zfs",
             &[
@@ -105,7 +106,6 @@ impl ZfsService {
                 "-Hp",
                 "-o",
                 "name,used,creation",
-                "-r",
                 dataset_id,
             ],
         )
@@ -129,6 +129,7 @@ impl ZfsService {
         dataset_id: &str,
         req: CreateSnapshotRequest,
     ) -> ApiResult<Snapshot> {
+        ensure_zfs_ref(dataset_id)?;
         if req.name.trim().is_empty() {
             return Err(AppError::validation("snapshot name must not be empty"));
         }
@@ -166,9 +167,8 @@ impl ZfsService {
         snapshot_id: &str,
         req: CloneSnapshotRequest,
     ) -> ApiResult<Dataset> {
-        if req.target.trim().is_empty() {
-            return Err(AppError::validation("target must not be empty"));
-        }
+        ensure_zfs_ref(snapshot_id)?;
+        ensure_zfs_ref(&req.target)?;
         command::run_ok("zfs", &["clone", snapshot_id, &req.target]).await?;
         self.get_dataset(&req.target).await
     }
@@ -185,6 +185,21 @@ impl ZfsService {
 
 fn to_argv(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
+}
+
+/// Validate a user-supplied ZFS reference (dataset/snapshot path) before it is
+/// passed to `zfs`/`zpool`. ZFS names legitimately contain `/` and `@`, so the
+/// strict filename allowlist does not apply; we only reject empty/whitespace
+/// names and a leading `-`, which a CLI could misparse as a flag.
+fn ensure_zfs_ref(name: &str) -> ApiResult<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::validation("ZFS name must not be empty"));
+    }
+    if trimmed.starts_with('-') {
+        return Err(AppError::validation("ZFS name must not start with '-'"));
+    }
+    Ok(())
 }
 
 fn parse_u64(s: &str) -> u64 {

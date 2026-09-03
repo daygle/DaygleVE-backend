@@ -194,14 +194,21 @@ impl KvmService {
             .ok_or_else(|| AppError::hypervisor("could not resolve the VM's VNC port"))?;
 
         let ticket = new_id();
-        self.tickets.write().expect("ticket lock").insert(
-            ticket.clone(),
-            Ticket {
-                vm_id: id.to_string(),
-                vnc_addr,
-                expires_at: Instant::now() + TICKET_TTL,
-            },
-        );
+        {
+            let mut tickets = self.tickets.write().expect("ticket lock");
+            let now = Instant::now();
+            // Opportunistically drop expired tickets so the map can't grow
+            // unbounded from tickets that were minted but never redeemed.
+            tickets.retain(|_, t| t.expires_at > now);
+            tickets.insert(
+                ticket.clone(),
+                Ticket {
+                    vm_id: id.to_string(),
+                    vnc_addr,
+                    expires_at: now + TICKET_TTL,
+                },
+            );
+        }
 
         Ok(ConsoleTicket {
             websocket_path: format!("/api/v1/vms/{id}/console/ws?ticket={ticket}"),
@@ -266,6 +273,10 @@ impl KvmService {
     async fn ensure_zvol(&self, disk: &VmDisk) -> ApiResult<()> {
         if disk.dataset.trim().is_empty() || disk.size_gib == 0 {
             return Ok(());
+        }
+        if disk.dataset.starts_with('-') {
+            // Prevent the dataset from being misparsed as a `zfs` flag.
+            return Err(AppError::validation("disk dataset must not start with '-'"));
         }
         // Reuse an existing dataset; otherwise create it. Distinguish "zfs not
         // installed" (fail fast — we must never define a domain pointing at a
