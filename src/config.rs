@@ -35,6 +35,12 @@ pub struct Config {
     /// When unset, the backend generates a random initial password on first
     /// boot (there is deliberately no built-in default password).
     pub admin_password: Option<String>,
+    /// PEM certificate chain for HTTPS. `DAYGLEVE_TLS_CERT`. TLS is enabled only
+    /// when both this and `tls_key` are set; otherwise the API is served over
+    /// plain HTTP (front it with a TLS-terminating proxy in that case).
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for HTTPS. `DAYGLEVE_TLS_KEY`.
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Config {
@@ -90,6 +96,15 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        let tls_cert = std::env::var("DAYGLEVE_TLS_CERT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let tls_key = std::env::var("DAYGLEVE_TLS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         Self {
             listen_addr,
             cors_origins,
@@ -100,6 +115,16 @@ impl Config {
             mounts_dir,
             token_ttl_secs,
             admin_password,
+            tls_cert,
+            tls_key,
+        }
+    }
+
+    /// Resolved TLS material when *both* a certificate and key are configured.
+    pub fn tls(&self) -> Option<(&std::path::Path, &std::path::Path)> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+            _ => None,
         }
     }
 }

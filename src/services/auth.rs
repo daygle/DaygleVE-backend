@@ -517,6 +517,8 @@ mod tests {
             mounts_dir: dir.join("mounts"),
             token_ttl_secs: 3600,
             admin_password: Some(rand_password()),
+            tls_cert: None,
+            tls_key: None,
         })
     }
 

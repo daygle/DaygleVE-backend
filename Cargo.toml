@@ -13,6 +13,11 @@ repository = "https://github.com/daygle/DaygleVE-backend"
 daygleve-schema = { git = "https://github.com/daygle/DaygleVE-schema", branch = "main" }
 
 axum = { version = "0.8", features = ["macros", "ws"] }
+# TLS-terminating server (rustls) for optional built-in HTTPS.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Pulled in transitively by axum-server; named directly so we can install the
+# process-level crypto provider that rustls 0.23 requires before serving TLS.
+rustls = "0.23"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["time"] }
 futures = "0.3"
