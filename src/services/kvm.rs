@@ -181,7 +181,7 @@ impl KvmService {
         }
         // Eject takes precedence over attach; otherwise a provided cdrom path is
         // validated against the ISO library and attached/replaced.
-        if req.eject_cdrom {
+        if req.eject_cdrom.unwrap_or(false) {
             vm.cdrom = None;
         } else if let Some(path) = req.cdrom {
             vm.cdrom = Some(self.resolve_iso(&path).await?);
