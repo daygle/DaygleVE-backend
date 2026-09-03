@@ -7,7 +7,7 @@
 //!
 //! [`node`]: MetricsService::node
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use daygleve_schema::metrics::NodeMetrics;
 use tokio::fs;
@@ -29,10 +29,13 @@ impl MetricsService {
         let disks = whole_disks().await;
 
         let a = Sample::take(&disks).await;
+        let started = Instant::now();
         tokio::time::sleep(SAMPLE_WINDOW).await;
         let b = Sample::take(&disks).await;
 
-        let dt = SAMPLE_WINDOW.as_secs_f64();
+        // Use the real elapsed time (sleep drift + the cost of the second read),
+        // not the nominal window, so rates aren't systematically skewed.
+        let dt = started.elapsed().as_secs_f64();
         let cpu_total_delta = b.cpu_total.saturating_sub(a.cpu_total);
         let cpu_busy_delta = b.cpu_busy.saturating_sub(a.cpu_busy);
         let cpu_pct = if cpu_total_delta > 0 {

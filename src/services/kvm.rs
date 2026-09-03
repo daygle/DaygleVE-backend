@@ -265,13 +265,20 @@ impl KvmService {
         if disk.dataset.trim().is_empty() || disk.size_gib == 0 {
             return Ok(());
         }
-        let size = format!("{}G", disk.size_gib);
-        match command::run_optional("zfs", &["create", "-V", &size, &disk.dataset]).await {
-            Ok(_) => Ok(()),
-            // Reusing an existing dataset is fine.
-            Err(e) if format!("{e:?}").contains("exists") => Ok(()),
-            Err(e) => Err(e),
+        // Reuse an existing dataset; otherwise create it. Distinguish "zfs not
+        // installed" (fail fast — we must never define a domain pointing at a
+        // zvol that was never provisioned) from "dataset does not exist yet".
+        match command::run_optional("zfs", &["list", "-H", "-o", "name", &disk.dataset]).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {
+                return Err(AppError::hypervisor(
+                    "zfs is not installed; cannot provision the VM disk",
+                ))
+            }
+            Err(_) => {} // dataset does not exist yet — create it below
         }
+        let size = format!("{}G", disk.size_gib);
+        command::run_ok("zfs", &["create", "-V", &size, &disk.dataset]).await
     }
 
     async fn virsh(&self, args: &[&str]) -> ApiResult<String> {

@@ -48,9 +48,16 @@ impl JsonStore {
         let path = self.path_for(id)?;
         let bytes = serde_json::to_vec_pretty(value)
             .map_err(|e| AppError::internal(format!("serialize record: {e}")))?;
-        fs::write(&path, bytes)
+        // Atomic write: write a temp file then rename over the target, so a
+        // crash or full disk mid-write never leaves a truncated record that
+        // would break get/list — readers see either the old or new file.
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, bytes)
             .await
-            .map_err(|e| AppError::internal(format!("write {}: {e}", path.display())))
+            .map_err(|e| AppError::internal(format!("write {}: {e}", tmp.display())))?;
+        fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| AppError::internal(format!("rename into {}: {e}", path.display())))
     }
 
     /// Read the record for `id`, or `None` if it does not exist.

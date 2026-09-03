@@ -148,7 +148,8 @@ impl NetworkService {
                 Some(json) => json,
                 None => return Ok(Vec::new()),
             };
-        let links: Vec<Value> = serde_json::from_str(json.trim()).unwrap_or_default();
+        let links: Vec<Value> = serde_json::from_str(json.trim())
+            .map_err(|e| AppError::internal(format!("parse `ip -j link show master`: {e}")))?;
         Ok(links
             .into_iter()
             .filter_map(|l| l["ifname"].as_str().map(str::to_string))
@@ -162,7 +163,8 @@ impl NetworkService {
             Some(json) => json,
             None => return Ok(None),
         };
-        let entries: Vec<Value> = serde_json::from_str(json.trim()).unwrap_or_default();
+        let entries: Vec<Value> = serde_json::from_str(json.trim())
+            .map_err(|e| AppError::internal(format!("parse `ip -j addr show`: {e}")))?;
         for entry in entries {
             if let Some(addrs) = entry["addr_info"].as_array() {
                 for a in addrs {

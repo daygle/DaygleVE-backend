@@ -49,9 +49,16 @@ pub fn router(state: AppState) -> Router {
         tracing::info!(web_root = %web_root.display(), "serving frontend assets");
     }
 
-    app.layer(TraceLayer::new_for_http())
-        .layer(cors)
-        .with_state(state)
+    // Trace requests by method + path only. The path deliberately excludes the
+    // query string so short-lived secrets passed there (e.g. the one-time VNC
+    // console ticket on the console websocket) are never written to logs.
+    let trace = TraceLayer::new_for_http().make_span_with(
+        |req: &axum::http::Request<axum::body::Body>| {
+            tracing::info_span!("http", method = %req.method(), path = %req.uri().path())
+        },
+    );
+
+    app.layer(trace).layer(cors).with_state(state)
 }
 
 /// Build the CORS layer. With no configured origins we fall back to a

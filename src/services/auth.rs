@@ -87,7 +87,10 @@ impl AuthService {
         let user = stored.user.clone();
         drop(users);
 
-        let expires_at = now + Duration::seconds(self.token_ttl_secs as i64);
+        // Clamp before the i64 cast so an absurd TTL can't overflow into a
+        // negative (already-expired) lifetime.
+        let ttl = self.token_ttl_secs.min(i64::MAX as u64) as i64;
+        let expires_at = now + Duration::seconds(ttl);
         let token = mint_token();
         self.tokens.write().expect("token lock").insert(
             token.clone(),
