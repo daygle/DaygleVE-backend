@@ -70,8 +70,13 @@ impl ShareService {
     pub async fn create(&self, req: CreateShareRequest) -> ApiResult<NetworkShare> {
         // The name is user-facing and must be safe to build a path/id from.
         ensure_safe_id(&req.name)?;
+        // `local` is reserved: it labels the node's built-in ISO library in
+        // IsoImage.storage, so a share may not claim that name.
+        if req.name.eq_ignore_ascii_case("local") {
+            return Err(AppError::validation("'local' is a reserved share name"));
+        }
         validate_host(&req.server, "server")?;
-        validate_export(&req.export)?;
+        validate_export(&req.export_path)?;
         if let Some(opts) = &req.options {
             validate_options(opts)?;
         }
@@ -89,7 +94,7 @@ impl ShareService {
         let cred_path = self.cred_path(&id);
         let mount_result = match req.share_type {
             ShareType::Nfs => {
-                let source = format!("{}:{}", req.server, req.export);
+                let source = format!("{}:{}", req.server, req.export_path);
                 let opts = merge_options("ro", req.options.as_deref());
                 command::run_ok(
                     "mount",
@@ -105,7 +110,7 @@ impl ShareService {
                     req.domain.as_deref(),
                 )
                 .await?;
-                let source = format!("//{}/{}", req.server, req.export);
+                let source = format!("//{}/{}", req.server, req.export_path);
                 let base = format!(
                     "ro,credentials={},file_mode=0444,dir_mode=0555",
                     cred_path.to_string_lossy()
@@ -134,7 +139,7 @@ impl ShareService {
             name: req.name,
             share_type: req.share_type,
             server: req.server,
-            export: req.export,
+            export_path: req.export_path,
             mount_point: mount_point_str,
             state: ShareState::Connected,
             read_only: true,
