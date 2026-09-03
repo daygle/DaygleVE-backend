@@ -19,7 +19,7 @@ pub fn routes() -> Router<AppState> {
 
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<GpuDevice>>> {
     user.require(Permission::GpuRead)?;
-    Ok(Json(state.services.gpu.list()))
+    Ok(Json(state.services.gpu.list().await?))
 }
 
 async fn bind(
@@ -31,6 +31,6 @@ async fn bind(
     user.require(Permission::GpuWrite)?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(state.services.gpu.bind(&pci_address, req)?),
+        Json(state.services.gpu.bind(&pci_address, req).await?),
     ))
 }

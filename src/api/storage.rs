@@ -26,7 +26,7 @@ pub fn routes() -> Router<AppState> {
 
 async fn list_pools(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<Pool>>> {
     user.require(Permission::StorageRead)?;
-    Ok(Json(state.services.zfs.list_pools()))
+    Ok(Json(state.services.zfs.list_pools().await?))
 }
 
 async fn list_datasets(
@@ -34,7 +34,7 @@ async fn list_datasets(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<Dataset>>> {
     user.require(Permission::StorageRead)?;
-    Ok(Json(state.services.zfs.list_datasets()))
+    Ok(Json(state.services.zfs.list_datasets().await?))
 }
 
 async fn create_dataset(
@@ -45,7 +45,7 @@ async fn create_dataset(
     user.require(Permission::StorageWrite)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.services.zfs.create_dataset(req)?),
+        Json(state.services.zfs.create_dataset(req).await?),
     ))
 }
 
@@ -55,7 +55,7 @@ async fn list_snapshots(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<Snapshot>>> {
     user.require(Permission::StorageRead)?;
-    Ok(Json(state.services.zfs.list_snapshots(&id)?))
+    Ok(Json(state.services.zfs.list_snapshots(&id).await?))
 }
 
 async fn create_snapshot(
@@ -67,7 +67,7 @@ async fn create_snapshot(
     user.require(Permission::StorageWrite)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.services.zfs.create_snapshot(&id, req)?),
+        Json(state.services.zfs.create_snapshot(&id, req).await?),
     ))
 }
 
@@ -80,6 +80,6 @@ async fn clone_snapshot(
     user.require(Permission::StorageWrite)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.services.zfs.clone_snapshot(&id, req)?),
+        Json(state.services.zfs.clone_snapshot(&id, req).await?),
     ))
 }

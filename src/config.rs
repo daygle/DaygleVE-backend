@@ -18,6 +18,15 @@ pub struct Config {
     /// SvelteKit dev server handles the UI. On the appliance this points at the
     /// bundled frontend build (e.g. `/usr/share/daygleve/web`).
     pub web_root: Option<PathBuf>,
+    /// Directory for DaygleVE's own persistent state (VM/container/bridge
+    /// records). `DAYGLEVE_STATE_DIR`, default `/var/lib/daygleve`.
+    pub state_dir: PathBuf,
+    /// Lifetime of an issued bearer token, in seconds. `DAYGLEVE_TOKEN_TTL_SECS`,
+    /// default 12 hours.
+    pub token_ttl_secs: u64,
+    /// Password for the seeded `admin` account. `DAYGLEVE_ADMIN_PASSWORD`,
+    /// default `daygleve` (a warning is logged until it is overridden).
+    pub admin_password: String,
 }
 
 impl Config {
@@ -46,11 +55,28 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
+        let state_dir = std::env::var("DAYGLEVE_STATE_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/daygleve"));
+
+        let token_ttl_secs = std::env::var("DAYGLEVE_TOKEN_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12 * 60 * 60);
+
+        let admin_password =
+            std::env::var("DAYGLEVE_ADMIN_PASSWORD").unwrap_or_else(|_| "daygleve".to_string());
+
         Self {
             listen_addr,
             cors_origins,
             default_pool,
             web_root,
+            state_dir,
+            token_ttl_secs,
+            admin_password,
         }
     }
 }

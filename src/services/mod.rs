@@ -1,18 +1,20 @@
 //! The service layer: one module per hypervisor/host subsystem.
 //!
 //! Handlers in [`crate::api`] stay thin — they parse/authorize requests and
-//! delegate all host interaction to these services. Each service is where real
-//! `libvirt`/`qemu`, `lxc`, `zfs`, `ip`/`bridge`, `vfio` and `/proc` calls will
-//! live. In this architecture-setup scaffold they are backed by in-memory
-//! state and clearly marked `TODO` stubs so the API shape and boundaries are
-//! exercisable end-to-end.
+//! delegate all host interaction to these services. Each service drives the
+//! host by shelling out to the real tools (`virsh`/`qemu-img`, `lxc-*`,
+//! `zfs`/`zpool`, `ip`/`bridge`, `vfio` via sysfs, `/proc`), with DaygleVE's
+//! own structured records persisted via [`store::JsonStore`]. See
+//! [`command`] for the spawn wrapper.
 
 pub mod auth;
+pub mod command;
 pub mod gpu;
 pub mod kvm;
 pub mod lxc;
 pub mod metrics;
 pub mod network;
+pub mod store;
 pub mod zfs;
 
 use std::sync::Arc;
@@ -33,14 +35,37 @@ pub struct Services {
 impl Services {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
-            auth: auth::AuthService::new(),
-            kvm: kvm::KvmService::new(),
-            lxc: lxc::LxcService::new(),
+            auth: auth::AuthService::new(config.clone()),
+            kvm: kvm::KvmService::new(config.clone()),
+            lxc: lxc::LxcService::new(config.clone()),
             zfs: zfs::ZfsService::new(config.clone()),
-            network: network::NetworkService::new(),
+            network: network::NetworkService::new(config.clone()),
             gpu: gpu::GpuService::new(),
             metrics: metrics::MetricsService::new(),
         }
+    }
+}
+
+/// Reject any id/name that could escape or traverse a filesystem path before
+/// it is used to build one. Allows ASCII alphanumerics plus `.`, `-`, `_`;
+/// forbids the empty string, `.` and `..`. This is the sanitizer guarding every
+/// user-influenced path in the service layer (VM/container tmp files, the JSON
+/// record store, LXC config paths).
+pub(crate) fn ensure_safe_id(id: &str) -> crate::error::ApiResult<()> {
+    let safe = !id.is_empty()
+        && id != "."
+        && id != ".."
+        // A leading '-' could be parsed as a flag by host CLIs (zfs/virsh/ip).
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if safe {
+        Ok(())
+    } else {
+        Err(crate::error::AppError::validation(format!(
+            "invalid identifier: {id:?}"
+        )))
     }
 }
 

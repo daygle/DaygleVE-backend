@@ -23,7 +23,7 @@ pub fn routes() -> Router<AppState> {
 
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<LxcSummary>>> {
     user.require(Permission::LxcRead)?;
-    Ok(Json(state.services.lxc.list()))
+    Ok(Json(state.services.lxc.list().await?))
 }
 
 async fn create(
@@ -32,7 +32,7 @@ async fn create(
     Json(req): Json<CreateLxcRequest>,
 ) -> ApiResult<(StatusCode, Json<Lxc>)> {
     user.require(Permission::LxcWrite)?;
-    let ct = state.services.lxc.create(req)?;
+    let ct = state.services.lxc.create(req).await?;
     Ok((StatusCode::CREATED, Json(ct)))
 }
 
@@ -42,7 +42,7 @@ async fn get_one(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Lxc>> {
     user.require(Permission::LxcRead)?;
-    Ok(Json(state.services.lxc.get(&id)?))
+    Ok(Json(state.services.lxc.get(&id).await?))
 }
 
 async fn update(
@@ -52,7 +52,7 @@ async fn update(
     Json(req): Json<UpdateLxcRequest>,
 ) -> ApiResult<Json<Lxc>> {
     user.require(Permission::LxcWrite)?;
-    Ok(Json(state.services.lxc.update(&id, req)?))
+    Ok(Json(state.services.lxc.update(&id, req).await?))
 }
 
 async fn delete(
@@ -61,7 +61,7 @@ async fn delete(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     user.require(Permission::LxcWrite)?;
-    state.services.lxc.delete(&id)?;
+    state.services.lxc.delete(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -72,6 +72,6 @@ async fn power(
     Json(req): Json<LxcPowerRequest>,
 ) -> ApiResult<(StatusCode, Json<Lxc>)> {
     user.require(Permission::LxcPower)?;
-    let ct = state.services.lxc.power(&id, req.action)?;
+    let ct = state.services.lxc.power(&id, req.action).await?;
     Ok((StatusCode::ACCEPTED, Json(ct)))
 }

@@ -22,7 +22,7 @@ async fn list_bridges(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<Bridge>>> {
     user.require(Permission::NetworkRead)?;
-    Ok(Json(state.services.network.list_bridges()))
+    Ok(Json(state.services.network.list_bridges().await?))
 }
 
 async fn create_bridge(
@@ -33,13 +33,13 @@ async fn create_bridge(
     user.require(Permission::NetworkWrite)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.services.network.create_bridge(req)?),
+        Json(state.services.network.create_bridge(req).await?),
     ))
 }
 
 async fn list_vlans(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<Vlan>>> {
     user.require(Permission::NetworkRead)?;
-    Ok(Json(state.services.network.list_vlans()))
+    Ok(Json(state.services.network.list_vlans().await?))
 }
 
 async fn create_vlan(
@@ -50,6 +50,6 @@ async fn create_vlan(
     user.require(Permission::NetworkWrite)?;
     Ok((
         StatusCode::CREATED,
-        Json(state.services.network.create_vlan(req)?),
+        Json(state.services.network.create_vlan(req).await?),
     ))
 }

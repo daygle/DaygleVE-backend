@@ -1,63 +1,110 @@
 //! LXC container lifecycle service.
 //!
-//! TODO(lxc): back these operations with the LXC API / `lxc-*` tooling and a
-//! ZFS-backed rootfs. In-memory for the scaffold.
+//! Drives the `lxc-*` tooling with a ZFS-backed rootfs (`lxc-create -B zfs`).
+//! As with VMs, LXC persists the container config/rootfs itself and DaygleVE
+//! keeps a sidecar record of the structured `Lxc`, overlaying live state from
+//! `lxc-info` at read time. CPU/memory limits and veth networking are written
+//! into the container config at create time.
+//!
+//! This is the least host-portable of the services: it depends on the
+//! `download` template server and a ZFS-capable `lxc`. Templates are given as
+//! `<dist>-<release>` (e.g. `debian-bookworm`).
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::Arc;
 
-use daygleve_schema::common::ResourceId;
 use daygleve_schema::lxc::{
-    CreateLxcRequest, Lxc, LxcPowerAction, LxcState, LxcSummary, UpdateLxcRequest,
+    CreateLxcRequest, Lxc, LxcNetwork, LxcPowerAction, LxcState, LxcSummary, UpdateLxcRequest,
 };
 
+use crate::config::Config;
 use crate::error::{ApiResult, AppError};
-use crate::services::{new_id, now_ts};
+use crate::services::store::JsonStore;
+use crate::services::{command, new_id, now_ts};
 
 pub struct LxcService {
-    containers: RwLock<HashMap<ResourceId, Lxc>>,
+    store: JsonStore,
+    config: Arc<Config>,
 }
 
 impl LxcService {
-    pub fn new() -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
         Self {
-            containers: RwLock::new(HashMap::new()),
+            store: JsonStore::new(&config.state_dir, "containers"),
+            config,
         }
     }
 
-    pub fn list(&self) -> Vec<LxcSummary> {
-        self.containers
-            .read()
-            .expect("lxc lock")
-            .values()
-            .map(summary_of)
-            .collect()
+    pub async fn list(&self) -> ApiResult<Vec<LxcSummary>> {
+        let cts: Vec<Lxc> = self.store.list().await?;
+        let mut out = Vec::with_capacity(cts.len());
+        for mut ct in cts {
+            ct.state = self.live_state(&ct.name).await.unwrap_or(ct.state);
+            out.push(summary_of(&ct));
+        }
+        Ok(out)
     }
 
-    pub fn get(&self, id: &str) -> ApiResult<Lxc> {
-        self.containers
-            .read()
-            .expect("lxc lock")
-            .get(id)
-            .cloned()
-            .ok_or_else(|| AppError::not_found(format!("container {id} not found")))
+    pub async fn get(&self, id: &str) -> ApiResult<Lxc> {
+        let mut ct = self.get_stored(id).await?;
+        ct.state = self.live_state(&ct.name).await.unwrap_or(ct.state);
+        Ok(ct)
     }
 
-    pub fn create(&self, req: CreateLxcRequest) -> ApiResult<Lxc> {
+    pub async fn create(&self, req: CreateLxcRequest) -> ApiResult<Lxc> {
+        if req.name.trim().is_empty() {
+            return Err(AppError::validation("name must not be empty"));
+        }
+        // The name becomes the container name and its config path; keep it safe.
+        crate::services::ensure_safe_id(&req.name)?;
         if req.vcpus == 0 {
             return Err(AppError::validation("vcpus must be >= 1"));
         }
-        // TODO(lxc): create the ZFS rootfs from `req.template` and write config.
+        if req.memory_mib == 0 {
+            // Written into lxc.cgroup2.memory.max; 0 would be an unusable limit.
+            return Err(AppError::validation("memory_mib must be >= 1"));
+        }
+        let (dist, release) = req.template.split_once('-').ok_or_else(|| {
+            AppError::validation("template must be <dist>-<release>, e.g. debian-bookworm")
+        })?;
+
+        let zfsroot = format!("{}/lxc", self.config.default_pool);
+        let rootfs_dataset = format!("{zfsroot}/{}", req.name);
+
+        // Create the container with a ZFS-backed rootfs from a download image.
+        command::run_ok(
+            "lxc-create",
+            &[
+                "-n",
+                &req.name,
+                "-B",
+                "zfs",
+                "--zfsroot",
+                &zfsroot,
+                "-t",
+                "download",
+                "--",
+                "--dist",
+                dist,
+                "--release",
+                release,
+                "--arch",
+                "amd64",
+            ],
+        )
+        .await?;
+
+        // Apply a rootfs quota (best-effort) and write limits + networking.
+        let quota = format!("quota={}G", req.rootfs_size_gib);
+        let _ = command::run_optional("zfs", &["set", &quota, &rootfs_dataset]).await;
+        self.write_config(&req.name, req.vcpus, req.memory_mib, &req.networks)
+            .await?;
+
         let ct = Lxc {
             id: new_id(),
-            name: req.name,
-            state: if req.start {
-                LxcState::Running
-            } else {
-                LxcState::Stopped
-            },
+            name: req.name.clone(),
+            state: LxcState::Stopped,
             template: req.template,
-            rootfs_dataset: String::new(), // TODO: set to provisioned dataset
+            rootfs_dataset,
             vcpus: req.vcpus,
             memory_mib: req.memory_mib,
             networks: req.networks,
@@ -66,22 +113,30 @@ impl LxcService {
             created_at: now_ts(),
             updated_at: None,
         };
-        self.containers
-            .write()
-            .expect("lxc lock")
-            .insert(ct.id.clone(), ct.clone());
+
+        let mut ct = ct;
+        if req.start {
+            command::run_ok("lxc-start", &["-n", &ct.name, "-d"]).await?;
+            ct.state = LxcState::Running;
+        }
+        self.store.put(&ct.id, &ct).await?;
         Ok(ct)
     }
 
-    pub fn update(&self, id: &str, req: UpdateLxcRequest) -> ApiResult<Lxc> {
-        let mut cts = self.containers.write().expect("lxc lock");
-        let ct = cts
-            .get_mut(id)
-            .ok_or_else(|| AppError::not_found(format!("container {id} not found")))?;
-        if let Some(name) = req.name {
-            ct.name = name;
+    pub async fn update(&self, id: &str, req: UpdateLxcRequest) -> ApiResult<Lxc> {
+        let mut ct = self.get_stored(id).await?;
+        if req.name.is_some() {
+            // The container name is also its config path and the handle every
+            // lxc-* call targets; renaming needs a real host-side rename, which
+            // isn't implemented yet. Reject rather than silently desync.
+            return Err(AppError::validation(
+                "renaming a container is not supported yet",
+            ));
         }
         if let Some(vcpus) = req.vcpus {
+            if vcpus == 0 {
+                return Err(AppError::validation("vcpus must be >= 1"));
+            }
             ct.vcpus = vcpus;
         }
         if let Some(mem) = req.memory_mib {
@@ -90,34 +145,109 @@ impl LxcService {
         if req.description.is_some() {
             ct.description = req.description;
         }
+
+        // Apply new limits live if the container is running (best-effort).
+        if matches!(self.live_state(&ct.name).await, Some(LxcState::Running)) {
+            let mem_bytes = (ct.memory_mib * 1024 * 1024).to_string();
+            let _ =
+                command::run_optional("lxc-cgroup", &["-n", &ct.name, "memory.max", &mem_bytes])
+                    .await;
+            let cpu_max = format!("{} 100000", ct.vcpus as u64 * 100_000);
+            let _ =
+                command::run_optional("lxc-cgroup", &["-n", &ct.name, "cpu.max", &cpu_max]).await;
+        }
+
         ct.updated_at = Some(now_ts());
-        Ok(ct.clone())
+        self.store.put(id, &ct).await?;
+        self.get(id).await
     }
 
-    pub fn delete(&self, id: &str) -> ApiResult<()> {
-        self.containers
-            .write()
-            .expect("lxc lock")
-            .remove(id)
-            .map(|_| ())
+    pub async fn delete(&self, id: &str) -> ApiResult<()> {
+        let ct = self.get_stored(id).await?;
+        let _ = command::run_optional("lxc-stop", &["-n", &ct.name, "-k"]).await;
+        let _ = command::run_optional("lxc-destroy", &["-n", &ct.name, "-f"]).await;
+        // lxc-destroy removes the zfs-backed rootfs; clean up any remnant.
+        let _ = command::run_optional("zfs", &["destroy", "-r", &ct.rootfs_dataset]).await;
+        self.store.delete(id).await?;
+        Ok(())
+    }
+
+    pub async fn power(&self, id: &str, action: LxcPowerAction) -> ApiResult<Lxc> {
+        let mut ct = self.get_stored(id).await?;
+        match action {
+            LxcPowerAction::Start => {
+                command::run_ok("lxc-start", &["-n", &ct.name, "-d"]).await?;
+            }
+            LxcPowerAction::Stop => {
+                command::run_ok("lxc-stop", &["-n", &ct.name]).await?;
+            }
+            LxcPowerAction::Restart => {
+                let _ = command::run_optional("lxc-stop", &["-n", &ct.name]).await;
+                command::run_ok("lxc-start", &["-n", &ct.name, "-d"]).await?;
+            }
+            LxcPowerAction::Freeze => {
+                command::run_ok("lxc-freeze", &["-n", &ct.name]).await?;
+            }
+            LxcPowerAction::Unfreeze => {
+                command::run_ok("lxc-unfreeze", &["-n", &ct.name]).await?;
+            }
+        }
+
+        ct.state = self.live_state(&ct.name).await.unwrap_or(ct.state);
+        ct.updated_at = Some(now_ts());
+        self.store.put(id, &ct).await?;
+        Ok(ct)
+    }
+
+    // --- internals -------------------------------------------------------
+
+    async fn get_stored(&self, id: &str) -> ApiResult<Lxc> {
+        self.store
+            .get(id)
+            .await?
             .ok_or_else(|| AppError::not_found(format!("container {id} not found")))
     }
 
-    pub fn power(&self, id: &str, action: LxcPowerAction) -> ApiResult<Lxc> {
-        let mut cts = self.containers.write().expect("lxc lock");
-        let ct = cts
-            .get_mut(id)
-            .ok_or_else(|| AppError::not_found(format!("container {id} not found")))?;
-        // TODO(lxc): issue the corresponding lxc lifecycle call.
-        ct.state = match action {
-            LxcPowerAction::Start | LxcPowerAction::Unfreeze | LxcPowerAction::Restart => {
-                LxcState::Running
+    /// Live state from `lxc-info -sH`, or `None` if it can't be determined.
+    async fn live_state(&self, name: &str) -> Option<LxcState> {
+        match command::run_optional("lxc-info", &["-n", name, "-sH"]).await {
+            Ok(Some(s)) => Some(map_lxc_state(s.trim())),
+            _ => None,
+        }
+    }
+
+    /// Append CPU/memory cgroup limits and veth networking to the container's
+    /// config file.
+    async fn write_config(
+        &self,
+        name: &str,
+        vcpus: u32,
+        memory_mib: u64,
+        networks: &[LxcNetwork],
+    ) -> ApiResult<()> {
+        let path = format!("/var/lib/lxc/{name}/config");
+        let mut block = String::from("\n# --- DaygleVE limits & networking ---\n");
+        block.push_str(&format!(
+            "lxc.cgroup2.memory.max = {}\n",
+            memory_mib * 1024 * 1024
+        ));
+        block.push_str(&format!(
+            "lxc.cgroup2.cpu.max = {} 100000\n",
+            vcpus as u64 * 100_000
+        ));
+        for (i, net) in networks.iter().enumerate() {
+            block.push_str(&format!("lxc.net.{i}.type = veth\n"));
+            block.push_str(&format!("lxc.net.{i}.link = {}\n", net.bridge));
+            block.push_str(&format!("lxc.net.{i}.flags = up\n"));
+            if let Some(ip) = &net.ip {
+                block.push_str(&format!("lxc.net.{i}.ipv4.address = {ip}\n"));
             }
-            LxcPowerAction::Stop => LxcState::Stopped,
-            LxcPowerAction::Freeze => LxcState::Frozen,
-        };
-        ct.updated_at = Some(now_ts());
-        Ok(ct.clone())
+        }
+
+        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        tokio::fs::write(&path, format!("{existing}{block}"))
+            .await
+            .map_err(|e| AppError::hypervisor(format!("write {path}: {e}")))
     }
 }
 
@@ -129,5 +259,15 @@ fn summary_of(ct: &Lxc) -> LxcSummary {
         vcpus: ct.vcpus,
         memory_mib: ct.memory_mib,
         created_at: ct.created_at.clone(),
+    }
+}
+
+fn map_lxc_state(s: &str) -> LxcState {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "RUNNING" => LxcState::Running,
+        "STOPPED" => LxcState::Stopped,
+        "FROZEN" => LxcState::Frozen,
+        "STARTING" | "STOPPING" | "ABORTING" | "FREEZING" | "THAWED" => LxcState::Transitioning,
+        _ => LxcState::Stopped,
     }
 }
