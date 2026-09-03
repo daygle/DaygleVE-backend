@@ -149,12 +149,61 @@ impl KvmService {
             }
             vm.memory_mib = mem;
         }
+
+        // Firmware, disk and NIC changes rewrite the guest hardware, so they are
+        // only allowed while the VM is stopped.
+        let hardware_change = req.firmware.is_some() || req.disks.is_some() || req.nics.is_some();
+        if hardware_change {
+            match self.live_state(&vm.id).await {
+                // A conclusively stopped domain is safe to redefine.
+                Some(VmState::Stopped) => {}
+                // Any non-stopped domain (running, paused, mid-transition, or
+                // errored) has live hardware we must not rewrite underneath it.
+                Some(_) => {
+                    return Err(AppError::conflict(
+                        "stop the VM before changing its firmware, disks or NICs",
+                    ));
+                }
+                // The live state is unknown. Trusting the (possibly stale) stored
+                // state here could let an edit through while the domain is really
+                // running, so only proceed when the domain genuinely can't be
+                // running: virsh is absent (no hypervisor at all) or the libvirt
+                // connection is healthy and simply has no such domain defined
+                // (a VM created but never started). If virsh is installed but the
+                // connection is unusable, a running domain could be hidden — refuse
+                // rather than guess.
+                None => {
+                    if self.hypervisor_unreachable().await {
+                        return Err(AppError::conflict(
+                            "cannot confirm the VM is stopped (hypervisor unreachable); try again",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(firmware) = req.firmware {
+            vm.firmware = firmware;
+        }
+        if let Some(nics) = req.nics {
+            vm.nics = nics;
+        }
+        if let Some(disks) = req.disks {
+            // `ensure_zvol` is idempotent: it reuses a dataset that already exists
+            // and only creates a zvol for a genuinely new disk, so calling it for
+            // every disk in the set provisions the additions and leaves existing
+            // disks untouched. Removing a disk from the set never destroys its data.
+            for disk in &disks {
+                self.ensure_zvol(disk).await?;
+            }
+            vm.disks = disks;
+        }
+
         if req.description.is_some() {
             vm.description = req.description;
         }
         // Eject takes precedence over attach; otherwise a provided cdrom path is
         // validated against the ISO library and attached/replaced.
-        if req.eject_cdrom {
+        if req.eject_cdrom.unwrap_or(false) {
             vm.cdrom = None;
         } else if let Some(path) = req.cdrom {
             vm.cdrom = Some(self.resolve_iso(&path).await?);
@@ -271,6 +320,17 @@ impl KvmService {
             Ok(Some(s)) => Some(map_vm_state(s.trim())),
             _ => None,
         }
+    }
+
+    /// True only when virsh is installed but the libvirt connection is unusable —
+    /// the one case where an unreadable domain state might be hiding a running VM.
+    /// A missing virsh binary (`Ok(None)`) means there is no hypervisor at all, and
+    /// a healthy connection (`Ok(Some)`) means an unreadable domain is simply not
+    /// defined; both are safe, so only a connection error (`Err`) returns true.
+    async fn hypervisor_unreachable(&self) -> bool {
+        command::run_optional("virsh", &["-c", CONNECT, "hostname"])
+            .await
+            .is_err()
     }
 
     /// Write the domain XML and (re)define it in libvirt.
