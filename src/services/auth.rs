@@ -500,10 +500,10 @@ mod tests {
     use super::*;
     use daygleve_schema::auth::{CreateUserRequest, Role};
 
-    // Build passwords at runtime (not string literals) so the tests carry no
-    // hard-coded credentials.
+    // Build passwords at runtime with no string literals at all, so the tests
+    // carry no hard-coded credentials (reusing the service's random generator).
     fn rand_password() -> String {
-        format!("pw-{}", new_id())
+        generate_initial_password()
     }
 
     fn test_config(dir: &std::path::Path) -> Arc<Config> {
