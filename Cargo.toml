@@ -10,7 +10,7 @@ repository = "https://github.com/daygle/DaygleVE-backend"
 # Shared API contract. Types are imported from DaygleVE-schema — never
 # redefined here. Tracks the schema's `main`; move to a tagged release once the
 # schema publishes one (see docs/VERSIONING.md there).
-daygleve-schema = { git = "https://github.com/daygle/DaygleVE-schema", branch = "main" }
+daygleve-schema = { git = "https://github.com/daygle/DaygleVE-schema", branch = "claude/daygleve-architecture-setup-vj7ksa" }
 
 axum = { version = "0.8", features = ["macros", "ws"] }
 # TLS-terminating server (rustls) for optional built-in HTTPS.

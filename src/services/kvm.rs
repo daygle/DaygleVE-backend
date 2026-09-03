@@ -149,6 +149,33 @@ impl KvmService {
             }
             vm.memory_mib = mem;
         }
+
+        // Firmware, disk and NIC changes rewrite the guest hardware, so they are
+        // only allowed while the VM is stopped.
+        let hardware_change = req.firmware.is_some() || req.disks.is_some() || req.nics.is_some();
+        if hardware_change {
+            let state = self.live_state(&vm.id).await.unwrap_or(vm.state);
+            if state == VmState::Running {
+                return Err(AppError::conflict(
+                    "stop the VM before changing its firmware, disks or NICs",
+                ));
+            }
+        }
+        if let Some(firmware) = req.firmware {
+            vm.firmware = firmware;
+        }
+        if let Some(nics) = req.nics {
+            vm.nics = nics;
+        }
+        if let Some(disks) = req.disks {
+            // Provision a zvol for any newly-added disk (an existing dataset is
+            // reused; removing a disk from the set never destroys its data).
+            for disk in &disks {
+                self.ensure_zvol(disk).await?;
+            }
+            vm.disks = disks;
+        }
+
         if req.description.is_some() {
             vm.description = req.description;
         }
