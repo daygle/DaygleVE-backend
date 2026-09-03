@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
+use daygleve_schema::share::{CreateShareRequest, NetworkShare};
 use daygleve_schema::storage::{
     CloneSnapshotRequest, CreateDatasetRequest, CreateSnapshotRequest, Dataset, Pool, Snapshot,
 };
@@ -22,6 +23,8 @@ pub fn routes() -> Router<AppState> {
             get(list_snapshots).post(create_snapshot),
         )
         .route("/storage/snapshots/{id}/clone", post(clone_snapshot))
+        .route("/storage/shares", get(list_shares).post(create_share))
+        .route("/storage/shares/{id}", axum::routing::delete(delete_share))
 }
 
 async fn list_pools(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<Pool>>> {
@@ -82,4 +85,36 @@ async fn clone_snapshot(
         StatusCode::CREATED,
         Json(state.services.zfs.clone_snapshot(&id, req).await?),
     ))
+}
+
+// --- Network shares (NFS/CIFS) ---
+
+async fn list_shares(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<NetworkShare>>> {
+    user.require(Permission::StorageRead)?;
+    Ok(Json(state.services.shares.list().await?))
+}
+
+async fn create_share(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<CreateShareRequest>,
+) -> ApiResult<(StatusCode, Json<NetworkShare>)> {
+    user.require(Permission::StorageWrite)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(state.services.shares.create(req).await?),
+    ))
+}
+
+async fn delete_share(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    user.require(Permission::StorageWrite)?;
+    state.services.shares.delete(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

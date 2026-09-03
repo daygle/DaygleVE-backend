@@ -23,11 +23,17 @@ use daygleve_schema::vm::{
 
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
+use crate::services::shares::ShareService;
 use crate::services::store::JsonStore;
 use crate::services::{command, new_id, now_ts};
 
 /// How long a console ticket is valid before the client must re-request one.
 const TICKET_TTL: Duration = Duration::from_secs(60);
+
+/// How many directory levels deep to search a network share for ISOs. Deep
+/// enough for the common `iso/` or `template/iso/` layouts without walking an
+/// arbitrarily large tree.
+const ISO_SCAN_DEPTH: u32 = 4;
 
 /// A pending console ticket bound to a domain's VNC socket.
 struct Ticket {
@@ -39,14 +45,16 @@ struct Ticket {
 pub struct KvmService {
     store: JsonStore,
     config: Arc<Config>,
+    shares: Arc<ShareService>,
     tickets: RwLock<HashMap<String, Ticket>>,
 }
 
 impl KvmService {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, shares: Arc<ShareService>) -> Self {
         Self {
             store: JsonStore::new(&config.state_dir, "vms"),
             config,
+            shares,
             tickets: RwLock::new(HashMap::new()),
         }
     }
@@ -309,60 +317,24 @@ impl KvmService {
         command::run_ok("zfs", &["create", "-V", &size, &disk.dataset]).await
     }
 
-    /// Enumerate the installer/live ISOs available in the node's ISO library
-    /// (`config.iso_dir`, non-recursive). A missing directory yields an empty
-    /// list rather than an error, so a fresh node simply shows "no ISOs yet".
+    /// Enumerate the installer/live ISOs available to the node: the built-in
+    /// library (`config.iso_dir`, non-recursive, tagged `local`) plus every
+    /// currently-mounted network share (scanned recursively, tagged with the
+    /// share's name). A missing/unreadable root contributes nothing rather than
+    /// erroring, so a fresh node simply shows "no ISOs yet".
     pub async fn list_isos(&self) -> ApiResult<Vec<IsoImage>> {
-        let mut dir = match tokio::fs::read_dir(&self.config.iso_dir).await {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(AppError::internal(format!(
-                    "cannot read ISO directory: {e}"
-                )))
-            }
-        };
-
         let mut isos = Vec::new();
-        while let Some(entry) = dir
-            .next_entry()
-            .await
-            .map_err(|e| AppError::internal(format!("cannot list ISO directory: {e}")))?
-        {
-            let path = entry.path();
-            let is_iso = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("iso"));
-            if !is_iso {
-                continue;
-            }
-            // Only surface *regular files that live directly in the library*.
-            // Use the entry's own type (which does NOT follow symlinks) and
-            // reject anything that isn't a plain file, so a symlink planted in
-            // the directory can't point a VM at an arbitrary host file.
-            let file_type = match entry.file_type().await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if !file_type.is_file() {
-                continue;
-            }
-            let meta = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            isos.push(IsoImage {
-                name,
-                path: path.to_string_lossy().into_owned(),
-                size_bytes: meta.len(),
-            });
+
+        // Built-in local library: flat, no recursion.
+        scan_iso_dir(&self.config.iso_dir, "local", 0, &mut isos).await;
+
+        // Network shares: a share can organise ISOs into subdirectories, so
+        // walk each mount point to a bounded depth.
+        for (name, root) in self.shares.iso_roots().await {
+            scan_iso_dir(&root, &name, ISO_SCAN_DEPTH, &mut isos).await;
         }
-        isos.sort_by(|a, b| a.name.cmp(&b.name));
+
+        isos.sort_by(|a, b| a.storage.cmp(&b.storage).then_with(|| a.name.cmp(&b.name)));
         Ok(isos)
     }
 
@@ -401,6 +373,67 @@ impl KvmService {
 
 /// libvirt connection URI (system instance; the backend runs as root).
 const CONNECT: &str = "qemu:///system";
+
+/// Collect `*.iso` regular files under `root` (up to `max_depth` levels deep;
+/// 0 means the root only), appending an [`IsoImage`] tagged with `storage` for
+/// each. Symlinks are never followed — a plain directory entry that is a
+/// symlink is skipped — so an ISO can never resolve outside the scanned root.
+/// Unreadable directories are silently skipped so one bad share can't fail the
+/// whole listing.
+async fn scan_iso_dir(
+    root: &std::path::Path,
+    storage: &str,
+    max_depth: u32,
+    out: &mut Vec<IsoImage>,
+) {
+    // Iterative walk over (directory, depth) to avoid async recursion.
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            // The entry's own type does not follow symlinks: a symlink reports
+            // neither is_dir nor is_file here, so it is skipped entirely.
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if depth < max_depth {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue; // symlink, socket, device, …
+            }
+            let is_iso = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("iso"));
+            if !is_iso {
+                continue;
+            }
+            let meta = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            out.push(IsoImage {
+                name,
+                path: path.to_string_lossy().into_owned(),
+                size_bytes: meta.len(),
+                storage: storage.to_string(),
+            });
+        }
+    }
+}
 
 fn summary_of(vm: &Vm) -> VmSummary {
     VmSummary {

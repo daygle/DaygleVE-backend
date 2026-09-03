@@ -14,6 +14,7 @@ pub mod kvm;
 pub mod lxc;
 pub mod metrics;
 pub mod network;
+pub mod shares;
 pub mod store;
 pub mod zfs;
 
@@ -30,18 +31,23 @@ pub struct Services {
     pub network: network::NetworkService,
     pub gpu: gpu::GpuService,
     pub metrics: metrics::MetricsService,
+    /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
+    /// enumerate ISOs living on mounted shares.
+    pub shares: Arc<shares::ShareService>,
 }
 
 impl Services {
     pub fn new(config: Arc<Config>) -> Self {
+        let shares = Arc::new(shares::ShareService::new(config.clone()));
         Self {
             auth: auth::AuthService::new(config.clone()),
-            kvm: kvm::KvmService::new(config.clone()),
+            kvm: kvm::KvmService::new(config.clone(), shares.clone()),
             lxc: lxc::LxcService::new(config.clone()),
             zfs: zfs::ZfsService::new(config.clone()),
             network: network::NetworkService::new(config.clone()),
             gpu: gpu::GpuService::new(),
             metrics: metrics::MetricsService::new(),
+            shares,
         }
     }
 }
