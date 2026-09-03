@@ -82,16 +82,25 @@ impl AuthService {
             return Ok(());
         }
 
-        // First boot: seed the admin from configuration. Force a password change
-        // if it is still on the built-in default.
-        let password_hash = hash_password(&self.config.admin_password)
+        // First boot: seed the admin. Use the configured password when present;
+        // otherwise generate a random one (there is no built-in default) and
+        // write it to a root-only file so the operator can retrieve it, forcing
+        // a change on first login. The password is never logged in cleartext.
+        let (password, must_change_password) = match self.config.admin_password.clone() {
+            Some(password) => (password, false),
+            None => {
+                let generated = generate_initial_password();
+                let path = self.config.state_dir.join("initial-admin-password");
+                write_secret_file(&path, &generated).await?;
+                tracing::warn!(
+                    "no DAYGLEVE_ADMIN_PASSWORD set; wrote a generated initial admin password to {} — log in as 'admin' and change it immediately",
+                    path.display()
+                );
+                (generated, true)
+            }
+        };
+        let password_hash = hash_password(&password)
             .map_err(|e| AppError::internal(format!("failed to hash admin password: {e}")))?;
-        let must_change_password = self.config.admin_password == "daygleve";
-        if must_change_password {
-            tracing::warn!(
-                "admin seeded with the default password; you will be required to change it on first login (or set DAYGLEVE_ADMIN_PASSWORD)"
-            );
-        }
         let admin = StoredUser {
             user: User {
                 id: new_id(),
@@ -390,6 +399,34 @@ fn mint_token() -> String {
     s
 }
 
+/// A random, high-entropy initial admin password (144 bits, hex-encoded).
+fn generate_initial_password() -> String {
+    let mut bytes = [0u8; 18];
+    OsRng.fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(36);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Write a secret to a root-only (0600) file, creating the parent directory.
+async fn write_secret_file(path: &std::path::Path, secret: &str) -> ApiResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| AppError::internal(format!("create {}: {e}", parent.display())))?;
+    }
+    tokio::fs::write(path, format!("{secret}\n"))
+        .await
+        .map_err(|e| AppError::internal(format!("write {}: {e}", path.display())))?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|e| AppError::internal(format!("secure {}: {e}", path.display())))?;
+    Ok(())
+}
+
 /// Map a set of roles to the flattened, de-duplicated permission set the RBAC
 /// layer enforces at the API boundary.
 pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
@@ -451,6 +488,12 @@ mod tests {
     use super::*;
     use daygleve_schema::auth::{CreateUserRequest, Role};
 
+    // Build passwords at runtime (not string literals) so the tests carry no
+    // hard-coded credentials.
+    fn rand_password() -> String {
+        format!("pw-{}", new_id())
+    }
+
     fn test_config(dir: &std::path::Path) -> Arc<Config> {
         Arc::new(Config {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -461,7 +504,7 @@ mod tests {
             iso_dir: dir.join("isos"),
             mounts_dir: dir.join("mounts"),
             token_ttl_secs: 3600,
-            admin_password: "changeme123".into(),
+            admin_password: Some(rand_password()),
         })
     }
 
@@ -476,7 +519,7 @@ mod tests {
         let op = svc
             .create_user(CreateUserRequest {
                 username: "op".into(),
-                password: "password1".into(),
+                password: rand_password(),
                 roles: vec![Role::Operator],
             })
             .await
@@ -487,15 +530,16 @@ mod tests {
         assert!(svc
             .create_user(CreateUserRequest {
                 username: "OP".into(),
-                password: "password1".into(),
+                password: rand_password(),
                 roles: vec![Role::Operator],
             })
             .await
             .is_err());
+        let short: String = new_id().chars().take(4).collect();
         assert!(svc
             .create_user(CreateUserRequest {
                 username: "z".into(),
-                password: "short".into(),
+                password: short,
                 roles: vec![Role::Viewer],
             })
             .await
