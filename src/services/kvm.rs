@@ -337,10 +337,20 @@ impl KvmService {
             if !is_iso {
                 continue;
             }
-            // Follow symlinks; only surface regular files we can size.
+            // Only surface *regular files that live directly in the library*.
+            // Use the entry's own type (which does NOT follow symlinks) and
+            // reject anything that isn't a plain file, so a symlink planted in
+            // the directory can't point a VM at an arbitrary host file.
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !file_type.is_file() {
+                continue;
+            }
             let meta = match tokio::fs::metadata(&path).await {
-                Ok(m) if m.is_file() => m,
-                _ => continue,
+                Ok(m) => m,
+                Err(_) => continue,
             };
             let name = match path.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n.to_string(),
@@ -522,14 +532,15 @@ fn disk_xml(index: usize, disk: &VmDisk, boot_order: Option<u32>) -> String {
 }
 
 /// A virtual CD-ROM holding an install ISO. Boots first (`<boot order='1'/>`)
-/// so a guest OS can be installed onto the (empty) primary disk. Attached on a
-/// SATA bus with a high target letter to avoid colliding with data disks.
+/// so a guest OS can be installed onto the (empty) primary disk. Uses a
+/// two-letter SATA target (`sdaa`) that sits outside the single-letter scheme
+/// data disks use (`sda`..`sdz`), so it can never collide with a data disk.
 fn cdrom_xml(iso_path: &str) -> String {
     format!(
         "    <disk type='file' device='cdrom'>\n      \
         <driver name='qemu' type='raw'/>\n      \
         <source file='{iso}'/>\n      \
-        <target dev='sdz' bus='sata'/>\n      \
+        <target dev='sdaa' bus='sata'/>\n      \
         <readonly/>\n      \
         <boot order='1'/>\n    \
         </disk>\n",
@@ -640,8 +651,31 @@ mod tests {
         assert!(xml.contains("device='cdrom'"));
         assert!(xml.contains("<source file='/var/lib/daygleve/isos/debian.iso'/>"));
         assert!(xml.contains("<readonly/>"));
+        // The CD-ROM target sits outside the single-letter data-disk scheme.
+        assert!(xml.contains("<target dev='sdaa' bus='sata'/>"));
         assert!(xml.contains("<boot order='1'/>"), "cdrom boots first");
         // The primary disk boots second.
         assert!(xml.contains("<boot order='2'/>"), "disk boots second");
+    }
+
+    #[test]
+    fn domain_xml_bios_firmware_boot_paths() {
+        // BIOS without media: legacy <os> block boots from disk.
+        let mut vm = sample_vm();
+        vm.firmware = Firmware::Bios;
+        let xml = domain_xml(&vm);
+        assert!(xml.contains("<os>\n"), "BIOS uses the plain <os> block");
+        assert!(!xml.contains("firmware='efi'"), "BIOS is not EFI");
+        assert!(xml.contains("<boot dev='hd'/>"), "BIOS boots from disk");
+
+        // BIOS with media: switches to the boot menu + per-device order.
+        vm.cdrom = Some("/var/lib/daygleve/isos/debian.iso".to_string());
+        let xml = domain_xml(&vm);
+        assert!(!xml.contains("firmware='efi'"), "still BIOS");
+        assert!(!xml.contains("<boot dev='hd'/>"));
+        assert!(xml.contains("<bootmenu enable='yes'/>"));
+        assert!(xml.contains("device='cdrom'"));
+        assert!(xml.contains("<boot order='1'/>"));
+        assert!(xml.contains("<boot order='2'/>"));
     }
 }
