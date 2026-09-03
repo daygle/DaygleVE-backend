@@ -117,6 +117,8 @@ impl KvmService {
         let old_name = vm.name.clone();
 
         if let Some(name) = req.name {
+            // Keep the rename target path/domain-name safe, mirroring create.
+            crate::services::ensure_safe_id(&name)?;
             vm.name = name;
         }
         if let Some(vcpus) = req.vcpus {

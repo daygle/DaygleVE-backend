@@ -78,6 +78,9 @@ impl NetworkService {
         if req.name.trim().is_empty() {
             return Err(AppError::validation("bridge name must not be empty"));
         }
+        // Validate before any host change so we can't create the bridge via
+        // `ip` and then fail to persist its record (the name is also its id).
+        crate::services::ensure_safe_id(&req.name)?;
 
         // Create the bridge device (optionally VLAN-aware).
         let mut add = vec!["link", "add", "name", &req.name, "type", "bridge"];

@@ -8,7 +8,8 @@
 //! is always overlaid from the host at read time — this store holds intent and
 //! metadata, not liveness.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -33,7 +34,13 @@ impl JsonStore {
     /// store directory (allowlist-validated via [`ensure_safe_id`]).
     fn path_for(&self, id: &str) -> ApiResult<PathBuf> {
         crate::services::ensure_safe_id(id)?;
-        Ok(self.dir.join(format!("{id}.json")))
+        // Defence in depth: the record must be a single filename component, so
+        // reject anything the OS would read as a nested path or traversal.
+        let file = format!("{id}.json");
+        if Path::new(&file).file_name() != Some(OsStr::new(file.as_str())) {
+            return Err(AppError::validation(format!("invalid resource id: {id:?}")));
+        }
+        Ok(self.dir.join(file))
     }
 
     async fn ensure_dir(&self) -> ApiResult<()> {

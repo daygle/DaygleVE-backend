@@ -59,6 +59,10 @@ impl LxcService {
         if req.vcpus == 0 {
             return Err(AppError::validation("vcpus must be >= 1"));
         }
+        if req.memory_mib == 0 {
+            // Written into lxc.cgroup2.memory.max; 0 would be an unusable limit.
+            return Err(AppError::validation("memory_mib must be >= 1"));
+        }
         let (dist, release) = req.template.split_once('-').ok_or_else(|| {
             AppError::validation("template must be <dist>-<release>, e.g. debian-bookworm")
         })?;
@@ -121,8 +125,13 @@ impl LxcService {
 
     pub async fn update(&self, id: &str, req: UpdateLxcRequest) -> ApiResult<Lxc> {
         let mut ct = self.get_stored(id).await?;
-        if let Some(name) = req.name {
-            ct.name = name;
+        if req.name.is_some() {
+            // The container name is also its config path and the handle every
+            // lxc-* call targets; renaming needs a real host-side rename, which
+            // isn't implemented yet. Reject rather than silently desync.
+            return Err(AppError::validation(
+                "renaming a container is not supported yet",
+            ));
         }
         if let Some(vcpus) = req.vcpus {
             if vcpus == 0 {

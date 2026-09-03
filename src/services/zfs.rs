@@ -90,7 +90,8 @@ impl ZfsService {
         }
         args.push(req.name.clone());
 
-        command::run_ok("zfs", &to_argv(&args)).await?;
+        let argv = to_argv(&args);
+        command::run_ok("zfs", &argv).await?;
         self.get_dataset(&req.name).await
     }
 
@@ -138,7 +139,8 @@ impl ZfsService {
             args.push("-r".into());
         }
         args.push(full.clone());
-        command::run_ok("zfs", &to_argv(&args)).await?;
+        let argv = to_argv(&args);
+        command::run_ok("zfs", &argv).await?;
 
         let out = command::run(
             "zfs",
