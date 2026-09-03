@@ -61,6 +61,11 @@ impl AppError {
         Self::new(ErrorCode::Internal, message)
     }
 
+    /// The human-readable message, for composing higher-level errors.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     fn status(&self) -> StatusCode {
         match self.code {
             ErrorCode::Validation => StatusCode::BAD_REQUEST,

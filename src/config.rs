@@ -24,6 +24,10 @@ pub struct Config {
     /// Directory holding installer/live ISO images offered as VM install media.
     /// `DAYGLEVE_ISO_DIR`, default `<state_dir>/isos`.
     pub iso_dir: PathBuf,
+    /// Parent directory under which network shares (NFS/CIFS) are mounted, one
+    /// subdirectory per share id. `DAYGLEVE_MOUNTS_DIR`, default
+    /// `<state_dir>/mounts`.
+    pub mounts_dir: PathBuf,
     /// Lifetime of an issued bearer token, in seconds. `DAYGLEVE_TOKEN_TTL_SECS`,
     /// default 12 hours.
     pub token_ttl_secs: u64,
@@ -70,6 +74,12 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| state_dir.join("isos"));
 
+        let mounts_dir = std::env::var("DAYGLEVE_MOUNTS_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("mounts"));
+
         let token_ttl_secs = std::env::var("DAYGLEVE_TOKEN_TTL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -85,6 +95,7 @@ impl Config {
             web_root,
             state_dir,
             iso_dir,
+            mounts_dir,
             token_ttl_secs,
             admin_password,
         }
