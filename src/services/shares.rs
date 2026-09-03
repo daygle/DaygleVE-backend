@@ -160,8 +160,22 @@ impl ShareService {
             .await?
             .ok_or_else(|| AppError::not_found("share not found"))?;
 
-        // Best-effort unmount; a share that is already gone is not an error.
-        let _ = command::run_optional("umount", &[&share.mount_point]).await;
+        // If the share is currently mounted, unmount it and require success:
+        // never remove the record while a live mount would be left orphaned on
+        // the host (and invisible to the API). A share that isn't mounted (e.g.
+        // after a reboot) skips straight to cleanup.
+        let mounted = read_mounts().await;
+        if mounted.iter().any(|m| m == &share.mount_point) {
+            command::run_ok("umount", &[&share.mount_point])
+                .await
+                .map_err(|e| {
+                    AppError::conflict(format!(
+                        "could not unmount the share (is it in use?): {}",
+                        e.message()
+                    ))
+                })?;
+        }
+
         let _ = tokio::fs::remove_file(self.cred_path(id)).await;
         let _ = tokio::fs::remove_dir(&share.mount_point).await;
         self.store.delete(id).await?;
@@ -253,9 +267,31 @@ fn validate_export(value: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// Mount option keys the caller may not set: anything that would carry
+/// credentials (handled separately via a root-only file) or override the
+/// enforced read-only mount.
+const DENIED_OPTION_KEYS: &[&str] = &[
+    "credentials",
+    "cred",
+    "password",
+    "pass",
+    "pass2",
+    "password2",
+    "username",
+    "user",
+    "user2",
+    "domain",
+    "dom",
+    "workgroup",
+    "sec",
+    "guest",
+    "rw", // would override the enforced read-only mount
+];
+
 /// User-supplied extra mount options: restricted to option-like characters, and
-/// never allowed to smuggle in credential options that would override our own
-/// secure handling.
+/// checked key-by-key so no option can smuggle in credentials or flip the mount
+/// to read-write. Credentials are supplied via the dedicated fields and written
+/// to a root-only file; the mount is always read-only.
 fn validate_options(value: &str) -> ApiResult<()> {
     if !value
         .chars()
@@ -263,11 +299,24 @@ fn validate_options(value: &str) -> ApiResult<()> {
     {
         return Err(AppError::validation("options contain invalid characters"));
     }
-    let lowered = value.to_ascii_lowercase();
-    if lowered.contains("credentials") || lowered.contains("password") {
-        return Err(AppError::validation(
-            "credential options are not allowed here; use the username/password fields",
-        ));
+    for opt in value.split(',') {
+        let opt = opt.trim();
+        if opt.is_empty() {
+            continue;
+        }
+        // The key is everything before the first '=' (or the whole token for a
+        // bare flag like `rw`).
+        let key = opt
+            .split('=')
+            .next()
+            .unwrap_or(opt)
+            .trim()
+            .to_ascii_lowercase();
+        if DENIED_OPTION_KEYS.contains(&key.as_str()) {
+            return Err(AppError::validation(format!(
+                "mount option '{key}' is not allowed; credentials use the dedicated fields and the mount is always read-only"
+            )));
+        }
     }
     Ok(())
 }
@@ -295,9 +344,20 @@ mod tests {
 
     #[test]
     fn options_block_credential_smuggling() {
+        // Benign tuning options are allowed.
         assert!(validate_options("vers=3.0").is_ok());
+        assert!(validate_options("vers=4.1,nconnect=4").is_ok());
+        // Credentials must not travel through mount options.
         assert!(validate_options("credentials=/etc/shadow").is_err());
         assert!(validate_options("password=secret").is_err());
+        assert!(validate_options("pass=secret").is_err());
+        assert!(validate_options("username=admin").is_err());
+        assert!(validate_options("user=admin").is_err());
+        assert!(validate_options("domain=corp").is_err());
+        // rw must not override the enforced read-only mount.
+        assert!(validate_options("rw").is_err());
+        assert!(validate_options("vers=3.0,rw").is_err());
+        // Bad characters are rejected.
         assert!(validate_options("bad opt").is_err());
     }
 }
