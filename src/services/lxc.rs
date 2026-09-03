@@ -93,11 +93,20 @@ impl LxcService {
         )
         .await?;
 
-        // Apply a rootfs quota (best-effort) and write limits + networking.
+        // Apply a rootfs quota (best-effort) and write limits + networking. If
+        // writing the config fails, the container/rootfs already exist on the
+        // host — tear them down so we don't leave an orphan the record never
+        // tracks.
         let quota = format!("quota={}G", req.rootfs_size_gib);
         let _ = command::run_optional("zfs", &["set", &quota, &rootfs_dataset]).await;
-        self.write_config(&req.name, req.vcpus, req.memory_mib, &req.networks)
-            .await?;
+        if let Err(e) = self
+            .write_config(&req.name, req.vcpus, req.memory_mib, &req.networks)
+            .await
+        {
+            let _ = command::run_optional("lxc-destroy", &["-n", &req.name, "-f"]).await;
+            let _ = command::run_optional("zfs", &["destroy", "-r", &rootfs_dataset]).await;
+            return Err(e);
+        }
 
         let ct = Lxc {
             id: new_id(),
@@ -140,6 +149,10 @@ impl LxcService {
             ct.vcpus = vcpus;
         }
         if let Some(mem) = req.memory_mib {
+            if mem == 0 {
+                // 0 would write an unusable cgroup memory limit (as on create).
+                return Err(AppError::validation("memory_mib must be >= 1"));
+            }
             ct.memory_mib = mem;
         }
         if req.description.is_some() {

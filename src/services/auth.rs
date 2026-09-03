@@ -74,18 +74,31 @@ impl AuthService {
     }
 
     pub fn login(&self, req: LoginRequest) -> ApiResult<LoginResponse> {
-        let mut users = self.users.write().expect("user lock");
-        let stored = users
-            .values_mut()
-            .find(|u| u.user.username == req.username)
-            .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
+        // Snapshot the id + hash under a read lock, then run the CPU-heavy
+        // argon2 verification with no lock held, so concurrent logins aren't
+        // serialized behind each other's hashing.
+        let (user_id, hash) = {
+            let users = self.users.read().expect("user lock");
+            let stored = users
+                .values()
+                .find(|u| u.user.username == req.username)
+                .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
+            (stored.user.id.clone(), stored.password_hash.clone())
+        };
 
-        verify_password(&req.password, &stored.password_hash)?;
+        verify_password(&req.password, &hash)?;
 
         let now = Utc::now();
-        stored.user.last_login_at = Some(now.to_rfc3339());
-        let user = stored.user.clone();
-        drop(users);
+        let user = {
+            let mut users = self.users.write().expect("user lock");
+            let stored = users
+                // A concurrent deletion between verify and here: keep the same
+                // "invalid credentials" message (don't hint at the race).
+                .get_mut(&user_id)
+                .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
+            stored.user.last_login_at = Some(now.to_rfc3339());
+            stored.user.clone()
+        };
 
         // Clamp before the i64 cast so an absurd TTL can't overflow into a
         // negative (already-expired) lifetime.
