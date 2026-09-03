@@ -9,8 +9,10 @@
 //! fronts them for fast, lock-only reads on the hot authentication path. Bearer
 //! tokens remain in-memory by design — sessions are ephemeral, so they simply
 //! reset on restart and clients re-authenticate. On first start (empty store) a
-//! single `admin` account is seeded from configuration and flagged to force a
-//! password change when it is still on the default password.
+//! single `admin` account is seeded: from `DAYGLEVE_ADMIN_PASSWORD` when set,
+//! otherwise from a generated random password (written to a root-only file)
+//! that the operator must change on first login. Account mutations are
+//! serialized through an async lock so check-then-write stays consistent.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,6 +57,9 @@ pub struct AuthService {
     config: Arc<Config>,
     tokens: RwLock<HashMap<String, Session>>,
     users: RwLock<HashMap<String, StoredUser>>,
+    /// Serializes account mutations (create/update/delete/change-password) so a
+    /// read-then-write (e.g. the username-uniqueness check) is never racy.
+    mutate: tokio::sync::Mutex<()>,
     token_ttl_secs: u64,
 }
 
@@ -67,6 +72,7 @@ impl AuthService {
             config,
             tokens: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
+            mutate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -219,6 +225,9 @@ impl AuthService {
 
     /// Create a new user account.
     pub async fn create_user(&self, req: CreateUserRequest) -> ApiResult<User> {
+        // Serialize with other mutations so the uniqueness check below and the
+        // subsequent persist/insert are atomic.
+        let _guard = self.mutate.lock().await;
         let username = req.username.trim();
         if username.is_empty() {
             return Err(AppError::validation("username must not be empty"));
@@ -266,6 +275,7 @@ impl AuthService {
 
     /// Update a user's roles and/or reset their password (admin action).
     pub async fn update_user(&self, id: &str, req: UpdateUserRequest) -> ApiResult<User> {
+        let _guard = self.mutate.lock().await;
         let mut stored = self
             .users
             .read()
@@ -310,6 +320,7 @@ impl AuthService {
 
     /// Delete a user account and revoke its sessions.
     pub async fn delete_user(&self, id: &str) -> ApiResult<()> {
+        let _guard = self.mutate.lock().await;
         {
             let users = self.users.read().expect("user lock");
             let target = users
@@ -335,6 +346,7 @@ impl AuthService {
         user_id: &str,
         req: ChangePasswordRequest,
     ) -> ApiResult<()> {
+        let _guard = self.mutate.lock().await;
         if req.new_password.len() < MIN_PASSWORD_LEN {
             return Err(AppError::validation(format!(
                 "password must be at least {MIN_PASSWORD_LEN} characters"
