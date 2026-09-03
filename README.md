@@ -49,13 +49,42 @@ src/
     storage.rs network.rs gpus.rs metrics.rs
   services/          # subsystem logic (host interaction lives here)
     kvm.rs lxc.rs zfs.rs network.rs gpu.rs metrics.rs auth.rs
+    command.rs       #   async wrapper for shelling out to host tools
+    store.rs         #   per-resource persistent JSON records
 ```
 
 Handlers authenticate + authorize, then delegate to a service. All host
-interaction (libvirt/QEMU, lxc, zfs, ip/bridge, vfio, /proc) is isolated in the
-service layer. In this architecture-setup scaffold the services are backed by
-in-memory state with `TODO(...)` markers where real host calls attach, so the
-API surface and repo boundaries are exercisable end-to-end.
+interaction is isolated in the service layer, which drives the real host tools
+(the same approach Proxmox takes) rather than an in-memory mock:
+
+| Subsystem | Backed by |
+|-----------|-----------|
+| **VMs** (`kvm.rs`) | libvirt via `virsh` (`qemu:///system`); zvol-backed disks; generated domain XML; live VNC console proxied over a websocket |
+| **Containers** (`lxc.rs`) | `lxc-*` with a ZFS-backed rootfs (`-B zfs`); cgroup2 CPU/memory limits; veth networking |
+| **Storage** (`zfs.rs`) | `zpool`/`zfs` (parsed `-Hp` output) |
+| **Networking** (`network.rs`) | `ip`/`bridge` (iproute2 `-j` JSON) |
+| **GPUs** (`gpu.rs`) | `/sys/bus/pci` enumeration + `vfio-pci` rebind of the IOMMU group |
+| **Metrics** (`metrics.rs`) | `/proc` + `/sys` sampling (CPU/disk/net rates over a short delta window) |
+| **Auth** (`auth.rs`) | argon2 password hashing + random bearer tokens with a real TTL |
+
+libvirt/LXC and ZFS are the source of truth for live state; DaygleVE keeps a
+small sidecar JSON record per VM/container/bridge (in `state.rs`'s state dir)
+for the structured fields the host tools don't round-trip, and always overlays
+live power/link state at read time. Where a host tool is absent (e.g. a dev
+laptop without `zfs`/`virsh`), list endpoints degrade to empty rather than
+erroring.
+
+### Host requirements
+
+The engine expects to run **as root on the appliance** (the DaygleVE ISO ships
+all of these): `libvirt`/`qemu-system-x86_64`, `lxc`, `zfsutils-linux`,
+`iproute2`, and (for passthrough) `vfio-pci`. It also needs a writable
+`DAYGLEVE_STATE_DIR` (default `/var/lib/daygleve`).
+
+> **Validation status:** the crate builds clean and its host-independent paths
+> (auth, RBAC, `/proc` metrics, the JSON store, graceful degradation) are
+> covered by a runtime smoke test. The libvirt/LXC/ZFS/vfio paths issue the
+> correct host commands but are exercised on a real node, not in CI.
 
 ## API
 
@@ -67,9 +96,12 @@ admin is seeded; obtain a token via `POST /api/v1/auth/login` and send it as
 
 ```sh
 cargo run
-# DAYGLEVE_LISTEN=0.0.0.0:8080  (default)
+# DAYGLEVE_LISTEN=0.0.0.0:8080          (default)
 # DAYGLEVE_CORS_ORIGINS=http://localhost:5173
-# DAYGLEVE_ZPOOL=tank
+# DAYGLEVE_ZPOOL=tank                   (default pool for new datasets/zvols)
+# DAYGLEVE_STATE_DIR=/var/lib/daygleve  (persistent records)
+# DAYGLEVE_ADMIN_PASSWORD=...           (seeded admin password; change it!)
+# DAYGLEVE_TOKEN_TTL_SECS=43200         (bearer token lifetime; default 12h)
 curl localhost:8080/api/v1/health
 ```
 

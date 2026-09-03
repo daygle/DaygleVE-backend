@@ -12,10 +12,14 @@ repository = "https://github.com/daygle/DaygleVE-backend"
 # schema publishes one (see docs/VERSIONING.md there).
 daygleve-schema = { git = "https://github.com/daygle/DaygleVE-schema", branch = "main" }
 
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["time"] }
 futures = "0.3"
+# Password hashing for the auth service (pure Rust).
+argon2 = "0.5"
+# OS RNG for password salts and bearer tokens (matches argon2's rand_core).
+rand_core = { version = "0.6", features = ["getrandom"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
 serde = { version = "1", features = ["derive"] }
