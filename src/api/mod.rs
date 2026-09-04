@@ -9,6 +9,7 @@ mod gpus;
 mod health;
 mod metrics;
 mod network;
+mod operations;
 mod storage;
 mod users;
 mod vms;
@@ -39,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .merge(containers::routes())
         .merge(storage::routes())
         .merge(network::routes())
+        .merge(operations::routes())
         .merge(gpus::routes())
         .merge(metrics::routes());
 

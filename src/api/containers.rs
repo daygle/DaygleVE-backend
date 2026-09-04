@@ -32,7 +32,17 @@ async fn create(
     Json(req): Json<CreateLxcRequest>,
 ) -> ApiResult<(StatusCode, Json<Lxc>)> {
     user.require(Permission::LxcWrite)?;
-    let ct = state.services.lxc.create(req).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let ct = operations
+        .run(
+            "container.create",
+            Some("container"),
+            None,
+            move || async move { operation_services.lxc.create(req).await },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(ct)))
 }
 
@@ -52,7 +62,19 @@ async fn update(
     Json(req): Json<UpdateLxcRequest>,
 ) -> ApiResult<Json<Lxc>> {
     user.require(Permission::LxcWrite)?;
-    Ok(Json(state.services.lxc.update(&id, req).await?))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let ct = operations
+        .run(
+            "container.update",
+            Some("container"),
+            Some(&resource_id),
+            move || async move { operation_services.lxc.update(&id, req).await },
+        )
+        .await?;
+    Ok(Json(ct))
 }
 
 async fn delete(
@@ -61,7 +83,18 @@ async fn delete(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     user.require(Permission::LxcWrite)?;
-    state.services.lxc.delete(&id).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    operations
+        .run(
+            "container.delete",
+            Some("container"),
+            Some(&resource_id),
+            move || async move { operation_services.lxc.delete(&id).await },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -72,6 +105,17 @@ async fn power(
     Json(req): Json<LxcPowerRequest>,
 ) -> ApiResult<(StatusCode, Json<Lxc>)> {
     user.require(Permission::LxcPower)?;
-    let ct = state.services.lxc.power(&id, req.action).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let ct = operations
+        .run(
+            "container.power",
+            Some("container"),
+            Some(&resource_id),
+            move || async move { operation_services.lxc.power(&id, req.action).await },
+        )
+        .await?;
     Ok((StatusCode::ACCEPTED, Json(ct)))
 }

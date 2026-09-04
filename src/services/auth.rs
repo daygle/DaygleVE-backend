@@ -499,6 +499,7 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 GpuRead,
                 GpuWrite,
                 MetricsRead,
+                OperationsRead,
                 UserAdmin,
             ],
             Role::Operator => &[
@@ -515,6 +516,7 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 GpuRead,
                 GpuWrite,
                 MetricsRead,
+                OperationsRead,
             ],
             Role::Viewer => &[
                 VmRead,
@@ -523,6 +525,7 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 NetworkRead,
                 GpuRead,
                 MetricsRead,
+                OperationsRead,
             ],
         };
         for p in granted {

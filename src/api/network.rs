@@ -31,10 +31,18 @@ async fn create_bridge(
     Json(req): Json<CreateBridgeRequest>,
 ) -> ApiResult<(StatusCode, Json<Bridge>)> {
     user.require(Permission::NetworkWrite)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(state.services.network.create_bridge(req).await?),
-    ))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let bridge = operations
+        .run(
+            "network.create_bridge",
+            Some("bridge"),
+            None,
+            move || async move { operation_services.network.create_bridge(req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(bridge)))
 }
 
 async fn list_vlans(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<Vlan>>> {
@@ -48,8 +56,16 @@ async fn create_vlan(
     Json(req): Json<CreateVlanRequest>,
 ) -> ApiResult<(StatusCode, Json<Vlan>)> {
     user.require(Permission::NetworkWrite)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(state.services.network.create_vlan(req).await?),
-    ))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let vlan = operations
+        .run(
+            "network.create_vlan",
+            Some("vlan"),
+            None,
+            move || async move { operation_services.network.create_vlan(req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(vlan)))
 }

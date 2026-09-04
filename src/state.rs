@@ -23,6 +23,13 @@ impl AppState {
         let config = Arc::new(config);
         let services = Arc::new(Services::new(config.clone()));
         services.auth.load_or_seed().await?;
+        let recovered = services.operations.recover_interrupted().await?;
+        if recovered.interrupted > 0 {
+            tracing::warn!(
+                interrupted = recovered.interrupted,
+                "startup recovered interrupted operations; inspect the operations endpoint"
+            );
+        }
         Ok(Self {
             config,
             services,

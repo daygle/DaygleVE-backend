@@ -46,10 +46,18 @@ async fn create_dataset(
     Json(req): Json<CreateDatasetRequest>,
 ) -> ApiResult<(StatusCode, Json<Dataset>)> {
     user.require(Permission::StorageWrite)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(state.services.zfs.create_dataset(req).await?),
-    ))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let dataset = operations
+        .run(
+            "storage.create_dataset",
+            Some("dataset"),
+            None,
+            move || async move { operation_services.zfs.create_dataset(req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(dataset)))
 }
 
 async fn list_snapshots(
@@ -68,10 +76,19 @@ async fn create_snapshot(
     Json(req): Json<CreateSnapshotRequest>,
 ) -> ApiResult<(StatusCode, Json<Snapshot>)> {
     user.require(Permission::StorageWrite)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(state.services.zfs.create_snapshot(&id, req).await?),
-    ))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let snapshot = operations
+        .run(
+            "storage.create_snapshot",
+            Some("snapshot"),
+            Some(&resource_id),
+            move || async move { operation_services.zfs.create_snapshot(&id, req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(snapshot)))
 }
 
 async fn clone_snapshot(
@@ -81,10 +98,19 @@ async fn clone_snapshot(
     Json(req): Json<CloneSnapshotRequest>,
 ) -> ApiResult<(StatusCode, Json<Dataset>)> {
     user.require(Permission::StorageWrite)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(state.services.zfs.clone_snapshot(&id, req).await?),
-    ))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let dataset = operations
+        .run(
+            "storage.clone_snapshot",
+            Some("dataset"),
+            Some(&resource_id),
+            move || async move { operation_services.zfs.clone_snapshot(&id, req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(dataset)))
 }
 
 // --- Network shares (NFS/CIFS) ---
@@ -103,10 +129,18 @@ async fn create_share(
     Json(req): Json<CreateShareRequest>,
 ) -> ApiResult<(StatusCode, Json<NetworkShare>)> {
     user.require(Permission::StorageWrite)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(state.services.shares.create(req).await?),
-    ))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let share = operations
+        .run(
+            "storage.create_share",
+            Some("share"),
+            None,
+            move || async move { operation_services.shares.create(req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(share)))
 }
 
 async fn delete_share(
@@ -115,6 +149,17 @@ async fn delete_share(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     user.require(Permission::StorageWrite)?;
-    state.services.shares.delete(&id).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    operations
+        .run(
+            "storage.delete_share",
+            Some("share"),
+            Some(&resource_id),
+            move || async move { operation_services.shares.delete(&id).await },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -66,7 +66,14 @@ async fn create(
     Json(req): Json<CreateVmRequest>,
 ) -> ApiResult<(StatusCode, Json<Vm>)> {
     user.require(Permission::VmWrite)?;
-    let vm = state.services.kvm.create(req).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let vm = operations
+        .run("vm.create", Some("vm"), None, move || async move {
+            operation_services.kvm.create(req).await
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(vm)))
 }
 
@@ -86,7 +93,19 @@ async fn update(
     Json(req): Json<UpdateVmRequest>,
 ) -> ApiResult<Json<Vm>> {
     user.require(Permission::VmWrite)?;
-    Ok(Json(state.services.kvm.update(&id, req).await?))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let vm = operations
+        .run(
+            "vm.update",
+            Some("vm"),
+            Some(&resource_id),
+            move || async move { operation_services.kvm.update(&id, req).await },
+        )
+        .await?;
+    Ok(Json(vm))
 }
 
 async fn delete(
@@ -95,7 +114,18 @@ async fn delete(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     user.require(Permission::VmWrite)?;
-    state.services.kvm.delete(&id).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    operations
+        .run(
+            "vm.delete",
+            Some("vm"),
+            Some(&resource_id),
+            move || async move { operation_services.kvm.delete(&id).await },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -106,7 +136,18 @@ async fn power(
     Json(req): Json<VmPowerRequest>,
 ) -> ApiResult<(StatusCode, Json<Vm>)> {
     user.require(Permission::VmPower)?;
-    let vm = state.services.kvm.power(&id, req.action).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let vm = operations
+        .run(
+            "vm.power",
+            Some("vm"),
+            Some(&resource_id),
+            move || async move { operation_services.kvm.power(&id, req.action).await },
+        )
+        .await?;
     Ok((StatusCode::ACCEPTED, Json(vm)))
 }
 
@@ -117,7 +158,18 @@ async fn clone_vm(
     Json(req): Json<CloneVmRequest>,
 ) -> ApiResult<(StatusCode, Json<Vm>)> {
     user.require(Permission::VmWrite)?;
-    let vm = state.services.kvm.clone(&id, req).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let vm = operations
+        .run(
+            "vm.clone",
+            Some("vm"),
+            Some(&resource_id),
+            move || async move { operation_services.kvm.clone(&id, req).await },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(vm)))
 }
 
@@ -137,7 +189,18 @@ async fn create_snapshot(
     Json(req): Json<CreateVmSnapshotRequest>,
 ) -> ApiResult<(StatusCode, Json<VmSnapshot>)> {
     user.require(Permission::VmWrite)?;
-    let snap = state.services.kvm.create_snapshot(&id, req).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let snap = operations
+        .run(
+            "vm.create_snapshot",
+            Some("vm"),
+            Some(&resource_id),
+            move || async move { operation_services.kvm.create_snapshot(&id, req).await },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(snap)))
 }
 
@@ -147,7 +210,18 @@ async fn rollback_snapshot(
     Path((id, name)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     user.require(Permission::VmWrite)?;
-    state.services.kvm.rollback_snapshot(&id, &name).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    operations
+        .run(
+            "vm.rollback_snapshot",
+            Some("vm"),
+            Some(&resource_id),
+            move || async move { operation_services.kvm.rollback_snapshot(&id, &name).await },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -157,7 +231,18 @@ async fn delete_snapshot(
     Path((id, name)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     user.require(Permission::VmWrite)?;
-    state.services.kvm.delete_snapshot(&id, &name).await?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    operations
+        .run(
+            "vm.delete_snapshot",
+            Some("vm"),
+            Some(&resource_id),
+            move || async move { operation_services.kvm.delete_snapshot(&id, &name).await },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

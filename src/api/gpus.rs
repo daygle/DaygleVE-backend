@@ -29,8 +29,17 @@ async fn bind(
     Json(req): Json<BindGpuRequest>,
 ) -> ApiResult<(StatusCode, Json<GpuDevice>)> {
     user.require(Permission::GpuWrite)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(state.services.gpu.bind(&pci_address, req).await?),
-    ))
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = pci_address.clone();
+    let device = operations
+        .run(
+            "gpu.bind",
+            Some("gpu"),
+            Some(&resource_id),
+            move || async move { operation_services.gpu.bind(&pci_address, req).await },
+        )
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(device)))
 }
