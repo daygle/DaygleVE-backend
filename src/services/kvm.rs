@@ -364,12 +364,18 @@ impl KvmService {
                 "a snapshot named {tag:?} already exists"
             )));
         }
-        // One `zfs snapshot` call over all disks is atomic across datasets of the
-        // same pool, so the set captures a single point in time.
+        // One `zfs snapshot` call over all disks captures them together, and is
+        // atomic when the disks share a pool (the common single-node case). Across
+        // pools ZFS still creates the whole set but not atomically, so on any
+        // failure we best-effort destroy whatever got created to avoid leaving a
+        // half-formed snapshot behind.
         let targets: Vec<String> = datasets.iter().map(|d| format!("{d}@{tag}")).collect();
         let mut args: Vec<&str> = vec!["snapshot"];
         args.extend(targets.iter().map(String::as_str));
         if let Err(e) = command::run_ok("zfs", &args).await {
+            for target in &targets {
+                let _ = command::run_ok("zfs", &["destroy", target]).await;
+            }
             // The pre-check above narrows the window, but a concurrent request can
             // still win the race; surface that as a 409 rather than a 502.
             if is_already_exists(&e) {
@@ -400,10 +406,13 @@ impl KvmService {
         let vm = self.get_stored(id).await?;
         let tag = ensure_safe_snapshot(name)?;
         self.require_stopped(&vm, "rolling back a snapshot").await?;
-        if !self.list_snapshots(id).await?.iter().any(|s| s.name == tag) {
+        // Require the snapshot on every disk before touching any of them, so an
+        // incomplete snapshot yields a clean 404 rather than a mid-loop 502.
+        let datasets = snapshot_datasets(&vm)?;
+        if !self.snapshot_on_all_disks(&datasets, tag).await {
             return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
         }
-        for dataset in snapshot_datasets(&vm)? {
+        for dataset in &datasets {
             let target = format!("{dataset}@{tag}");
             command::run_ok("zfs", &["rollback", "-r", &target]).await?;
         }
@@ -414,14 +423,34 @@ impl KvmService {
     pub async fn delete_snapshot(&self, id: &str, name: &str) -> ApiResult<()> {
         let vm = self.get_stored(id).await?;
         let tag = ensure_safe_snapshot(name)?;
-        if !self.list_snapshots(id).await?.iter().any(|s| s.name == tag) {
+        // As with rollback, verify the snapshot on every disk up front so a
+        // partial snapshot is a 404 rather than a half-completed destroy.
+        let datasets = snapshot_datasets(&vm)?;
+        if !self.snapshot_on_all_disks(&datasets, tag).await {
             return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
         }
-        for dataset in snapshot_datasets(&vm)? {
+        for dataset in &datasets {
             let target = format!("{dataset}@{tag}");
             command::run_ok("zfs", &["destroy", &target]).await?;
         }
         Ok(())
+    }
+
+    /// Whether `dataset@tag` exists for every one of the given datasets. Any
+    /// dataset that lacks the snapshot (or a host without `zfs`) yields `false`,
+    /// so callers can reject an incomplete snapshot before a destructive loop.
+    async fn snapshot_on_all_disks(&self, datasets: &[&str], tag: &str) -> bool {
+        for dataset in datasets {
+            let target = format!("{dataset}@{tag}");
+            let present = matches!(
+                command::run_optional("zfs", &["list", "-H", "-o", "name", "-t", "snapshot", &target]).await,
+                Ok(Some(o)) if !o.trim().is_empty()
+            );
+            if !present {
+                return false;
+            }
+        }
+        !datasets.is_empty()
     }
 
     // --- internals -------------------------------------------------------
