@@ -198,6 +198,65 @@ impl NetworkService {
             .collect())
     }
 
+    /// Compare persisted bridge/VLAN records to live host state, returning findings.
+    ///
+    /// Read-only: never modifies the host or the store.
+    pub async fn reconcile_with_host(
+        &self,
+        stored_ids: &std::collections::HashSet<String>,
+    ) -> ApiResult<(Vec<String>, Vec<String>)> {
+        let mut missing_in_host = Vec::new();
+        let mut missing_in_store = Vec::new();
+
+        // Bridges recorded but not present on the host.
+        let stored_bridges: Vec<daygleve_schema::network::Bridge> = self.bridges.list().await?;
+        let live_bridges = self.list_bridges().await?;
+        let live_bridge_names: std::collections::HashSet<&str> =
+            live_bridges.iter().map(|b| b.name.as_str()).collect();
+        for bridge in stored_bridges {
+            if !live_bridge_names.contains(bridge.name.as_str()) {
+                missing_in_host.push(bridge.name.clone());
+            }
+        }
+
+        // Bridges present on the host but not recorded.
+        for bridge in live_bridges {
+            if !stored_ids.contains(bridge.id.as_str()) {
+                missing_in_store.push(bridge.name.clone());
+            }
+        }
+
+        // VLANs recorded but not present (best-effort: check via bridge vlan show).
+        let stored_vlans = self.vlans.list().await?;
+        for vlan in stored_vlans {
+            if let Ok(Some(result)) = self.vlan_exists_on_host(&vlan).await {
+                if !result {
+                    missing_in_host.push(format!("vlan {}", vlan.tag));
+                }
+            }
+            // Don't fail the whole reconciliation for a single VLAN check failure.
+        }
+
+        Ok((missing_in_host, missing_in_store))
+    }
+
+    /// Check whether a VLAN exists on the host via `bridge vlan show`.
+    async fn vlan_exists_on_host(
+        &self,
+        vlan: &daygleve_schema::network::Vlan,
+    ) -> ApiResult<Option<bool>> {
+        match command::run_optional("bridge", &["vlan", "show", "dev", &vlan.bridge]).await {
+            Ok(Some(out)) => {
+                let exists = out
+                    .lines()
+                    .any(|line| line.contains(&format!("vid {}", vlan.tag)));
+                Ok(Some(exists))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// First IPv4 address on `bridge` in CIDR form, if any.
     async fn bridge_address(&self, bridge: &str) -> ApiResult<Option<String>> {
         let json = match command::run_optional("ip", &["-j", "addr", "show", "dev", bridge]).await?

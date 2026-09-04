@@ -381,6 +381,78 @@ impl KvmService {
         }
     }
 
+    /// Compare persisted VM records to live libvirt domains, returning findings
+    /// about VMs that exist in one but not the other.
+    ///
+    /// Read-only: never modifies the host or the store.
+    pub async fn reconcile_with_host(
+        &self,
+        stored_ids: &std::collections::HashSet<String>,
+    ) -> ApiResult<(Vec<String>, Vec<String>)> {
+        let mut missing_in_host = Vec::new();
+        let mut missing_in_store = Vec::new();
+
+        // VMs that are in the store but not defined in libvirt.
+        for id in stored_ids {
+            let exists = match self.virsh_opt(&["domstate", id]).await {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(_) => {
+                    // If libvirt can't even be queried, stop the comparison —
+                    // don't report individual VMs as missing (would be noisy).
+                    return Err(AppError::hypervisor(
+                        "libvirt is unavailable; cannot reconcile VMs",
+                    ));
+                }
+            };
+            if !exists {
+                let name = self
+                    .get_stored(id)
+                    .await
+                    .map(|vm| vm.name)
+                    .unwrap_or_default();
+                missing_in_host.push(format!("{} ({})", name, id));
+            }
+        }
+
+        // Domains defined in libvirt but not tracked in the DaygleVE store.
+        // `list` returns all domains; filter out our known ids.
+        let all_domains = self.list_all_domains().await?;
+        for dom in all_domains {
+            if !stored_ids.contains(&dom.id) {
+                missing_in_store.push(dom.id);
+            }
+        }
+
+        Ok((missing_in_host, missing_in_store))
+    }
+
+    /// All libvirt domains visible under `qemu:///system`, as summaries.
+    async fn list_all_domains(&self) -> ApiResult<Vec<VmSummary>> {
+        let out = match command::run_optional("virsh", &["-c", CONNECT, "list", "--all", "--name"])
+            .await
+        {
+            Ok(Some(o)) => o,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut out_vec = Vec::new();
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            // We can only get the name here; the id is the domain name in
+            // libvirt. We report the name as the identifier for drift.
+            out_vec.push(VmSummary {
+                id: line.trim().to_string(),
+                name: line.trim().to_string(),
+                state: VmState::Stopped,
+                vcpus: 0,
+                memory_mib: 0,
+                created_at: now_ts(),
+            });
+        }
+        Ok(out_vec)
+    }
+
     pub async fn power(&self, id: &str, action: VmPowerAction) -> ApiResult<Vm> {
         let mut vm = self.get_stored(id).await?;
         let subcommand = match action {

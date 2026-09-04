@@ -258,9 +258,75 @@ impl LxcService {
             _ => None,
         }
     }
+    /// Append CPU/memory cgroup limits and vet the bridge name.
+    ///
+    /// Compare persisted container records to live lxc containers, returning findings
+    /// about containers that exist in one but not the other.
+    ///
+    /// Read-only: never modifies the host or the store.
+    pub async fn reconcile_with_host(
+        &self,
+        stored_ids: &std::collections::HashSet<String>,
+    ) -> ApiResult<(Vec<String>, Vec<String>)> {
+        let mut missing_in_host = Vec::new();
+        let mut missing_in_store = Vec::new();
 
-    /// Append CPU/memory cgroup limits and veth networking to the container's
-    /// config file.
+        // Containers that are in the store but not in lxc.
+        for id in stored_ids {
+            let ct = match self.get_stored(id).await {
+                Ok(ct) => ct,
+                Err(_) => continue,
+            };
+            let exists = match command::run_optional("lxc-info", &["-n", &ct.name, "-sH"]).await {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(_) => {
+                    // If lxc-info can't be run, stop the comparison.
+                    return Err(AppError::hypervisor(
+                        "lxc-info is unavailable; cannot reconcile containers",
+                    ));
+                }
+            };
+            if !exists {
+                missing_in_host.push(ct.name.clone());
+            }
+        }
+
+        // Containers defined in lxc but not tracked in the store.
+        let all_containers = self.list_all_containers().await?;
+        for ct in all_containers {
+            if !stored_ids.contains(&ct.id) {
+                missing_in_store.push(ct.name);
+            }
+        }
+
+        Ok((missing_in_host, missing_in_store))
+    }
+
+    /// All lxc containers visible on the host, as summaries.
+    async fn list_all_containers(&self) -> ApiResult<Vec<LxcSummary>> {
+        let out = match command::run_optional("lxc-ls", &["-1", "--active", "--nesting"]).await {
+            Ok(Some(o)) => o,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut out_vec = Vec::new();
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            out_vec.push(LxcSummary {
+                id: line.trim().to_string(),
+                name: line.trim().to_string(),
+                state: LxcState::Stopped,
+                vcpus: 0,
+                memory_mib: 0,
+                created_at: now_ts(),
+            });
+        }
+        Ok(out_vec)
+    }
+    /// Write CPU/memory cgroup limits and vet the bridge name.
+    ///
+    /// Config
     async fn write_config(
         &self,
         name: &str,

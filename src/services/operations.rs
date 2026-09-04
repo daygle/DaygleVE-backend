@@ -168,6 +168,10 @@ impl OperationService {
     /// Enqueue a read-only host inventory scan. Listing services overlay their
     /// live host state onto persisted records, making this an automatic
     /// reconciliation pass without risking an unsolicited host mutation.
+    ///
+    /// The scan also compares persisted records to live host state and reports
+    /// drift findings (VMs/containers/bridges that exist in one but not the
+    /// other). Drift is informational only — the scan never auto-corrects.
     pub(crate) async fn enqueue_reconciliation(
         self: &Arc<Self>,
         services: Arc<Services>,
@@ -203,12 +207,113 @@ impl OperationService {
                     .await?;
                 let gpus = services.gpu.list().await?.len();
 
-                Ok(Some(format!(
+                // Phase 2: drift detection — compare persisted records to live state.
+                operations
+                    .update_progress(&handle.id, 90, Some("checking for drift"))
+                    .await?;
+                let drift = Self::detect_drift(
+                    &services,
+                    &operations.store,
+                )
+                .await?;
+
+                let mut msg = format!(
                     "reconciled {vms} VMs, {containers} containers, {datasets} datasets, {bridges} bridges, {shares} shares, and {gpus} GPUs"
-                )))
+                );
+                if !drift.is_empty() {
+                    msg.push_str(&format!(
+                        "; drift: {drift}"
+                    ));
+                }
+                Ok(Some(msg))
             },
         )
         .await
+    }
+
+    /// Compare persisted records to live host state and return a human-readable
+    /// summary of discrepancies. Read-only: never modifies the host or store.
+    async fn detect_drift(services: &Arc<Services>, store: &JsonStore) -> ApiResult<String> {
+        let mut findings: Vec<String> = Vec::new();
+
+        // VMs.
+        let stored_vm_ids: std::collections::HashSet<String> = store
+            .list::<daygleve_schema::vm::Vm>()
+            .await?
+            .into_iter()
+            .map(|vm| vm.id)
+            .collect();
+        let (vm_missing_host, vm_missing_store) =
+            services.kvm.reconcile_with_host(&stored_vm_ids).await?;
+        if !vm_missing_host.is_empty() {
+            findings.push(format!(
+                "{} VMs missing from libvirt: {}",
+                vm_missing_host.len(),
+                vm_missing_host.join(", ")
+            ));
+        }
+        if !vm_missing_store.is_empty() {
+            findings.push(format!(
+                "{} VMs in libvirt but not in store: {}",
+                vm_missing_store.len(),
+                vm_missing_store.join(", ")
+            ));
+        }
+
+        // Containers.
+        let stored_ct_ids: std::collections::HashSet<String> = store
+            .list::<daygleve_schema::lxc::Lxc>()
+            .await?
+            .into_iter()
+            .map(|ct| ct.id)
+            .collect();
+        let (ct_missing_host, ct_missing_store) =
+            services.lxc.reconcile_with_host(&stored_ct_ids).await?;
+        if !ct_missing_host.is_empty() {
+            findings.push(format!(
+                "{} containers missing from lxc: {}",
+                ct_missing_host.len(),
+                ct_missing_host.join(", ")
+            ));
+        }
+        if !ct_missing_store.is_empty() {
+            findings.push(format!(
+                "{} containers in lxc but not in store: {}",
+                ct_missing_store.len(),
+                ct_missing_store.join(", ")
+            ));
+        }
+
+        // Network.
+        let mut stored_net_ids: std::collections::HashSet<String> = store
+            .list::<daygleve_schema::network::Bridge>()
+            .await?
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        let vlans: Vec<daygleve_schema::network::Vlan> = store.list().await?;
+        stored_net_ids.extend(vlans.into_iter().map(|v| v.id));
+
+        let (net_missing_host, net_missing_store) = services
+            .network
+            .reconcile_with_host(&stored_net_ids)
+            .await?;
+        if !net_missing_host.is_empty() {
+            findings.push(format!(
+                "{} network resources missing from host: {}",
+                net_missing_host.len(),
+                net_missing_host.join(", ")
+            ));
+        }
+        if !net_missing_store.is_empty() {
+            findings.push(format!(
+                "{} network resources on host but not in store: {}",
+                net_missing_store.len(),
+                net_missing_store.join(", ")
+            ));
+        }
+
+        Ok(findings.join("; "))
     }
 
     /// List operation records, newest first.
@@ -293,6 +398,7 @@ impl OperationService {
             resource_type: resource_type.map(str::to_string),
             resource_id: resource_id.map(str::to_string),
             result_id: None,
+            drift: None,
             created_at: now,
             started_at,
             finished_at: None,
