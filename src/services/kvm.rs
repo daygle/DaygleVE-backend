@@ -282,12 +282,18 @@ impl KvmService {
 
     // --- snapshots -------------------------------------------------------
 
-    /// List the VM's snapshots, one entry per snapshot name taken across the
-    /// VM's disks. `used_bytes` is summed over the per-disk snapshots.
+    /// List the VM's snapshots, one entry per snapshot name present on *every*
+    /// one of the VM's disks. `used_bytes` is summed over those per-disk
+    /// snapshots. Names that cover only some disks (e.g. a partial cross-pool
+    /// create) are omitted, so the list stays consistent with rollback/delete —
+    /// which operate on all disks — and with the summed-bytes semantics.
     pub async fn list_snapshots(&self, id: &str) -> ApiResult<Vec<VmSnapshot>> {
         let vm = self.get_stored(id).await?;
-        let mut by_name: BTreeMap<String, VmSnapshot> = BTreeMap::new();
-        for dataset in snapshot_datasets(&vm)? {
+        let datasets = snapshot_datasets(&vm)?;
+        let disk_count = datasets.len();
+        // Each entry pairs the accumulating snapshot with how many disks carry it.
+        let mut by_name: BTreeMap<String, (VmSnapshot, usize)> = BTreeMap::new();
+        for &dataset in &datasets {
             // `-d 1` limits to the dataset's own snapshots; `-p` gives raw bytes
             // and a unix `creation`. A dataset that exists but has no snapshots
             // lists cleanly (empty output), so a *non-zero* exit is either a
@@ -333,15 +339,19 @@ impl KvmService {
                 let Some((_, tag)) = full.split_once('@') else {
                     continue;
                 };
-                let entry = by_name
-                    .entry(tag.to_string())
-                    .or_insert_with(|| VmSnapshot {
-                        name: tag.to_string(),
-                        used_bytes: 0,
-                        description: None,
-                        created_at: ts_from_unix(creation),
-                    });
+                let (entry, count) = by_name.entry(tag.to_string()).or_insert_with(|| {
+                    (
+                        VmSnapshot {
+                            name: tag.to_string(),
+                            used_bytes: 0,
+                            description: None,
+                            created_at: ts_from_unix(creation),
+                        },
+                        0,
+                    )
+                });
                 entry.used_bytes = entry.used_bytes.saturating_add(used);
+                *count += 1;
                 // Take the description from whichever disk carries one, rather than
                 // letting an unset (`-`) first disk mask a later disk's value.
                 if entry.description.is_none() && desc != "-" && !desc.is_empty() {
@@ -349,7 +359,11 @@ impl KvmService {
                 }
             }
         }
-        Ok(by_name.into_values().collect())
+        Ok(by_name
+            .into_values()
+            .filter(|(_, count)| disk_count > 0 && *count == disk_count)
+            .map(|(snap, _)| snap)
+            .collect())
     }
 
     /// Snapshot every one of the VM's disks under a single name. Works while the
@@ -423,7 +437,7 @@ impl KvmService {
         // Require the snapshot on every disk before touching any of them, so an
         // incomplete snapshot yields a clean 404 rather than a mid-loop 502.
         let datasets = snapshot_datasets(&vm)?;
-        if !self.snapshot_on_all_disks(&datasets, tag).await {
+        if !self.snapshot_on_all_disks(&datasets, tag).await? {
             return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
         }
         for dataset in &datasets {
@@ -440,7 +454,7 @@ impl KvmService {
         // As with rollback, verify the snapshot on every disk up front so a
         // partial snapshot is a 404 rather than a half-completed destroy.
         let datasets = snapshot_datasets(&vm)?;
-        if !self.snapshot_on_all_disks(&datasets, tag).await {
+        if !self.snapshot_on_all_disks(&datasets, tag).await? {
             return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
         }
         for dataset in &datasets {
@@ -450,21 +464,40 @@ impl KvmService {
         Ok(())
     }
 
-    /// Whether `dataset@tag` exists for every one of the given datasets. Any
-    /// dataset that lacks the snapshot (or a host without `zfs`) yields `false`,
-    /// so callers can reject an incomplete snapshot before a destructive loop.
-    async fn snapshot_on_all_disks(&self, datasets: &[&str], tag: &str) -> bool {
+    /// Whether `dataset@tag` exists on every one of the given datasets, so a
+    /// caller can reject an incomplete snapshot before a destructive loop.
+    /// Returns `Ok(false)` when at least one disk lacks the snapshot (a clean
+    /// 404), but a missing `zfs` binary is an operational error on these
+    /// destructive endpoints and surfaces as a hypervisor error (502) rather than
+    /// masquerading as "not found".
+    async fn snapshot_on_all_disks(&self, datasets: &[&str], tag: &str) -> ApiResult<bool> {
+        if datasets.is_empty() {
+            return Ok(false);
+        }
         for dataset in datasets {
             let target = format!("{dataset}@{tag}");
-            let present = matches!(
-                command::run_optional("zfs", &["list", "-H", "-o", "name", "-t", "snapshot", &target]).await,
-                Ok(Some(o)) if !o.trim().is_empty()
-            );
-            if !present {
-                return false;
+            match command::run_optional(
+                "zfs",
+                &["list", "-H", "-o", "name", "-t", "snapshot", &target],
+            )
+            .await
+            {
+                Ok(Some(o)) if !o.trim().is_empty() => {}
+                // Empty output, or a "does not exist" error: the snapshot is
+                // absent on this dataset, so it isn't complete → 404.
+                Ok(Some(_)) => return Ok(false),
+                Err(e) if is_missing_dataset(&e) => return Ok(false),
+                // zfs isn't installed: a host-configuration problem, not a 404.
+                Ok(None) => {
+                    return Err(AppError::hypervisor(
+                        "zfs is not installed; cannot manage snapshots",
+                    ))
+                }
+                // A permission/transient failure must not masquerade as 404.
+                Err(e) => return Err(e),
             }
         }
-        !datasets.is_empty()
+        Ok(true)
     }
 
     // --- internals -------------------------------------------------------
@@ -508,7 +541,8 @@ impl KvmService {
             None => {
                 if self.hypervisor_unreachable().await {
                     Err(AppError::conflict(
-                        "cannot confirm the VM is stopped (hypervisor unreachable); try again",
+                        "cannot confirm the VM is stopped: the libvirt connection is unavailable \
+                         (check libvirtd, the qemu:///system socket and permissions); try again",
                     ))
                 } else {
                     Ok(())
@@ -702,9 +736,10 @@ fn map_vm_state(s: &str) -> VmState {
 }
 
 /// Format a unix epoch (seconds, from ZFS `creation -p`) as the schema's RFC-3339
-/// timestamp. Falls back to the current time only for a `secs` that lands outside
-/// the representable range (a non-numeric `creation` was already coerced to 0 by
-/// the caller's `parse().unwrap_or(0)`, which is in range).
+/// timestamp. The caller only reaches here with a `creation` that already parsed
+/// as an `i64` (rows whose columns don't parse are skipped), so the current-time
+/// fallback covers just the theoretical case of a `secs` outside the range
+/// `DateTime` can represent.
 fn ts_from_unix(secs: i64) -> daygleve_schema::common::Timestamp {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| dt.to_rfc3339())
