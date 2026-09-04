@@ -483,15 +483,18 @@ impl KvmService {
             .await
             {
                 Ok(Some(o)) if !o.trim().is_empty() => {}
-                // Empty output, or a non-zero exit (snapshot absent on this
-                // dataset): the snapshot isn't complete → 404.
-                Ok(Some(_)) | Err(_) => return Ok(false),
+                // Empty output, or a "does not exist" error: the snapshot is
+                // absent on this dataset, so it isn't complete → 404.
+                Ok(Some(_)) => return Ok(false),
+                Err(e) if is_missing_dataset(&e) => return Ok(false),
                 // zfs isn't installed: a host-configuration problem, not a 404.
                 Ok(None) => {
                     return Err(AppError::hypervisor(
                         "zfs is not installed; cannot manage snapshots",
                     ))
                 }
+                // A permission/transient failure must not masquerade as 404.
+                Err(e) => return Err(e),
             }
         }
         Ok(true)
