@@ -287,10 +287,12 @@ impl KvmService {
     pub async fn list_snapshots(&self, id: &str) -> ApiResult<Vec<VmSnapshot>> {
         let vm = self.get_stored(id).await?;
         let mut by_name: BTreeMap<String, VmSnapshot> = BTreeMap::new();
-        for disk in vm.disks.iter().filter(|d| !d.dataset.trim().is_empty()) {
+        for dataset in snapshot_datasets(&vm)? {
             // `-d 1` limits to the dataset's own snapshots; `-p` gives raw bytes
-            // and a unix `creation`. A dataset with no snapshots exits non-zero,
-            // and a host without zfs yields `Ok(None)` — both mean "nothing here".
+            // and a unix `creation`. A dataset that exists but has no snapshots
+            // lists cleanly (empty output), so a *non-zero* exit is either a
+            // not-yet-provisioned dataset (skip) or a genuine failure — a missing
+            // `zfs` binary (dev host) yields `Ok(None)`, also nothing to list.
             let out = match command::run_optional(
                 "zfs",
                 &[
@@ -303,13 +305,17 @@ impl KvmService {
                     "1",
                     "-o",
                     "name,used,creation,daygleve:description",
-                    disk.dataset.trim(),
+                    dataset,
                 ],
             )
             .await
             {
                 Ok(Some(o)) => o,
-                _ => continue,
+                Ok(None) => continue,
+                // Don't hide permission/transient errors as "no snapshots"; only
+                // a dataset that simply doesn't exist yet is safe to skip.
+                Err(e) if is_missing_dataset(&e) => continue,
+                Err(e) => return Err(e),
             };
             for line in out.lines() {
                 let mut cols = line.split('\t');
@@ -325,10 +331,15 @@ impl KvmService {
                     .or_insert_with(|| VmSnapshot {
                         name: tag.to_string(),
                         used_bytes: 0,
-                        description: (desc != "-" && !desc.is_empty()).then(|| desc.to_string()),
+                        description: None,
                         created_at: ts_from_unix(creation),
                     });
                 entry.used_bytes = entry.used_bytes.saturating_add(used);
+                // Take the description from whichever disk carries one, rather than
+                // letting an unset (`-`) first disk mask a later disk's value.
+                if entry.description.is_none() && desc != "-" && !desc.is_empty() {
+                    entry.description = Some(desc.to_string());
+                }
             }
         }
         Ok(by_name.into_values().collect())
@@ -344,12 +355,7 @@ impl KvmService {
     ) -> ApiResult<VmSnapshot> {
         let vm = self.get_stored(id).await?;
         let tag = ensure_safe_snapshot(&req.name)?;
-        let datasets: Vec<&str> = vm
-            .disks
-            .iter()
-            .map(|d| d.dataset.trim())
-            .filter(|d| !d.is_empty())
-            .collect();
+        let datasets = snapshot_datasets(&vm)?;
         if datasets.is_empty() {
             return Err(AppError::validation("the VM has no disks to snapshot"));
         }
@@ -363,7 +369,16 @@ impl KvmService {
         let targets: Vec<String> = datasets.iter().map(|d| format!("{d}@{tag}")).collect();
         let mut args: Vec<&str> = vec!["snapshot"];
         args.extend(targets.iter().map(String::as_str));
-        command::run_ok("zfs", &args).await?;
+        if let Err(e) = command::run_ok("zfs", &args).await {
+            // The pre-check above narrows the window, but a concurrent request can
+            // still win the race; surface that as a 409 rather than a 502.
+            if is_already_exists(&e) {
+                return Err(AppError::conflict(format!(
+                    "a snapshot named {tag:?} already exists"
+                )));
+            }
+            return Err(e);
+        }
         if let Some(desc) = req.description.as_deref().filter(|d| !d.trim().is_empty()) {
             let prop = format!("daygleve:description={desc}");
             for target in &targets {
@@ -388,8 +403,8 @@ impl KvmService {
         if !self.list_snapshots(id).await?.iter().any(|s| s.name == tag) {
             return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
         }
-        for disk in vm.disks.iter().filter(|d| !d.dataset.trim().is_empty()) {
-            let target = format!("{}@{}", disk.dataset.trim(), tag);
+        for dataset in snapshot_datasets(&vm)? {
+            let target = format!("{dataset}@{tag}");
             command::run_ok("zfs", &["rollback", "-r", &target]).await?;
         }
         Ok(())
@@ -402,8 +417,8 @@ impl KvmService {
         if !self.list_snapshots(id).await?.iter().any(|s| s.name == tag) {
             return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
         }
-        for disk in vm.disks.iter().filter(|d| !d.dataset.trim().is_empty()) {
-            let target = format!("{}@{}", disk.dataset.trim(), tag);
+        for dataset in snapshot_datasets(&vm)? {
+            let target = format!("{dataset}@{tag}");
             command::run_ok("zfs", &["destroy", &target]).await?;
         }
         Ok(())
@@ -644,17 +659,52 @@ fn map_vm_state(s: &str) -> VmState {
 }
 
 /// Format a unix epoch (seconds, from ZFS `creation -p`) as the schema's RFC-3339
-/// timestamp; an unparseable value falls back to the current time.
+/// timestamp. Falls back to the current time only for a `secs` that lands outside
+/// the representable range (a non-numeric `creation` was already coerced to 0 by
+/// the caller's `parse().unwrap_or(0)`, which is in range).
 fn ts_from_unix(secs: i64) -> daygleve_schema::common::Timestamp {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(now_ts)
 }
 
+/// The VM's non-empty disk datasets, each validated as a ZFS dataset path, so the
+/// `dataset@tag` targets handed to `zfs` are always built from sanitized input.
+fn snapshot_datasets(vm: &Vm) -> ApiResult<Vec<&str>> {
+    vm.disks
+        .iter()
+        .map(|d| d.dataset.trim())
+        .filter(|d| !d.is_empty())
+        .map(ensure_safe_dataset)
+        .collect()
+}
+
+/// Validate a ZFS dataset path and return it, so callers build `zfs` arguments
+/// from the sanitizer's output (path/flag-injection barrier). Allows the ZFS
+/// dataset charset — letters, digits, and the punctuation `_`, `-`, `.`, `:`,
+/// `/` — while rejecting an empty path, a leading `-` (which a host CLI could
+/// read as a flag) and any `..` traversal component.
+fn ensure_safe_dataset(dataset: &str) -> ApiResult<&str> {
+    let ok = !dataset.is_empty()
+        && !dataset.starts_with('-')
+        && !dataset.split('/').any(|seg| seg == ".." || seg.is_empty())
+        && dataset
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'/'));
+    if ok {
+        Ok(dataset)
+    } else {
+        Err(AppError::validation(format!(
+            "invalid dataset path: {dataset:?}"
+        )))
+    }
+}
+
 /// Validate a ZFS snapshot tag and return it, so callers build the
 /// `dataset@tag` from the sanitizer's output (path/flag-injection barrier).
-/// Accepts the ZFS-safe set (letters, digits and `_ - . :`) and rejects a
-/// leading `-` that a host CLI could read as a flag.
+/// Accepts the ZFS-safe set — letters, digits, and the punctuation `_`, `-`,
+/// `.`, `:` (no spaces) — and rejects a leading `-` that a host CLI could read
+/// as a flag.
 fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
     let ok = !name.is_empty()
         && !name.starts_with('-')
@@ -668,6 +718,19 @@ fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
             "invalid snapshot name: {name:?}"
         )))
     }
+}
+
+/// True when a `zfs` error indicates the target dataset simply does not exist,
+/// as opposed to a permission or transient failure we must not hide.
+fn is_missing_dataset(e: &AppError) -> bool {
+    let m = e.message().to_ascii_lowercase();
+    m.contains("does not exist") || m.contains("dataset does not exist")
+}
+
+/// True when a `zfs snapshot` error indicates the snapshot already exists, so a
+/// racing create can be reported as a 409 instead of a 502.
+fn is_already_exists(e: &AppError) -> bool {
+    e.message().to_ascii_lowercase().contains("already exists")
 }
 
 /// Parse `virsh vncdisplay` output (`host:N` or `:N`) to a `host:port` socket.
@@ -936,6 +999,20 @@ mod tests {
         for bad in ["", "-rf", "a/b", "a@b", "a b", "naïve"] {
             assert!(
                 ensure_safe_snapshot(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn dataset_paths_are_validated() {
+        for ok in ["tank/vms/web01-disk0", "pool", "a/b/c", "rpool/data:1"] {
+            assert!(ensure_safe_dataset(ok).is_ok(), "{ok:?} should be valid");
+        }
+        // Empty, leading '-', traversal, empty segments and the '@' separator.
+        for bad in ["", "-tank/x", "tank/../etc", "tank//x", "tank/x@y", "a b"] {
+            assert!(
+                ensure_safe_dataset(bad).is_err(),
                 "{bad:?} should be rejected"
             );
         }
