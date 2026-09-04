@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
+use daygleve_schema::operations::OperationRecord;
 use daygleve_schema::vm::{
     CloneVmRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, IsoImage,
     UpdateVmRequest, Vm, VmPowerRequest, VmSnapshot, VmSummary,
@@ -64,17 +65,25 @@ async fn create(
     user: AuthUser,
     State(state): State<AppState>,
     Json(req): Json<CreateVmRequest>,
-) -> ApiResult<(StatusCode, Json<Vm>)> {
+) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
     user.require(Permission::VmWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
-    let operation_services = services.clone();
-    let vm = operations
-        .run("vm.create", Some("vm"), None, move || async move {
-            operation_services.kvm.create(req).await
-        })
+    let record = operations
+        .enqueue(
+            "vm.create",
+            Some("vm"),
+            None,
+            move |ops, handle| async move {
+                ops.update_progress(&handle.id, 10, Some("provisioning disk"))
+                    .await?;
+                let vm = services.kvm.create(req).await?;
+                ops.set_result_id(&handle.id, &vm.id).await?;
+                Ok(Some(format!("created VM {}", vm.name)))
+            },
+        )
         .await?;
-    Ok((StatusCode::CREATED, Json(vm)))
+    Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
 async fn get_one(
@@ -156,21 +165,26 @@ async fn clone_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<CloneVmRequest>,
-) -> ApiResult<(StatusCode, Json<Vm>)> {
+) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
     user.require(Permission::VmWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
-    let operation_services = services.clone();
     let resource_id = id.clone();
-    let vm = operations
-        .run(
+    let record = operations
+        .enqueue(
             "vm.clone",
             Some("vm"),
             Some(&resource_id),
-            move || async move { operation_services.kvm.clone(&id, req).await },
+            move |ops, handle| async move {
+                ops.update_progress(&handle.id, 10, Some("cloning disks"))
+                    .await?;
+                let vm = services.kvm.clone(&id, req).await?;
+                ops.set_result_id(&handle.id, &vm.id).await?;
+                Ok(Some(format!("cloned VM {}", vm.name)))
+            },
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(vm)))
+    Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
 async fn list_snapshots(

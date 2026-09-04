@@ -292,6 +292,7 @@ impl OperationService {
             progress_pct: None,
             resource_type: resource_type.map(str::to_string),
             resource_id: resource_id.map(str::to_string),
+            result_id: None,
             created_at: now,
             started_at,
             finished_at: None,
@@ -344,6 +345,13 @@ impl OperationService {
             Some(error),
         )
         .await
+    }
+
+    /// Set the result_id on a completed or running operation.
+    pub(crate) async fn set_result_id(&self, id: &str, result_id: &str) -> ApiResult<()> {
+        let mut record = self.get(id).await?;
+        record.result_id = Some(result_id.to_string());
+        self.store.put(&record.id, &record).await
     }
 
     async fn finish(

@@ -6,6 +6,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::gpu::{BindGpuRequest, GpuDevice};
+use daygleve_schema::operations::OperationRecord;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
@@ -27,19 +28,24 @@ async fn bind(
     State(state): State<AppState>,
     Path(pci_address): Path<String>,
     Json(req): Json<BindGpuRequest>,
-) -> ApiResult<(StatusCode, Json<GpuDevice>)> {
+) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
     user.require(Permission::GpuWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
-    let operation_services = services.clone();
     let resource_id = pci_address.clone();
-    let device = operations
-        .run(
+    let record = operations
+        .enqueue(
             "gpu.bind",
             Some("gpu"),
             Some(&resource_id),
-            move || async move { operation_services.gpu.bind(&pci_address, req).await },
+            move |ops, handle| async move {
+                ops.update_progress(&handle.id, 10, Some("binding to vfio-pci"))
+                    .await?;
+                let device = services.gpu.bind(&pci_address, req).await?;
+                ops.set_result_id(&handle.id, &device.pci_address).await?;
+                Ok(Some(format!("bound GPU {}", device.pci_address)))
+            },
         )
         .await?;
-    Ok((StatusCode::ACCEPTED, Json(device)))
+    Ok((StatusCode::ACCEPTED, Json(record)))
 }

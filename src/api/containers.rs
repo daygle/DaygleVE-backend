@@ -6,6 +6,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::lxc::{CreateLxcRequest, Lxc, LxcPowerRequest, LxcSummary, UpdateLxcRequest};
+use daygleve_schema::operations::OperationRecord;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
@@ -30,20 +31,25 @@ async fn create(
     user: AuthUser,
     State(state): State<AppState>,
     Json(req): Json<CreateLxcRequest>,
-) -> ApiResult<(StatusCode, Json<Lxc>)> {
+) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
     user.require(Permission::LxcWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
-    let operation_services = services.clone();
-    let ct = operations
-        .run(
+    let record = operations
+        .enqueue(
             "container.create",
             Some("container"),
             None,
-            move || async move { operation_services.lxc.create(req).await },
+            move |ops, handle| async move {
+                ops.update_progress(&handle.id, 10, Some("downloading template"))
+                    .await?;
+                let ct = services.lxc.create(req).await?;
+                ops.set_result_id(&handle.id, &ct.id).await?;
+                Ok(Some(format!("created container {}", ct.name)))
+            },
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(ct)))
+    Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
 async fn get_one(
