@@ -12,7 +12,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::vm::{
-    ConsoleTicket, CreateVmRequest, IsoImage, UpdateVmRequest, Vm, VmPowerRequest, VmSummary,
+    ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, IsoImage, UpdateVmRequest, Vm,
+    VmPowerRequest, VmSnapshot, VmSummary,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -28,6 +29,18 @@ pub fn routes() -> Router<AppState> {
         .route("/vms/iso-images", get(iso_images))
         .route("/vms/{id}", get(get_one).patch(update).delete(delete))
         .route("/vms/{id}/power", post(power))
+        .route(
+            "/vms/{id}/snapshots",
+            get(list_snapshots).post(create_snapshot),
+        )
+        .route(
+            "/vms/{id}/snapshots/{name}",
+            axum::routing::delete(delete_snapshot),
+        )
+        .route(
+            "/vms/{id}/snapshots/{name}/rollback",
+            post(rollback_snapshot),
+        )
         .route("/vms/{id}/console", post(console))
         .route("/vms/{id}/console/ws", get(console_ws))
 }
@@ -94,6 +107,46 @@ async fn power(
     user.require(Permission::VmPower)?;
     let vm = state.services.kvm.power(&id, req.action).await?;
     Ok((StatusCode::ACCEPTED, Json(vm)))
+}
+
+async fn list_snapshots(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<VmSnapshot>>> {
+    user.require(Permission::VmRead)?;
+    Ok(Json(state.services.kvm.list_snapshots(&id).await?))
+}
+
+async fn create_snapshot(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateVmSnapshotRequest>,
+) -> ApiResult<(StatusCode, Json<VmSnapshot>)> {
+    user.require(Permission::VmWrite)?;
+    let snap = state.services.kvm.create_snapshot(&id, req).await?;
+    Ok((StatusCode::CREATED, Json(snap)))
+}
+
+async fn rollback_snapshot(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    user.require(Permission::VmWrite)?;
+    state.services.kvm.rollback_snapshot(&id, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_snapshot(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    user.require(Permission::VmWrite)?;
+    state.services.kvm.delete_snapshot(&id, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn console(
