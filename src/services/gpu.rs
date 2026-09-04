@@ -12,6 +12,7 @@ use daygleve_schema::gpu::{BindGpuRequest, GpuDevice};
 use tokio::fs;
 
 use crate::error::{ApiResult, AppError};
+use crate::services::ensure_safe_pci_address;
 
 const PCI_DEVICES: &str = "/sys/bus/pci/devices";
 
@@ -48,9 +49,7 @@ impl GpuService {
     }
 
     pub async fn bind(&self, pci_address: &str, req: BindGpuRequest) -> ApiResult<GpuDevice> {
-        if pci_address.trim().is_empty() {
-            return Err(AppError::validation("pci_address must not be empty"));
-        }
+        ensure_safe_pci_address(pci_address)?;
         let dir = PathBuf::from(PCI_DEVICES).join(pci_address);
         if fs::metadata(&dir).await.is_err() {
             return Err(AppError::not_found(format!(
@@ -61,6 +60,7 @@ impl GpuService {
         // Rebind every function in the IOMMU group — a group is the smallest
         // unit that can be isolated and passed through.
         for addr in iommu_group_members(&dir).await? {
+            ensure_safe_pci_address(&addr)?;
             bind_one(&addr, req.force).await?;
         }
 
@@ -128,6 +128,7 @@ async fn iommu_group_members(dir: &Path) -> ApiResult<Vec<String>> {
 /// Read a full [`GpuDevice`] from a PCI device directory.
 async fn read_gpu(dir: &Path) -> Option<GpuDevice> {
     let pci_address = dir.file_name()?.to_str()?.to_string();
+    ensure_safe_pci_address(&pci_address).ok()?;
     let vendor_id = read_trimmed(&dir.join("vendor")).await.unwrap_or_default();
     let device_id = read_trimmed(&dir.join("device")).await.unwrap_or_default();
     let driver = current_driver(dir).await;

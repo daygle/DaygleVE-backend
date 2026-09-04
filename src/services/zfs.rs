@@ -14,7 +14,9 @@ use daygleve_schema::storage::{
 
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
-use crate::services::command;
+use crate::services::{
+    command, ensure_safe_zfs_dataset, ensure_safe_zfs_snapshot, ensure_safe_zfs_snapshot_ref,
+};
 
 /// Columns requested from `zfs list` for a [`Dataset`].
 const DATASET_COLS: &str = "name,used,avail,mountpoint,compression,type,creation";
@@ -71,9 +73,20 @@ impl ZfsService {
     }
 
     pub async fn create_dataset(&self, req: CreateDatasetRequest) -> ApiResult<Dataset> {
-        ensure_zfs_ref(&req.name)?;
-        if matches!(req.kind, DatasetKind::Volume) && req.size_gib.is_none() {
-            return Err(AppError::validation("size_gib is required for volumes"));
+        ensure_safe_zfs_dataset(&req.name)?;
+        ensure_safe_zfs_dataset(&self.config.default_pool)?;
+        if matches!(req.kind, DatasetKind::Volume) && req.size_gib.is_none_or(|size| size == 0) {
+            return Err(AppError::validation("size_gib must be >= 1 for volumes"));
+        }
+        if let Some(compression) = req.compression.as_deref() {
+            if !is_safe_compression(compression) {
+                return Err(AppError::validation("invalid compression property"));
+            }
+        }
+        if matches!(req.kind, DatasetKind::Filesystem) && req.size_gib.is_some() {
+            return Err(AppError::validation(
+                "size_gib is only valid for volume datasets",
+            ));
         }
 
         let mut args: Vec<String> = vec!["create".into()];
@@ -94,7 +107,7 @@ impl ZfsService {
     }
 
     pub async fn list_snapshots(&self, dataset_id: &str) -> ApiResult<Vec<Snapshot>> {
-        ensure_zfs_ref(dataset_id)?;
+        ensure_safe_zfs_dataset(dataset_id)?;
         // No `-r`: we only want this dataset's own snapshots, so recursing into
         // descendants and filtering them back out is wasted work on large trees.
         let out = match command::run_optional(
@@ -129,11 +142,9 @@ impl ZfsService {
         dataset_id: &str,
         req: CreateSnapshotRequest,
     ) -> ApiResult<Snapshot> {
-        ensure_zfs_ref(dataset_id)?;
-        if req.name.trim().is_empty() {
-            return Err(AppError::validation("snapshot name must not be empty"));
-        }
-        let full = format!("{dataset_id}@{}", req.name);
+        ensure_safe_zfs_dataset(dataset_id)?;
+        let snapshot = ensure_safe_zfs_snapshot(req.name.trim())?;
+        let full = format!("{dataset_id}@{snapshot}");
 
         let mut args: Vec<String> = vec!["snapshot".into()];
         if req.recursive {
@@ -167,8 +178,8 @@ impl ZfsService {
         snapshot_id: &str,
         req: CloneSnapshotRequest,
     ) -> ApiResult<Dataset> {
-        ensure_zfs_ref(snapshot_id)?;
-        ensure_zfs_ref(&req.target)?;
+        ensure_safe_zfs_snapshot_ref(snapshot_id)?;
+        ensure_safe_zfs_dataset(&req.target)?;
         command::run_ok("zfs", &["clone", snapshot_id, &req.target]).await?;
         self.get_dataset(&req.target).await
     }
@@ -187,19 +198,19 @@ fn to_argv(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
 
-/// Validate a user-supplied ZFS reference (dataset/snapshot path) before it is
-/// passed to `zfs`/`zpool`. ZFS names legitimately contain `/` and `@`, so the
-/// strict filename allowlist does not apply; we only reject empty/whitespace
-/// names and a leading `-`, which a CLI could misparse as a flag.
-fn ensure_zfs_ref(name: &str) -> ApiResult<()> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::validation("ZFS name must not be empty"));
-    }
-    if trimmed.starts_with('-') {
-        return Err(AppError::validation("ZFS name must not start with '-'"));
-    }
-    Ok(())
+fn is_safe_compression(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    let numbered = |prefix: &str, max: u8| {
+        value
+            .strip_prefix(prefix)
+            .and_then(|level| level.parse::<u8>().ok())
+            .is_some_and(|level| (1..=max).contains(&level))
+    };
+    matches!(
+        value.as_str(),
+        "on" | "off" | "lz4" | "gzip" | "zle" | "zstd" | "zstd-fast"
+    ) || numbered("gzip-", 9)
+        || numbered("zstd-", 16)
 }
 
 fn parse_u64(s: &str) -> u64 {

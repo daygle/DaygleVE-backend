@@ -209,7 +209,20 @@ async fn write_cifs_credentials(
     password: Option<&str>,
     domain: Option<&str>,
 ) -> ApiResult<()> {
-    use std::os::unix::fs::PermissionsExt;
+    for (field, value) in [
+        ("username", username.unwrap_or("")),
+        ("password", password.unwrap_or("")),
+        ("domain", domain.unwrap_or("")),
+    ] {
+        if value
+            .chars()
+            .any(|c| c.is_control() || c == '\n' || c == '\r')
+        {
+            return Err(AppError::validation(format!(
+                "{field} contains invalid characters"
+            )));
+        }
+    }
 
     let mut body = String::new();
     body.push_str(&format!("username={}\n", username.unwrap_or("guest")));
@@ -221,9 +234,13 @@ async fn write_cifs_credentials(
     tokio::fs::write(path, body)
         .await
         .map_err(|e| AppError::internal(format!("cannot write credentials: {e}")))?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .await
-        .map_err(|e| AppError::internal(format!("cannot secure credentials: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| AppError::internal(format!("cannot secure credentials: {e}")))?;
+    }
     Ok(())
 }
 
@@ -238,7 +255,7 @@ fn merge_options(base: &str, extra: Option<&str>) -> String {
 /// A hostname or IP: non-empty, no whitespace, not flag-like, and restricted to
 /// characters valid in a host or address.
 fn validate_host(value: &str, field: &str) -> ApiResult<()> {
-    if value.is_empty() || value.starts_with('-') {
+    if value.is_empty() || value.starts_with('-') || value.len() > 253 {
         return Err(AppError::validation(format!("{field} is invalid")));
     }
     if !value
@@ -255,7 +272,7 @@ fn validate_host(value: &str, field: &str) -> ApiResult<()> {
 /// An NFS export path or CIFS share name: non-empty, not flag-like, and free of
 /// whitespace, control characters, and comma (which would split mount options).
 fn validate_export(value: &str) -> ApiResult<()> {
-    if value.is_empty() || value.starts_with('-') {
+    if value.is_empty() || value.starts_with('-') || value.len() > 1024 {
         return Err(AppError::validation("export is invalid"));
     }
     if value

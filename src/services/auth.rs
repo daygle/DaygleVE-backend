@@ -93,7 +93,14 @@ impl AuthService {
         // write it to a root-only file so the operator can retrieve it, forcing
         // a change on first login. The password is never logged in cleartext.
         let (password, must_change_password) = match self.config.admin_password.clone() {
-            Some(password) => (password, false),
+            Some(password) => {
+                if password.len() < MIN_PASSWORD_LEN {
+                    return Err(AppError::validation(format!(
+                        "DAYGLEVE_ADMIN_PASSWORD must be at least {MIN_PASSWORD_LEN} characters"
+                    )));
+                }
+                (password, false)
+            }
             None => {
                 let generated = generate_initial_password();
                 let path = self.config.state_dir.join("initial-admin-password");
@@ -173,6 +180,11 @@ impl AuthService {
         })
     }
 
+    /// Revoke one bearer-token session. Missing/expired tokens are harmless.
+    pub fn logout(&self, token: &str) {
+        self.tokens.write().expect("token lock").remove(token);
+    }
+
     /// Resolve a bearer token to the caller and their effective permissions.
     /// Expired tokens are rejected and evicted.
     pub fn authenticate(&self, token: &str) -> ApiResult<CurrentUser> {
@@ -229,8 +241,15 @@ impl AuthService {
         // subsequent persist/insert are atomic.
         let _guard = self.mutate.lock().await;
         let username = req.username.trim();
-        if username.is_empty() {
-            return Err(AppError::validation("username must not be empty"));
+        if username.is_empty()
+            || username.len() > 64
+            || username
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(AppError::validation(
+                "username must be 1..=64 characters with no whitespace or control characters",
+            ));
         }
         if req.roles.is_empty() {
             return Err(AppError::validation("at least one role is required"));
@@ -298,6 +317,7 @@ impl AuthService {
             }
             stored.user.roles = roles;
         }
+        let password_reset = req.password.is_some();
         if let Some(password) = req.password {
             if password.len() < MIN_PASSWORD_LEN {
                 return Err(AppError::validation(format!(
@@ -315,6 +335,14 @@ impl AuthService {
             .write()
             .expect("user lock")
             .insert(id.to_string(), stored);
+        // An administrator password reset invalidates existing sessions so a
+        // previously issued token cannot survive the credential change.
+        if password_reset {
+            self.tokens
+                .write()
+                .expect("token lock")
+                .retain(|_, session| session.user_id != id);
+        }
         Ok(user)
     }
 
@@ -344,6 +372,7 @@ impl AuthService {
     pub async fn change_password(
         &self,
         user_id: &str,
+        current_token: &str,
         req: ChangePasswordRequest,
     ) -> ApiResult<()> {
         let _guard = self.mutate.lock().await;
@@ -369,6 +398,13 @@ impl AuthService {
             .write()
             .expect("user lock")
             .insert(user_id.to_string(), stored);
+        // Changing a password is a session boundary: revoke every other token
+        // for this account while preserving the token that authenticated this
+        // request, so the caller can continue without a needless login loop.
+        self.tokens
+            .write()
+            .expect("token lock")
+            .retain(|token, session| session.user_id != user_id || token == current_token);
         Ok(())
     }
 
@@ -424,7 +460,6 @@ fn generate_initial_password() -> String {
 
 /// Write a secret to a root-only (0600) file, creating the parent directory.
 async fn write_secret_file(path: &std::path::Path, secret: &str) -> ApiResult<()> {
-    use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -433,9 +468,13 @@ async fn write_secret_file(path: &std::path::Path, secret: &str) -> ApiResult<()
     tokio::fs::write(path, format!("{secret}\n"))
         .await
         .map_err(|e| AppError::internal(format!("write {}: {e}", path.display())))?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .await
-        .map_err(|e| AppError::internal(format!("secure {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| AppError::internal(format!("secure {}: {e}", path.display())))?;
+    }
     Ok(())
 }
 

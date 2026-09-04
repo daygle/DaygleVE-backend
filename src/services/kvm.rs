@@ -26,7 +26,10 @@ use crate::config::Config;
 use crate::error::{ApiResult, AppError};
 use crate::services::shares::ShareService;
 use crate::services::store::JsonStore;
-use crate::services::{command, new_id, now_ts};
+use crate::services::{
+    command, ensure_safe_id, ensure_safe_mac, ensure_safe_pci_address, ensure_safe_zfs_dataset,
+    new_id, now_ts,
+};
 
 /// How long a console ticket is valid before the client must re-request one.
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -82,17 +85,9 @@ impl KvmService {
     }
 
     pub async fn create(&self, req: CreateVmRequest) -> ApiResult<Vm> {
-        if req.name.trim().is_empty() {
-            return Err(AppError::validation("name must not be empty"));
-        }
-        // The name becomes the libvirt domain name; keep it path/shell-safe.
-        crate::services::ensure_safe_id(&req.name)?;
-        if req.vcpus == 0 {
-            return Err(AppError::validation("vcpus must be >= 1"));
-        }
-        if req.memory_mib == 0 {
-            return Err(AppError::validation("memory_mib must be >= 1"));
-        }
+        validate_vm_request(&req)?;
+        let nics = normalize_nics(req.nics)?;
+        validate_gpu_assignments(&req.gpus)?;
 
         // Validate any requested install ISO against the node's library before
         // it reaches libvirt (prevents pointing a VM at an arbitrary host file).
@@ -101,10 +96,13 @@ impl KvmService {
             None => None,
         };
 
-        // Provision a zvol for each disk that names a size (best-effort: an
-        // existing dataset is reused).
+        // Provision a zvol for each disk. Existing datasets are reused; newly
+        // created zvols are tracked so later failures can be rolled back.
+        let mut created_zvols = Vec::new();
         for disk in &req.disks {
-            self.ensure_zvol(disk).await?;
+            if self.ensure_zvol(disk).await? {
+                created_zvols.push(disk.dataset.trim().to_string());
+            }
         }
 
         let vm = Vm {
@@ -115,7 +113,7 @@ impl KvmService {
             memory_mib: req.memory_mib,
             firmware: req.firmware,
             disks: req.disks,
-            nics: req.nics,
+            nics,
             gpus: req.gpus,
             cdrom,
             description: req.description,
@@ -123,14 +121,26 @@ impl KvmService {
             updated_at: None,
         };
 
-        self.define(&vm).await?;
+        if let Err(e) = self.define(&vm).await {
+            self.cleanup_created_zvols(&created_zvols).await;
+            return Err(e);
+        }
 
         let mut vm = vm;
         if req.start {
-            self.virsh(&["start", &vm.id]).await?;
+            if let Err(e) = self.virsh(&["start", &vm.id]).await {
+                let _ = self.virsh_opt(&["undefine", &vm.id, "--nvram"]).await;
+                self.cleanup_created_zvols(&created_zvols).await;
+                return Err(e);
+            }
             vm.state = VmState::Running;
         }
-        self.store.put(&vm.id, &vm).await?;
+        if let Err(e) = self.store.put(&vm.id, &vm).await {
+            let _ = self.virsh_opt(&["destroy", &vm.id]).await;
+            let _ = self.virsh_opt(&["undefine", &vm.id, "--nvram"]).await;
+            self.cleanup_created_zvols(&created_zvols).await;
+            return Err(e);
+        }
         Ok(vm)
     }
 
@@ -138,9 +148,22 @@ impl KvmService {
         let mut vm = self.get_stored(id).await?;
         let old_name = vm.name.clone();
 
+        if let Some(name) = req.name.as_deref() {
+            ensure_safe_id(name)?;
+            if name != old_name {
+                let existing: Vec<Vm> = self.store.list().await?;
+                if existing
+                    .iter()
+                    .any(|other| other.id != id && other.name == name)
+                {
+                    return Err(AppError::conflict(format!(
+                        "a VM named {name:?} already exists"
+                    )));
+                }
+            }
+        }
+
         if let Some(name) = req.name {
-            // Keep the rename target path/domain-name safe, mirroring create.
-            crate::services::ensure_safe_id(&name)?;
             vm.name = name;
         }
         if let Some(vcpus) = req.vcpus {
@@ -158,6 +181,12 @@ impl KvmService {
 
         // Firmware, disk and NIC changes rewrite the guest hardware, so they are
         // only allowed while the VM is stopped.
+        if let Some(disks) = req.disks.as_ref() {
+            validate_disks(disks)?;
+        }
+        if let Some(nics) = req.nics.as_ref() {
+            validate_nics(nics)?;
+        }
         let hardware_change = req.firmware.is_some() || req.disks.is_some() || req.nics.is_some();
         if hardware_change {
             self.require_stopped(&vm, "changing its firmware, disks or NICs")
@@ -167,7 +196,7 @@ impl KvmService {
             vm.firmware = firmware;
         }
         if let Some(nics) = req.nics {
-            vm.nics = nics;
+            vm.nics = normalize_nics(nics)?;
         }
         if let Some(disks) = req.disks {
             // `ensure_zvol` is idempotent: it reuses a dataset that already exists
@@ -175,7 +204,7 @@ impl KvmService {
             // every disk in the set provisions the additions and leaves existing
             // disks untouched. Removing a disk from the set never destroys its data.
             for disk in &disks {
-                self.ensure_zvol(disk).await?;
+                let _ = self.ensure_zvol(disk).await?;
             }
             vm.disks = disks;
         }
@@ -718,28 +747,33 @@ impl KvmService {
     }
 
     /// Create a zvol for a disk if it does not already exist.
-    async fn ensure_zvol(&self, disk: &VmDisk) -> ApiResult<()> {
-        if disk.dataset.trim().is_empty() || disk.size_gib == 0 {
-            return Ok(());
-        }
-        if disk.dataset.starts_with('-') {
-            // Prevent the dataset from being misparsed as a `zfs` flag.
-            return Err(AppError::validation("disk dataset must not start with '-'"));
+    async fn ensure_zvol(&self, disk: &VmDisk) -> ApiResult<bool> {
+        let dataset = ensure_safe_zfs_dataset(disk.dataset.trim())?;
+        if disk.size_gib == 0 {
+            return Err(AppError::validation("disk size_gib must be >= 1"));
         }
         // Reuse an existing dataset; otherwise create it. Distinguish "zfs not
         // installed" (fail fast — we must never define a domain pointing at a
         // zvol that was never provisioned) from "dataset does not exist yet".
-        match command::run_optional("zfs", &["list", "-H", "-o", "name", &disk.dataset]).await {
-            Ok(Some(_)) => return Ok(()),
+        match command::run_optional("zfs", &["list", "-H", "-o", "name", dataset]).await {
+            Ok(Some(_)) => return Ok(false),
             Ok(None) => {
                 return Err(AppError::hypervisor(
                     "zfs is not installed; cannot provision the VM disk",
                 ))
             }
-            Err(_) => {} // dataset does not exist yet — create it below
+            Err(e) if is_missing_dataset(&e) => {}
+            Err(e) => return Err(e),
         }
         let size = format!("{}G", disk.size_gib);
-        command::run_ok("zfs", &["create", "-V", &size, &disk.dataset]).await
+        command::run_ok("zfs", &["create", "-V", &size, dataset]).await?;
+        Ok(true)
+    }
+
+    async fn cleanup_created_zvols(&self, datasets: &[String]) {
+        for dataset in datasets {
+            let _ = command::run_ok("zfs", &["destroy", "-r", dataset]).await;
+        }
     }
 
     /// Enumerate the installer/live ISOs available to the node: the built-in
@@ -860,6 +894,71 @@ async fn scan_iso_dir(
     }
 }
 
+fn validate_vm_request(req: &CreateVmRequest) -> ApiResult<()> {
+    if req.name.trim().is_empty() {
+        return Err(AppError::validation("name must not be empty"));
+    }
+    ensure_safe_id(&req.name)?;
+    if req.vcpus == 0 {
+        return Err(AppError::validation("vcpus must be >= 1"));
+    }
+    if req.memory_mib == 0 {
+        return Err(AppError::validation("memory_mib must be >= 1"));
+    }
+    validate_disks(&req.disks)?;
+    validate_nics(&req.nics)
+}
+
+fn validate_disks(disks: &[VmDisk]) -> ApiResult<()> {
+    for disk in disks {
+        ensure_safe_zfs_dataset(disk.dataset.trim())?;
+        if disk.size_gib == 0 {
+            return Err(AppError::validation("disk size_gib must be >= 1"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_nics(nics: &[VmNic]) -> ApiResult<()> {
+    for nic in nics {
+        ensure_safe_id(&nic.bridge)?;
+        if let Some(vlan) = nic.vlan {
+            if !(1..=4094).contains(&vlan) {
+                return Err(AppError::validation("NIC VLAN must be in 1..=4094"));
+            }
+        }
+        if let Some(mac) = nic.mac.as_deref() {
+            ensure_safe_mac(mac)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_nics(nics: Vec<VmNic>) -> ApiResult<Vec<VmNic>> {
+    validate_nics(&nics)?;
+    let mut seen = std::collections::HashSet::new();
+    nics.into_iter()
+        .map(|mut nic| {
+            nic.mac = Some(nic.mac.unwrap_or_else(generate_mac));
+            if !seen.insert(nic.mac.clone().unwrap_or_default().to_ascii_lowercase()) {
+                return Err(AppError::conflict("duplicate VM NIC MAC address"));
+            }
+            Ok(nic)
+        })
+        .collect()
+}
+
+fn validate_gpu_assignments(gpus: &[daygleve_schema::gpu::GpuAssignment]) -> ApiResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for gpu in gpus {
+        ensure_safe_pci_address(&gpu.pci_address)?;
+        if !seen.insert(gpu.pci_address.to_ascii_lowercase()) {
+            return Err(AppError::conflict("duplicate GPU assignment"));
+        }
+    }
+    Ok(())
+}
+
 fn summary_of(vm: &Vm) -> VmSummary {
     VmSummary {
         id: vm.id.clone(),
@@ -910,19 +1009,7 @@ fn snapshot_datasets(vm: &Vm) -> ApiResult<Vec<&str>> {
 /// `/` — while rejecting an empty path, a leading `-` (which a host CLI could
 /// read as a flag) and any `..` traversal component.
 fn ensure_safe_dataset(dataset: &str) -> ApiResult<&str> {
-    let ok = !dataset.is_empty()
-        && !dataset.starts_with('-')
-        && !dataset.split('/').any(|seg| seg == ".." || seg.is_empty())
-        && dataset
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'/'));
-    if ok {
-        Ok(dataset)
-    } else {
-        Err(AppError::validation(format!(
-            "invalid dataset path: {dataset:?}"
-        )))
-    }
+    ensure_safe_zfs_dataset(dataset)
 }
 
 /// Validate a *user-supplied* ZFS snapshot tag and return it, so callers build
@@ -1131,6 +1218,7 @@ fn nic_xml(nic: &VmNic) -> String {
 
 /// A `<hostdev>` PCI passthrough element from an address like `0000:01:00.0`.
 fn pci_hostdev_xml(pci_address: &str) -> Option<String> {
+    ensure_safe_pci_address(pci_address).ok()?;
     let (dbs, func) = pci_address.rsplit_once('.')?;
     let mut it = dbs.split(':');
     let domain = it.next()?;

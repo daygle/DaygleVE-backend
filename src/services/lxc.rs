@@ -19,7 +19,9 @@ use daygleve_schema::lxc::{
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
 use crate::services::store::JsonStore;
-use crate::services::{command, new_id, now_ts};
+use crate::services::{
+    command, ensure_safe_cidr, ensure_safe_id, ensure_safe_zfs_dataset, new_id, now_ts,
+};
 
 pub struct LxcService {
     store: JsonStore,
@@ -63,10 +65,34 @@ impl LxcService {
             // Written into lxc.cgroup2.memory.max; 0 would be an unusable limit.
             return Err(AppError::validation("memory_mib must be >= 1"));
         }
+        if req.rootfs_size_gib == 0 {
+            return Err(AppError::validation("rootfs_size_gib must be >= 1"));
+        }
+        for network in &req.networks {
+            ensure_safe_id(&network.bridge)?;
+            if let Some(vlan) = network.vlan {
+                if !(1..=4094).contains(&vlan) {
+                    return Err(AppError::validation("container VLAN must be in 1..=4094"));
+                }
+            }
+            if let Some(ip) = network.ip.as_deref() {
+                ensure_safe_cidr(ip, "network.ip")?;
+            }
+        }
         let (dist, release) = req.template.split_once('-').ok_or_else(|| {
             AppError::validation("template must be <dist>-<release>, e.g. debian-bookworm")
         })?;
+        if dist.is_empty()
+            || release.is_empty()
+            || !dist.bytes().all(|b| b.is_ascii_alphanumeric())
+            || !release
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        {
+            return Err(AppError::validation("template contains invalid characters"));
+        }
 
+        ensure_safe_zfs_dataset(&self.config.default_pool)?;
         let zfsroot = format!("{}/lxc", self.config.default_pool);
         let rootfs_dataset = format!("{zfsroot}/{}", req.name);
 
@@ -98,7 +124,11 @@ impl LxcService {
         // host — tear them down so we don't leave an orphan the record never
         // tracks.
         let quota = format!("quota={}G", req.rootfs_size_gib);
-        let _ = command::run_optional("zfs", &["set", &quota, &rootfs_dataset]).await;
+        if let Err(e) = command::run_ok("zfs", &["set", &quota, &rootfs_dataset]).await {
+            let _ = command::run_optional("lxc-destroy", &["-n", &req.name, "-f"]).await;
+            let _ = command::run_optional("zfs", &["destroy", "-r", &rootfs_dataset]).await;
+            return Err(e);
+        }
         if let Err(e) = self
             .write_config(&req.name, req.vcpus, req.memory_mib, &req.networks)
             .await
@@ -252,6 +282,9 @@ impl LxcService {
             block.push_str(&format!("lxc.net.{i}.type = veth\n"));
             block.push_str(&format!("lxc.net.{i}.link = {}\n", net.bridge));
             block.push_str(&format!("lxc.net.{i}.flags = up\n"));
+            if let Some(vlan) = net.vlan {
+                block.push_str(&format!("lxc.net.{i}.vlan.id = {vlan}\n"));
+            }
             if let Some(ip) = &net.ip {
                 block.push_str(&format!("lxc.net.{i}.ipv4.address = {ip}\n"));
             }

@@ -65,7 +65,7 @@ async fn change_password(
     state
         .services
         .auth
-        .change_password(&user.0.user.id, req)
+        .change_password(&user.0.user.id, &user.1, req)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

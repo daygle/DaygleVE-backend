@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
 use crate::services::store::JsonStore;
-use crate::services::{command, new_id, now_ts};
+use crate::services::{command, ensure_safe_cidr, new_id, now_ts};
 
 pub struct NetworkService {
     bridges: JsonStore,
@@ -86,6 +86,14 @@ impl NetworkService {
         // be misparsed as an `ip` flag is rejected up front.
         for port in &req.ports {
             crate::services::ensure_safe_id(port)?;
+        }
+        if let Some(address) = req.address.as_deref() {
+            ensure_safe_cidr(address, "bridge.address")?;
+        }
+        if let Some(mtu) = req.mtu {
+            if !(576..=65_535).contains(&mtu) {
+                return Err(AppError::validation("bridge MTU must be in 576..=65535"));
+            }
         }
 
         // Create the bridge device (optionally VLAN-aware).

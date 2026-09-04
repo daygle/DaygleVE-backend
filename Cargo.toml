@@ -15,6 +15,7 @@ daygleve-schema = { git = "https://github.com/daygle/DaygleVE-schema", branch = 
 axum = { version = "0.8", features = ["macros", "ws"] }
 # TLS-terminating server (rustls) for optional built-in HTTPS.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+http-body-util = "0.1"
 # Pulled in transitively by axum-server; named directly so we can install the
 # process-level crypto provider that rustls 0.23 requires before serving TLS.
 rustls = "0.23"
@@ -26,7 +27,7 @@ argon2 = "0.5"
 # OS RNG for password salts and bearer tokens (matches argon2's rand_core).
 rand_core = { version = "0.6", features = ["getrandom"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs", "limit"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

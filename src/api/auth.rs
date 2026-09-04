@@ -1,6 +1,7 @@
 //! Authentication endpoints.
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::{CurrentUser, LoginRequest, LoginResponse};
@@ -13,6 +14,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/me", get(me))
+        .route("/auth/logout", post(logout))
 }
 
 async fn login(
@@ -24,4 +26,9 @@ async fn login(
 
 async fn me(user: AuthUser) -> Json<CurrentUser> {
     Json(user.0)
+}
+
+async fn logout(user: AuthUser, State(state): State<AppState>) -> StatusCode {
+    state.services.auth.logout(&user.1);
+    StatusCode::NO_CONTENT
 }

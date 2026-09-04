@@ -61,6 +61,11 @@ async fn stream(
         })
         .ok_or_else(|| AppError::unauthorized("missing token"))?;
     let user = state.services.auth.authenticate(&token)?;
+    if user.must_change_password {
+        return Err(AppError::forbidden(
+            "change the initial password before using the control plane",
+        ));
+    }
     if !user.permissions.contains(&Permission::MetricsRead) {
         return Err(AppError::forbidden("missing permission: MetricsRead"));
     }
