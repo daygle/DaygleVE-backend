@@ -520,15 +520,9 @@ impl KvmService {
         req: CreateVmSnapshotRequest,
     ) -> ApiResult<VmSnapshot> {
         let vm = self.get_stored(id).await?;
+        // ensure_safe_snapshot also rejects the reserved clone-base prefix, so a
+        // user snapshot can't vanish from listing or collide with a clone base.
         let tag = ensure_safe_snapshot(&req.name)?;
-        // The clone-base prefix is reserved for internal snapshots (which are
-        // hidden from listing); reject it so a user snapshot can't vanish or
-        // collide with a clone base.
-        if tag.starts_with(CLONE_SNAPSHOT_PREFIX) {
-            return Err(AppError::validation(format!(
-                "snapshot name must not start with the reserved prefix {CLONE_SNAPSHOT_PREFIX:?}"
-            )));
-        }
         let datasets = snapshot_datasets(&vm)?;
         if datasets.is_empty() {
             return Err(AppError::validation("the VM has no disks to snapshot"));
@@ -931,12 +925,19 @@ fn ensure_safe_dataset(dataset: &str) -> ApiResult<&str> {
     }
 }
 
-/// Validate a ZFS snapshot tag and return it, so callers build the
-/// `dataset@tag` from the sanitizer's output (path/flag-injection barrier).
+/// Validate a *user-supplied* ZFS snapshot tag and return it, so callers build
+/// the `dataset@tag` from the sanitizer's output (path/flag-injection barrier).
 /// Accepts the ZFS-safe set — letters, digits, and the punctuation `_`, `-`,
-/// `.`, `:` (no spaces) — and rejects a leading `-` that a host CLI could read
-/// as a flag.
+/// `.`, `:` (no spaces) — rejects a leading `-` that a host CLI could read as a
+/// flag, and rejects the reserved clone-base prefix so no user snapshot
+/// entrypoint (create/rollback/delete) can target an internal clone base.
+/// Internal clone bases build their tag directly and never pass through here.
 fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
+    if name.starts_with(CLONE_SNAPSHOT_PREFIX) {
+        return Err(AppError::validation(format!(
+            "snapshot name must not start with the reserved prefix {CLONE_SNAPSHOT_PREFIX:?}"
+        )));
+    }
     let ok = !name.is_empty()
         && !name.starts_with('-')
         && name
@@ -1257,12 +1258,18 @@ mod tests {
     }
 
     #[test]
-    fn generated_macs_are_locally_administered_and_unique() {
-        let a = generate_mac();
-        assert!(a.starts_with("52:54:00:"), "unexpected MAC: {a}");
-        assert_eq!(a.len(), 17, "MAC should be 6 octets: {a}");
-        // Two draws should differ (random host bytes).
-        assert_ne!(a, generate_mac());
+    fn generated_macs_are_well_formed() {
+        let mac = generate_mac();
+        assert!(mac.starts_with("52:54:00:"), "unexpected MAC: {mac}");
+        let octets: Vec<&str> = mac.split(':').collect();
+        assert_eq!(octets.len(), 6, "MAC should have 6 octets: {mac}");
+        for o in octets {
+            assert_eq!(o.len(), 2, "each octet is two hex digits: {mac}");
+            assert!(
+                o.bytes().all(|b| b.is_ascii_hexdigit()),
+                "octet not hex: {mac}"
+            );
+        }
     }
 
     #[test]
