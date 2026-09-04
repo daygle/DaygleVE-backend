@@ -30,6 +30,11 @@ impl AppState {
                 "startup recovered interrupted operations; inspect the operations endpoint"
             );
         }
+        let startup_job = services
+            .operations
+            .enqueue_reconciliation(services.clone())
+            .await?;
+        tracing::info!(operation_id = %startup_job.id, "queued startup host reconciliation");
         Ok(Self {
             config,
             services,
