@@ -12,8 +12,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::vm::{
-    ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, IsoImage, UpdateVmRequest, Vm,
-    VmPowerRequest, VmSnapshot, VmSummary,
+    CloneVmRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, IsoImage,
+    UpdateVmRequest, Vm, VmPowerRequest, VmSnapshot, VmSummary,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/vms/iso-images", get(iso_images))
         .route("/vms/{id}", get(get_one).patch(update).delete(delete))
         .route("/vms/{id}/power", post(power))
+        .route("/vms/{id}/clone", post(clone_vm))
         .route(
             "/vms/{id}/snapshots",
             get(list_snapshots).post(create_snapshot),
@@ -107,6 +108,17 @@ async fn power(
     user.require(Permission::VmPower)?;
     let vm = state.services.kvm.power(&id, req.action).await?;
     Ok((StatusCode::ACCEPTED, Json(vm)))
+}
+
+async fn clone_vm(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CloneVmRequest>,
+) -> ApiResult<(StatusCode, Json<Vm>)> {
+    user.require(Permission::VmWrite)?;
+    let vm = state.services.kvm.clone(&id, req).await?;
+    Ok((StatusCode::CREATED, Json(vm)))
 }
 
 async fn list_snapshots(

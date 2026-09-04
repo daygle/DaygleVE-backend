@@ -17,8 +17,9 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use daygleve_schema::vm::{
-    ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, DiskBus, Firmware, IsoImage, NicModel,
-    UpdateVmRequest, Vm, VmDisk, VmNic, VmPowerAction, VmSnapshot, VmState, VmSummary,
+    CloneVmRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, DiskBus, Firmware,
+    IsoImage, NicModel, UpdateVmRequest, Vm, VmDisk, VmNic, VmPowerAction, VmSnapshot, VmState,
+    VmSummary,
 };
 
 use crate::config::Config;
@@ -34,6 +35,11 @@ const TICKET_TTL: Duration = Duration::from_secs(60);
 /// enough for the common `iso/` or `template/iso/` layouts without walking an
 /// arbitrarily large tree.
 const ISO_SCAN_DEPTH: u32 = 4;
+
+/// Prefix for the internal base snapshots that back linked clones. Snapshots
+/// with this tag are system-managed, so they're hidden from the user-facing VM
+/// snapshot list.
+const CLONE_SNAPSHOT_PREFIX: &str = "daygleve-clone-";
 
 /// A pending console ticket bound to a domain's VNC socket.
 struct Ticket {
@@ -211,6 +217,141 @@ impl KvmService {
         Ok(())
     }
 
+    /// Clone a VM: ZFS-clone each of the source's disks (from a fresh base
+    /// snapshot) into new datasets, then define a new stopped domain with a new
+    /// id, the source's compute/hardware, and freshly-generated NIC MACs. GPU
+    /// passthrough and any attached install ISO are dropped. `full` promotes the
+    /// cloned disks so they no longer depend on the source snapshot.
+    pub async fn clone(&self, id: &str, req: CloneVmRequest) -> ApiResult<Vm> {
+        let src = self.get_stored(id).await?;
+        if req.name.trim().is_empty() {
+            return Err(AppError::validation("name must not be empty"));
+        }
+        crate::services::ensure_safe_id(&req.name)?;
+        // libvirt domain names are unique; reject a name another VM already uses.
+        let existing: Vec<Vm> = self.store.list().await?;
+        if existing.iter().any(|v| v.name == req.name) {
+            return Err(AppError::conflict(format!(
+                "a VM named {:?} already exists",
+                req.name
+            )));
+        }
+
+        let new_id = new_id();
+        // A short, unique, ZFS-safe base-snapshot tag. The reserved prefix marks
+        // it as a clone base so it stays out of the user-facing snapshot list.
+        let short = new_id.replace('-', "");
+        let tag = format!("{CLONE_SNAPSHOT_PREFIX}{}", &short[..12]);
+
+        // A disk with no dataset would clone into an invalid domain (domain_xml
+        // always renders a zvol source), so fail fast rather than silently
+        // dropping it and producing a partial hardware copy.
+        if src.disks.iter().any(|d| d.dataset.trim().is_empty()) {
+            return Err(AppError::validation(
+                "the source VM has a disk with no dataset; cannot clone",
+            ));
+        }
+        // Plan the destination datasets: same parent as each source disk, with a
+        // leaf derived from the new VM name. Validate every path through the
+        // dataset barrier before it reaches `zfs`.
+        let mut new_disks: Vec<VmDisk> = Vec::new();
+        let mut planned: Vec<(String, String)> = Vec::new(); // (src_dataset, new_dataset)
+        for (i, disk) in src.disks.iter().enumerate() {
+            let src_ds = ensure_safe_dataset(disk.dataset.trim())?;
+            let parent = src_ds.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let new_ds = if parent.is_empty() {
+                format!("{}-disk{i}", req.name)
+            } else {
+                format!("{parent}/{}-disk{i}", req.name)
+            };
+            ensure_safe_dataset(&new_ds)?;
+            planned.push((src_ds.to_string(), new_ds.clone()));
+            new_disks.push(VmDisk {
+                dataset: new_ds,
+                size_gib: disk.size_gib,
+                bus: disk.bus,
+            });
+        }
+
+        // Snapshot every source disk together as the clone base (crash-consistent
+        // if the source is running, like the snapshot endpoint).
+        if !planned.is_empty() {
+            let bases: Vec<String> = planned.iter().map(|(s, _)| format!("{s}@{tag}")).collect();
+            let mut args: Vec<&str> = vec!["snapshot"];
+            args.extend(bases.iter().map(String::as_str));
+            command::run_ok("zfs", &args).await?;
+        }
+
+        // Clone (and optionally promote) each disk, tearing everything down on
+        // any failure so a partial clone never lingers.
+        let mut created: Vec<String> = Vec::new();
+        for (src_ds, new_ds) in &planned {
+            let base = format!("{src_ds}@{tag}");
+            if let Err(e) = command::run_ok("zfs", &["clone", &base, new_ds]).await {
+                self.cleanup_clone(&planned, &created, &tag).await;
+                return Err(e);
+            }
+            created.push(new_ds.clone());
+            if req.full {
+                if let Err(e) = command::run_ok("zfs", &["promote", new_ds]).await {
+                    self.cleanup_clone(&planned, &created, &tag).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // A full clone is meant to be independent: `zfs promote` moved each base
+        // snapshot onto the clone, where it's no longer needed, so best-effort
+        // destroy it rather than leave a hidden snapshot pinning space.
+        if req.full {
+            for new_ds in &created {
+                let _ = command::run_ok("zfs", &["destroy", &format!("{new_ds}@{tag}")]).await;
+            }
+        }
+
+        let clone_vm = Vm {
+            id: new_id,
+            name: req.name,
+            state: VmState::Stopped,
+            vcpus: src.vcpus,
+            memory_mib: src.memory_mib,
+            firmware: src.firmware,
+            disks: new_disks,
+            // Give each NIC a freshly-generated MAC (recorded in the VM), so the
+            // clone never inherits the source's MAC and we always know what it is.
+            nics: src
+                .nics
+                .iter()
+                .map(|n| VmNic {
+                    mac: Some(generate_mac()),
+                    ..n.clone()
+                })
+                .collect(),
+            gpus: Vec::new(), // passthrough can't be shared
+            cdrom: None,      // install media isn't carried over
+            description: req.description.or(src.description.clone()),
+            created_at: now_ts(),
+            updated_at: None,
+        };
+        if let Err(e) = self.define(&clone_vm).await {
+            self.cleanup_clone(&planned, &created, &tag).await;
+            return Err(e);
+        }
+        self.store.put(&clone_vm.id, &clone_vm).await?;
+        Ok(clone_vm)
+    }
+
+    /// Best-effort teardown of a partially-created clone: destroy any clone
+    /// datasets already made, then the base snapshots on the source disks.
+    async fn cleanup_clone(&self, planned: &[(String, String)], created: &[String], tag: &str) {
+        for new_ds in created {
+            let _ = command::run_ok("zfs", &["destroy", "-r", new_ds]).await;
+        }
+        for (src_ds, _) in planned {
+            let _ = command::run_ok("zfs", &["destroy", &format!("{src_ds}@{tag}")]).await;
+        }
+    }
+
     pub async fn power(&self, id: &str, action: VmPowerAction) -> ApiResult<Vm> {
         let mut vm = self.get_stored(id).await?;
         let subcommand = match action {
@@ -339,6 +480,10 @@ impl KvmService {
                 let Some((_, tag)) = full.split_once('@') else {
                     continue;
                 };
+                // Hide internal clone-base snapshots from the user-facing list.
+                if tag.starts_with(CLONE_SNAPSHOT_PREFIX) {
+                    continue;
+                }
                 let (entry, count) = by_name.entry(tag.to_string()).or_insert_with(|| {
                     (
                         VmSnapshot {
@@ -375,6 +520,8 @@ impl KvmService {
         req: CreateVmSnapshotRequest,
     ) -> ApiResult<VmSnapshot> {
         let vm = self.get_stored(id).await?;
+        // ensure_safe_snapshot also rejects the reserved clone-base prefix, so a
+        // user snapshot can't vanish from listing or collide with a clone base.
         let tag = ensure_safe_snapshot(&req.name)?;
         let datasets = snapshot_datasets(&vm)?;
         if datasets.is_empty() {
@@ -778,12 +925,19 @@ fn ensure_safe_dataset(dataset: &str) -> ApiResult<&str> {
     }
 }
 
-/// Validate a ZFS snapshot tag and return it, so callers build the
-/// `dataset@tag` from the sanitizer's output (path/flag-injection barrier).
+/// Validate a *user-supplied* ZFS snapshot tag and return it, so callers build
+/// the `dataset@tag` from the sanitizer's output (path/flag-injection barrier).
 /// Accepts the ZFS-safe set — letters, digits, and the punctuation `_`, `-`,
-/// `.`, `:` (no spaces) — and rejects a leading `-` that a host CLI could read
-/// as a flag.
+/// `.`, `:` (no spaces) — rejects a leading `-` that a host CLI could read as a
+/// flag, and rejects the reserved clone-base prefix so no user snapshot
+/// entrypoint (create/rollback/delete) can target an internal clone base.
+/// Internal clone bases build their tag directly and never pass through here.
 fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
+    if name.starts_with(CLONE_SNAPSHOT_PREFIX) {
+        return Err(AppError::validation(format!(
+            "snapshot name must not start with the reserved prefix {CLONE_SNAPSHOT_PREFIX:?}"
+        )));
+    }
     let ok = !name.is_empty()
         && !name.starts_with('-')
         && name
@@ -809,6 +963,13 @@ fn is_missing_dataset(e: &AppError) -> bool {
 /// racing create can be reported as a 409 instead of a 502.
 fn is_already_exists(e: &AppError) -> bool {
     e.message().to_ascii_lowercase().contains("already exists")
+}
+
+/// A fresh locally-administered unicast MAC in QEMU's `52:54:00` OUI, with three
+/// random host bytes from a v4 UUID. Used to give a cloned VM its own MACs.
+fn generate_mac() -> String {
+    let b = uuid::Uuid::new_v4().into_bytes();
+    format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
 }
 
 /// Parse `virsh vncdisplay` output (`host:N` or `:N`) to a `host:port` socket.
@@ -1092,6 +1253,21 @@ mod tests {
             assert!(
                 ensure_safe_dataset(bad).is_err(),
                 "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_macs_are_well_formed() {
+        let mac = generate_mac();
+        assert!(mac.starts_with("52:54:00:"), "unexpected MAC: {mac}");
+        let octets: Vec<&str> = mac.split(':').collect();
+        assert_eq!(octets.len(), 6, "MAC should have 6 octets: {mac}");
+        for o in octets {
+            assert_eq!(o.len(), 2, "each octet is two hex digits: {mac}");
+            assert!(
+                o.bytes().all(|b| b.is_ascii_hexdigit()),
+                "octet not hex: {mac}"
             );
         }
     }
