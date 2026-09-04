@@ -320,8 +320,15 @@ impl KvmService {
             for line in out.lines() {
                 let mut cols = line.split('\t');
                 let full = cols.next().unwrap_or_default();
-                let used = cols.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
-                let creation = cols.next().unwrap_or("0").parse::<i64>().unwrap_or(0);
+                // `-p` always emits numeric used/creation; a row that doesn't
+                // parse is malformed output, so skip it rather than fabricate a
+                // 0-byte / epoch-0 entry that would read as a real snapshot.
+                let (Some(used), Some(creation)) = (
+                    cols.next().and_then(|s| s.parse::<u64>().ok()),
+                    cols.next().and_then(|s| s.parse::<i64>().ok()),
+                ) else {
+                    continue;
+                };
                 let desc = cols.next().unwrap_or("-");
                 let Some((_, tag)) = full.split_once('@') else {
                     continue;
@@ -386,7 +393,14 @@ impl KvmService {
             return Err(e);
         }
         if let Some(desc) = req.description.as_deref().filter(|d| !d.trim().is_empty()) {
-            let prop = format!("daygleve:description={desc}");
+            // The description is read back from tab-delimited `zfs list -H` output,
+            // so collapse any control whitespace (tabs, newlines) to spaces before
+            // storing it, or a value with a tab/newline would corrupt that parse.
+            let sanitized: String = desc
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let prop = format!("daygleve:description={}", sanitized.trim());
             for target in &targets {
                 // The snapshot is already captured; a failed annotation must not
                 // fail the whole operation.
