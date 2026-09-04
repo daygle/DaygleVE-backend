@@ -243,17 +243,20 @@ impl KvmService {
         let short = new_id.replace('-', "");
         let tag = format!("{CLONE_SNAPSHOT_PREFIX}{}", &short[..12]);
 
+        // A disk with no dataset would clone into an invalid domain (domain_xml
+        // always renders a zvol source), so fail fast rather than silently
+        // dropping it and producing a partial hardware copy.
+        if src.disks.iter().any(|d| d.dataset.trim().is_empty()) {
+            return Err(AppError::validation(
+                "the source VM has a disk with no dataset; cannot clone",
+            ));
+        }
         // Plan the destination datasets: same parent as each source disk, with a
         // leaf derived from the new VM name. Validate every path through the
         // dataset barrier before it reaches `zfs`.
         let mut new_disks: Vec<VmDisk> = Vec::new();
         let mut planned: Vec<(String, String)> = Vec::new(); // (src_dataset, new_dataset)
-        for (i, disk) in src
-            .disks
-            .iter()
-            .filter(|d| !d.dataset.trim().is_empty())
-            .enumerate()
-        {
+        for (i, disk) in src.disks.iter().enumerate() {
             let src_ds = ensure_safe_dataset(disk.dataset.trim())?;
             let parent = src_ds.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
             let new_ds = if parent.is_empty() {
@@ -297,6 +300,15 @@ impl KvmService {
             }
         }
 
+        // A full clone is meant to be independent: `zfs promote` moved each base
+        // snapshot onto the clone, where it's no longer needed, so best-effort
+        // destroy it rather than leave a hidden snapshot pinning space.
+        if req.full {
+            for new_ds in &created {
+                let _ = command::run_ok("zfs", &["destroy", &format!("{new_ds}@{tag}")]).await;
+            }
+        }
+
         let clone_vm = Vm {
             id: new_id,
             name: req.name,
@@ -305,12 +317,13 @@ impl KvmService {
             memory_mib: src.memory_mib,
             firmware: src.firmware,
             disks: new_disks,
-            // Drop the source MACs so libvirt/the backend assigns fresh ones.
+            // Give each NIC a freshly-generated MAC (recorded in the VM), so the
+            // clone never inherits the source's MAC and we always know what it is.
             nics: src
                 .nics
                 .iter()
                 .map(|n| VmNic {
-                    mac: None,
+                    mac: Some(generate_mac()),
                     ..n.clone()
                 })
                 .collect(),
@@ -508,6 +521,14 @@ impl KvmService {
     ) -> ApiResult<VmSnapshot> {
         let vm = self.get_stored(id).await?;
         let tag = ensure_safe_snapshot(&req.name)?;
+        // The clone-base prefix is reserved for internal snapshots (which are
+        // hidden from listing); reject it so a user snapshot can't vanish or
+        // collide with a clone base.
+        if tag.starts_with(CLONE_SNAPSHOT_PREFIX) {
+            return Err(AppError::validation(format!(
+                "snapshot name must not start with the reserved prefix {CLONE_SNAPSHOT_PREFIX:?}"
+            )));
+        }
         let datasets = snapshot_datasets(&vm)?;
         if datasets.is_empty() {
             return Err(AppError::validation("the VM has no disks to snapshot"));
@@ -943,6 +964,13 @@ fn is_already_exists(e: &AppError) -> bool {
     e.message().to_ascii_lowercase().contains("already exists")
 }
 
+/// A fresh locally-administered unicast MAC in QEMU's `52:54:00` OUI, with three
+/// random host bytes from a v4 UUID. Used to give a cloned VM its own MACs.
+fn generate_mac() -> String {
+    let b = uuid::Uuid::new_v4().into_bytes();
+    format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
+}
+
 /// Parse `virsh vncdisplay` output (`host:N` or `:N`) to a `host:port` socket.
 fn parse_vnc_display(display: &str) -> Option<String> {
     let (host, disp) = display.rsplit_once(':')?;
@@ -1226,6 +1254,15 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn generated_macs_are_locally_administered_and_unique() {
+        let a = generate_mac();
+        assert!(a.starts_with("52:54:00:"), "unexpected MAC: {a}");
+        assert_eq!(a.len(), 17, "MAC should be 6 octets: {a}");
+        // Two draws should differ (random host bytes).
+        assert_ne!(a, generate_mac());
     }
 
     #[test]
