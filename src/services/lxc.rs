@@ -16,6 +16,8 @@ use daygleve_schema::lxc::{
     CreateLxcRequest, Lxc, LxcNetwork, LxcPowerAction, LxcState, LxcSummary, UpdateLxcRequest,
 };
 
+use daygleve_schema::lxc_snapshot::LxcSnapshotRecord;
+
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
 use crate::services::store::JsonStore;
@@ -25,6 +27,7 @@ use crate::services::{
 
 pub struct LxcService {
     store: JsonStore,
+    snapshot_store: JsonStore,
     config: Arc<Config>,
 }
 
@@ -32,6 +35,7 @@ impl LxcService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             store: JsonStore::new(&config.state_dir, "containers"),
+            snapshot_store: JsonStore::new(&config.state_dir, "container_snapshots"),
             config,
         }
     }
@@ -324,6 +328,118 @@ impl LxcService {
         }
         Ok(out_vec)
     }
+    /// Snapshot a container's ZFS-backed rootfs.
+    pub async fn snapshot(&self, id: &str, name: &str) -> ApiResult<LxcSnapshotRecord> {
+        let ct = self.get_stored(id).await?;
+        crate::services::kvm::ensure_safe_snapshot(name)?;
+        let full = format!("{0}@{name}", ct.rootfs_dataset);
+        command::run_ok("zfs", &["snapshot", &full]).await?;
+
+        let out = command::run("zfs", &["list", "-Hp", "-o", "name,used", &full]).await?;
+        let line = out
+            .lines()
+            .next()
+            .ok_or_else(|| AppError::internal("snapshot created but could not be read back"))?;
+        let parts: Vec<&str> = line.split('\t').collect();
+        let used_bytes = parts
+            .get(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let snapshot = LxcSnapshotRecord {
+            id: new_id(),
+            name: name.to_string(),
+            container_id: ct.id.clone(),
+            dataset: ct.rootfs_dataset.clone(),
+            used_bytes,
+            created_at: now_ts(),
+        };
+        // Persist the snapshot record.
+        self.snapshot_store.put(&snapshot.id, &snapshot).await?;
+        Ok(snapshot)
+    }
+
+    /// Roll a snapshot back to, restoring the container's rootfs.
+    pub async fn rollback_snapshot(&self, id: &str, name: &str) -> ApiResult<()> {
+        let ct = self.get_stored(id).await?;
+        crate::services::kvm::ensure_safe_snapshot(name)?;
+        let target = format!("{0}@{name}", ct.rootfs_dataset);
+        command::run_ok("zfs", &["rollback", "-r", &target]).await?;
+        Ok(())
+    }
+
+    /// Delete a snapshot.
+    pub async fn delete_snapshot(&self, id: &str, name: &str) -> ApiResult<()> {
+        let ct = self.get_stored(id).await?;
+        crate::services::kvm::ensure_safe_snapshot(name)?;
+        let target = format!("{0}@{name}", ct.rootfs_dataset);
+        command::run_ok("zfs", &["destroy", &target]).await?;
+        // Remove the stored record.
+        let snapshots = self.snapshot_store.list::<LxcSnapshotRecord>().await?;
+        for snap in snapshots
+            .into_iter()
+            .filter(|s| s.container_id == id && s.name == name)
+        {
+            let _ = self.snapshot_store.delete(&snap.id).await;
+        }
+        Ok(())
+    }
+
+    /// List snapshots for a container.
+    pub async fn list_snapshots(&self, id: &str) -> ApiResult<Vec<LxcSnapshotRecord>> {
+        let ct = self.get_stored(id).await?;
+        let prefix = format!("{0}@", ct.rootfs_dataset);
+        let out = match command::run_optional(
+            "zfs",
+            &[
+                "list",
+                "-t",
+                "snapshot",
+                "-Hp",
+                "-o",
+                "name,used",
+                "-d",
+                "1",
+                &ct.rootfs_dataset,
+            ],
+        )
+        .await
+        {
+            Ok(Some(o)) => o,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) if crate::services::kvm::is_missing_dataset(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut snapshots = Vec::new();
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            if !line.starts_with(&prefix) {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            let name = parts
+                .first()
+                .and_then(|s| s.strip_prefix(&prefix))
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let used_bytes = parts
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let snapshot = LxcSnapshotRecord {
+                id: new_id(),
+                name: name.to_string(),
+                container_id: ct.id.clone(),
+                dataset: ct.rootfs_dataset.clone(),
+                used_bytes,
+                created_at: now_ts(),
+            };
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
+    }
+
     /// Write CPU/memory cgroup limits and vet the bridge name.
     ///
     /// Config

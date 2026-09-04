@@ -1091,7 +1091,7 @@ fn ensure_safe_dataset(dataset: &str) -> ApiResult<&str> {
 /// flag, and rejects the reserved clone-base prefix so no user snapshot
 /// entrypoint (create/rollback/delete) can target an internal clone base.
 /// Internal clone bases build their tag directly and never pass through here.
-fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
+pub(crate) fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
     if name.starts_with(CLONE_SNAPSHOT_PREFIX) {
         return Err(AppError::validation(format!(
             "snapshot name must not start with the reserved prefix {CLONE_SNAPSHOT_PREFIX:?}"
@@ -1113,7 +1113,7 @@ fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
 
 /// True when a `zfs` error indicates the target dataset simply does not exist,
 /// as opposed to a permission or transient failure we must not hide.
-fn is_missing_dataset(e: &AppError) -> bool {
+pub(crate) fn is_missing_dataset(e: &AppError) -> bool {
     let m = e.message().to_ascii_lowercase();
     m.contains("does not exist") || m.contains("dataset does not exist")
 }

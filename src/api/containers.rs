@@ -6,6 +6,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::lxc::{CreateLxcRequest, Lxc, LxcPowerRequest, LxcSummary, UpdateLxcRequest};
+use daygleve_schema::lxc_snapshot::{CreateLxcSnapshotRequest, LxcSnapshot};
 use daygleve_schema::operations::OperationRecord;
 
 use crate::auth::AuthUser;
@@ -20,6 +21,18 @@ pub fn routes() -> Router<AppState> {
             get(get_one).patch(update).delete(delete),
         )
         .route("/containers/{id}/power", post(power))
+        .route(
+            "/containers/{id}/snapshots",
+            get(list_snapshots).post(create_snapshot),
+        )
+        .route(
+            "/containers/{id}/snapshots/{name}",
+            axum::routing::delete(delete_snapshot),
+        )
+        .route(
+            "/containers/{id}/snapshots/{name}/rollback",
+            post(rollback_snapshot),
+        )
 }
 
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<LxcSummary>>> {
@@ -101,6 +114,46 @@ async fn delete(
             move || async move { operation_services.lxc.delete(&id).await },
         )
         .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_snapshots(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<LxcSnapshot>>> {
+    user.require(Permission::LxcRead)?;
+    Ok(Json(state.services.lxc.list_snapshots(&id).await?))
+}
+
+async fn create_snapshot(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateLxcSnapshotRequest>,
+) -> ApiResult<(StatusCode, Json<LxcSnapshot>)> {
+    user.require(Permission::LxcWrite)?;
+    let snapshot = state.services.lxc.snapshot(&id, &req.name).await?;
+    Ok((StatusCode::CREATED, Json(snapshot)))
+}
+
+async fn rollback_snapshot(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    user.require(Permission::LxcWrite)?;
+    state.services.lxc.rollback_snapshot(&id, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_snapshot(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    user.require(Permission::LxcWrite)?;
+    state.services.lxc.delete_snapshot(&id, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
