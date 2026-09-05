@@ -49,7 +49,7 @@ src/
     storage.rs network.rs gpus.rs metrics.rs
   services/          # subsystem logic (host interaction lives here)
     kvm.rs lxc.rs zfs.rs network.rs gpu.rs metrics.rs auth.rs
-    command.rs       #   async wrapper for shelling out to host tools
+    command.rs       #   allowlisted host-tool wrapper with fixed paths
     store.rs         #   per-resource persistent JSON records
 ```
 
@@ -76,10 +76,19 @@ erroring.
 
 ### Host requirements
 
-The engine expects to run **as root on the appliance** (the DaygleVE ISO ships
-all of these): `libvirt`/`qemu-system-x86_64`, `lxc`, `zfsutils-linux`,
-`iproute2`, and (for passthrough) `vfio-pci`. It also needs a writable
-`DAYGLEVE_STATE_DIR` (default `/var/lib/daygleve`).
+The engine expects to run as the dedicated `daygleve` service account on the
+appliance. The account has no login shell or sudo access and is granted only the
+host groups/devices required by the current direct-tool architecture. The
+systemd unit applies filesystem, device, capability, syscall, and network
+restrictions; AppArmor is also shipped by the ISO. A root-only preparation unit
+creates/migrates the state directory before the backend starts.
+
+The engine expects these host components (the DaygleVE ISO ships all of them):
+`libvirt`/`qemu-system-x86_64`, `lxc`, `zfsutils-linux`, `iproute2`, and (for
+passthrough) `vfio-pci`. It also needs a writable `DAYGLEVE_STATE_DIR` (default
+`/var/lib/daygleve`). Some direct LXC, ZFS, networking, and vfio operations
+still require high-risk capabilities; production multi-tenant deployments
+should put those operations behind a small root-owned broker.
 
 > **Validation status:** the crate builds clean and its host-independent paths
 > (auth, RBAC, `/proc` metrics, the JSON store, graceful degradation) are
@@ -102,6 +111,7 @@ cargo run
 # DAYGLEVE_STATE_DIR=/var/lib/daygleve  (persistent records)
 # DAYGLEVE_ADMIN_PASSWORD=...           (seeded admin password; change it!)
 # DAYGLEVE_TOKEN_TTL_SECS=43200         (bearer token lifetime; default 12h)
+# DAYGLEVE_BACKUP_DIR=/var/lib/daygleve/backups
 curl localhost:8080/api/v1/health
 ```
 

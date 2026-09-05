@@ -424,7 +424,7 @@ impl BackupService {
     }
 
     async fn send_to_file(&self, snapshot: &str, path: &Path) -> ApiResult<u64> {
-        let mut child = tokio::process::Command::new("zfs")
+        let mut child = command::new("zfs")?
             .args(["send", "-p", snapshot])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -470,7 +470,7 @@ impl BackupService {
         if exists.is_some() && force {
             command::run_ok("zfs", &["destroy", "-r", target]).await?;
         }
-        let mut child = tokio::process::Command::new("zfs")
+        let mut child = command::new("zfs")?
             .args(["receive", "-F", target])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
