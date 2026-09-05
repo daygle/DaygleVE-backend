@@ -569,6 +569,7 @@ mod tests {
             admin_password: Some(rand_password()),
             tls_cert: None,
             tls_key: None,
+            broker_socket: None,
         })
     }
 

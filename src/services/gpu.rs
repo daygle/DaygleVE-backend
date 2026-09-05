@@ -86,14 +86,14 @@ async fn bind_one(addr: &str, force: bool) -> ApiResult<()> {
                 "{addr} is bound to host driver `{driver}`; retry with force to rebind"
             )));
         }
-        write_sysfs(&dir.join("driver").join("unbind"), addr).await?;
+        crate::services::command::pci_write(crate::broker::PciWriteKind::Unbind, addr).await?;
     }
 
     // driver_override pins the device to vfio-pci for the subsequent bind.
-    write_sysfs(&dir.join("driver_override"), "vfio-pci").await?;
+    crate::services::command::pci_write(crate::broker::PciWriteKind::Override, addr).await?;
     // Ignore an "already bound"/EBUSY here — the override + a fresh bind is
     // best-effort and the device may already be attached.
-    let _ = write_sysfs(&PathBuf::from("/sys/bus/pci/drivers/vfio-pci/bind"), addr).await;
+    let _ = crate::services::command::pci_write(crate::broker::PciWriteKind::Bind, addr).await;
     Ok(())
 }
 
@@ -182,10 +182,4 @@ async fn read_trimmed(path: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-async fn write_sysfs(path: &Path, value: &str) -> ApiResult<()> {
-    fs::write(path, value)
-        .await
-        .map_err(|e| AppError::hypervisor(format!("write {}: {e}", path.display())))
 }

@@ -44,6 +44,12 @@ pub struct Config {
     pub tls_cert: Option<PathBuf>,
     /// PEM private key for HTTPS. `DAYGLEVE_TLS_KEY`.
     pub tls_key: Option<PathBuf>,
+    /// Unix socket of the root-owned host broker. `DAYGLEVE_BROKER_SOCKET`.
+    /// When set, every allowlisted host command, PCI sysfs write, and LXC
+    /// config write is delegated to the broker process instead of being
+    /// performed directly — the privilege split from the security plan.
+    /// When unset (dev hosts), the backend executes host tools directly.
+    pub broker_socket: Option<PathBuf>,
 }
 
 impl Config {
@@ -114,6 +120,11 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
+        let broker_socket = std::env::var("DAYGLEVE_BROKER_SOCKET")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         Self {
             listen_addr,
             cors_origins,
@@ -127,6 +138,7 @@ impl Config {
             admin_password,
             tls_cert,
             tls_key,
+            broker_socket,
         }
     }
 

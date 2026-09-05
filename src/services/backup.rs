@@ -17,7 +17,7 @@ use daygleve_schema::backup::{
     RestoreBackupRequest, UpdateBackupPlanRequest,
 };
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
@@ -27,7 +27,6 @@ use crate::services::operations::OperationService;
 use crate::services::store::JsonStore;
 use crate::services::{ensure_safe_id, ensure_safe_zfs_dataset, new_id, now_ts, Services};
 
-const BACKUP_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const MIN_INTERVAL_SECS: u64 = 60;
 const MAX_RETENTION: u32 = 3650;
 
@@ -424,39 +423,8 @@ impl BackupService {
     }
 
     async fn send_to_file(&self, snapshot: &str, path: &Path) -> ApiResult<u64> {
-        let mut child = command::new("zfs")?
-            .args(["send", "-p", snapshot])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| AppError::hypervisor(format!("failed to start zfs send: {e}")))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AppError::internal("zfs send stdout was not captured"))?;
-        let mut file = tokio::fs::File::create(path)
-            .await
-            .map_err(|e| AppError::internal(format!("create backup file: {e}")))?;
-        let copied = tokio::time::timeout(BACKUP_TIMEOUT, tokio::io::copy(&mut stdout, &mut file))
-            .await
-            .map_err(|_| AppError::hypervisor("zfs send timed out"))?
-            .map_err(|e| AppError::internal(format!("write backup stream: {e}")))?;
-        file.flush()
-            .await
-            .map_err(|e| AppError::internal(format!("flush backup: {e}")))?;
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| AppError::hypervisor(format!("wait for zfs send: {e}")))?;
-        if !output.status.success() {
-            let _ = tokio::fs::remove_file(path).await;
-            return Err(AppError::hypervisor(format!(
-                "zfs send failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(copied)
+        let args = ["send", "-p", snapshot];
+        command::stream_to_file("zfs", &args, path).await
     }
 
     async fn restore_file(&self, file: &BackupFile, target: &str, force: bool) -> ApiResult<()> {
@@ -470,37 +438,8 @@ impl BackupService {
         if exists.is_some() && force {
             command::run_ok("zfs", &["destroy", "-r", target]).await?;
         }
-        let mut child = command::new("zfs")?
-            .args(["receive", "-F", target])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| AppError::hypervisor(format!("failed to start zfs receive: {e}")))?;
-        let mut input = child
-            .stdin
-            .take()
-            .ok_or_else(|| AppError::internal("zfs receive stdin was not captured"))?;
-        let mut source = tokio::fs::File::open(&file.path)
-            .await
-            .map_err(|e| AppError::internal(format!("open backup file: {e}")))?;
-        tokio::time::timeout(BACKUP_TIMEOUT, tokio::io::copy(&mut source, &mut input))
-            .await
-            .map_err(|_| AppError::hypervisor("zfs receive timed out"))?
-            .map_err(|e| AppError::internal(format!("read backup stream: {e}")))?;
-        drop(input);
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| AppError::hypervisor(format!("wait for zfs receive: {e}")))?;
-        if !output.status.success() {
-            return Err(AppError::hypervisor(format!(
-                "zfs receive failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(())
+        let args = ["receive", "-F", target];
+        command::stream_from_file("zfs", &args, Path::new(&file.path)).await
     }
 
     async fn verify_file(&self, file: &BackupFile) -> ApiResult<()> {

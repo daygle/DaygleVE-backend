@@ -450,7 +450,6 @@ impl LxcService {
         memory_mib: u64,
         networks: &[LxcNetwork],
     ) -> ApiResult<()> {
-        let path = format!("/var/lib/lxc/{name}/config");
         let mut block = String::from("\n# --- DaygleVE limits & networking ---\n");
         block.push_str(&format!(
             "lxc.cgroup2.memory.max = {}\n",
@@ -472,10 +471,7 @@ impl LxcService {
             }
         }
 
-        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        tokio::fs::write(&path, format!("{existing}{block}"))
-            .await
-            .map_err(|e| AppError::hypervisor(format!("write {path}: {e}")))
+        command::append_lxc_config(name, &block).await
     }
 }
 

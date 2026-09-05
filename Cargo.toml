@@ -36,6 +36,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+# Broker protocol: base64 chunk payloads inside JSON frames.
+base64 = "0.22"
+# Unix broker peer-credential and no-follow file operations.
+libc = "0.2"
 
 [lints.rust]
 unsafe_code = "forbid"

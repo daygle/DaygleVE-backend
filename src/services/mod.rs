@@ -7,34 +7,40 @@
 //! own structured records persisted via [`store::JsonStore`]. See
 //! [`command`] for the spawn wrapper.
 //!
-//! ## Privilege boundary (a completed security fix, not an optimization)
+//! ## Privilege boundary
 //!
-//! The current backend still directly performs high-risk host operations. The
-//! recent account/sandbox/AppArmor/workflow hardening reduces exposure, but it
-//! does **not** remove the root-equivalent boundary for the hypervisor stack.
+//! On the appliance, high-risk host operations are delegated through the
+//! root-owned `daygleve-broker` over an authenticated Unix socket. The direct
+//! implementation remains available only for explicit development mode when
+//! `DAYGLEVE_BROKER_SOCKET` is unset; the appliance unit sets it and the command
+//! layer refuses direct command construction in that mode.
 //!
 //! Host actions are grouped by whether they *must* move into a small,
 //! root-owned broker before the control plane can be considered hardened for
 //! untrusted tenants or a hostile network:
 //!
-//! | Subsystem | Current execution | Residual root-equivalent surface | Broker status |
-//! |-----------|------------------|-----------------------------------|---------------|
-//! | KVM/virsh | direct `virsh` via `qemu:///system` | libvirt system instance, VM define/start/destroy, nvram, console VNC | broker required |
-//! | ZFS | direct `zfs`/`zpool` | dataset/snapshot/zvol mutation, send/receive, pool-level operations | broker required |
-//! | LXC | direct `lxc-*` + ZFS rootfs writes | container create/start/stop/destroy, cgroup writes, config mutation | broker required |
-//! | GPU/vfio | sysfs PCI binding/unbind, driver overrides | `/sys/bus/pci/*` writes, IOMMU group rebound to `vfio-pci` | broker required |
-//! | Network | direct `ip`/`bridge` | bridge/VLAN/mount/network device changes, namespace and cgroup usage | broker required |
-//! | Shares/mounts | direct `mount`/`umount` + mount-info reads | mount table mutation, filesystem attach/detach | broker required |
-//! | Backup/restore | direct ZFS send/receive + checksum/file I/O | long-running stream ops, restore target replacement, retention deletes | broker required (long-running) |
+//! | Subsystem | Appliance execution | Residual root-equivalent surface | Broker status |
+//! |-----------|--------------------|-----------------------------------|---------------|
+//! | KVM/virsh | broker-mediated `virsh` via `qemu:///system` | libvirt system instance, VM define/start/destroy, nvram, console VNC | delegated |
+//! | ZFS | broker-mediated `zfs`/`zpool` | dataset/snapshot/zvol mutation, send/receive, pool-level operations | delegated |
+//! | LXC | broker-mediated `lxc-*` + ZFS rootfs writes | container create/start/stop/destroy, cgroup writes, config mutation | delegated |
+//! | GPU/vfio | broker-mediated PCI sysfs writes | `/sys/bus/pci/*` writes, IOMMU group rebound to `vfio-pci` | delegated |
+//! | Network | broker-mediated `ip`/`bridge` | bridge/VLAN/mount/network device changes, namespace and cgroup usage | delegated |
+//! | Shares/mounts | broker-mediated `mount`/`umount` | mount table mutation, filesystem attach/detach | delegated |
+//! | Backup/restore | broker-mediated ZFS streams | long-running stream ops, restore target replacement, retention deletes | delegated |
 //!
 //! Lower-risk, read-heavy, or state-local concerns are **not** broker blockers
 //! today: JSON record stores, auth/password state, ISO/library enumeration,
-//! metrics, the operations journal, and API housekeeping.
+//! metrics, the operations journal, and API housekeeping. The explicit direct
+//! fallback is intended only for development hosts where the broker socket is
+//! unset; the appliance config sets the socket and refuses direct streaming
+//! command construction.
 //!
-//! The service layer is therefore wired through an explicit [`HostBroker`]
-//! abstraction. The current implementation is [`DirectHostBroker`], which
-//! mirrors today's behavior so the code compiles and passes its existing tests.
-//! It is intentionally not presented as the finished security architecture.
+//! The command layer is therefore wired to the broker transport for configured
+//! appliance deployments, with [`DirectHostBroker`] retained only as an
+//! informational compatibility marker for local development and tests. The
+//! broker protocol independently validates requests; real-host systemd and
+//! AppArmor validation remains a deployment requirement.
 
 pub mod auth;
 pub mod backup;
@@ -51,28 +57,25 @@ pub mod zfs;
 
 /// The host side of the planned privilege split.
 ///
-/// Today the backend runs as the `daygleve` system account and still directly
-/// touches libvirt, ZFS, LXC, PCI sysfs, network devices/mounts, and the backup
-/// tree. A future milestone replaces the direct path below with a small,
-/// root-owned broker that accepts authenticated local requests for only the
-/// operations each subsystem must delegate.
+/// On the appliance the backend runs as the `daygleve` system account and
+/// delegates libvirt, ZFS, LXC, PCI sysfs, network devices/mounts, and backup
+/// streams to the root-owned broker. The direct implementation remains only as
+/// an explicit development fallback when the broker socket is not configured.
 ///
-/// This trait is the stable boundary for that split. It is complete enough to be
-/// the implementation target, but deliberately does **not** pretend the broker
-/// already exists. The current symbols are kept as the stable target for the
-/// future broker, even though the live implementation is still direct.
+/// This trait is the stable audit marker for that split. The live command
+/// transport is implemented in [`command`] because streaming backup and restore
+/// operations need bidirectional framing.
 #[allow(dead_code)]
 pub trait HostBroker: Send + Sync {
-    /// The broker name used for audit/operational messages. Today this is always
-    /// `direct`, because the backend is still the acting process.
+    /// The broker name used for audit/operational messages. The marker remains
+    /// `direct` only for development hosts where the socket is intentionally
+    /// unset; appliance host commands use the broker transport.
     fn kind(&self) -> &str;
 }
 
-/// The current implementation: the backend performs the host operation itself.
-///
-/// This is correct for compatibility and for the existing test suite, but it is
-/// explicit about the residual exposure rather than hiding it behind a vague
-/// "hardened" claim.
+/// The explicit direct development implementation marker. Appliance execution
+/// uses the broker transport instead; retaining this marker avoids pretending
+/// that non-appliance development hosts have the same privilege boundary.
 #[allow(dead_code)]
 pub(crate) struct DirectHostBroker;
 
@@ -85,8 +88,8 @@ impl HostBroker for DirectHostBroker {
 /// Marker used in operation messages and audit comments to indicate that an
 /// operation should eventually be executed by the root-owned broker.
 ///
-/// It is informational today. It becomes enforceable only once the broker is
-/// deployed and the direct path is removed from the corresponding service.
+/// It is informational for audit records; runtime enforcement is provided by
+/// the configured broker socket and the direct-path fail-closed checks.
 #[allow(dead_code)]
 pub(crate) const BROKER_REQUIRED: &str = "broker-required";
 
@@ -94,9 +97,9 @@ pub(crate) const BROKER_REQUIRED: &str = "broker-required";
 ///
 /// This is for documentation and operational review, not for runtime policy.
 ///
-/// It is informational: the actual enforcement still happens through the host-tool
-/// wrappers, the service layer, the systemd/AppArmor sandbox, and eventually the
-/// broker. Today it does **not** gate execution.
+/// Runtime enforcement comes from the broker protocol, host-tool wrappers, and
+/// systemd/AppArmor sandbox; this list is the audit summary of the affected
+/// surface.
 #[allow(dead_code)]
 pub(crate) fn residual_root_surface() -> Vec<&'static str> {
     vec![

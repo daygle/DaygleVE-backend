@@ -10,6 +10,7 @@
 
 mod api;
 mod auth;
+mod broker;
 mod config;
 mod error;
 mod services;
@@ -31,6 +32,11 @@ async fn main() -> anyhow_lite::Result<()> {
         .init();
 
     let config = Config::from_env();
+    if let Some(socket) = &config.broker_socket {
+        tracing::info!(socket = %socket.display(), "root-owned host broker is configured");
+    } else {
+        tracing::warn!("DAYGLEVE_BROKER_SOCKET is unset; privileged host operations use the direct development path");
+    }
     let addr: SocketAddr = config.listen_addr;
 
     let state = AppState::new(config.clone())

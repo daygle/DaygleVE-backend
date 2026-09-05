@@ -510,6 +510,7 @@ mod tests {
             admin_password: Some("test-password-generated-at-runtime".into()),
             tls_cert: None,
             tls_key: None,
+            broker_socket: None,
         })
     }
 

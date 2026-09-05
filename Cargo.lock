@@ -292,10 +292,12 @@ dependencies = [
  "argon2",
  "axum",
  "axum-server",
+ "base64",
  "chrono",
  "daygleve-schema",
  "futures",
  "http-body-util",
+ "libc",
  "rand_core 0.6.4",
  "rustls",
  "serde",
@@ -314,7 +316,7 @@ dependencies = [
 [[package]]
 name = "daygleve-schema"
 version = "1.0.0"
-source = "git+https://github.com/daygle/DaygleVE-schema?branch=main#32647d78b9dc69d2e7b4b32ee29e634a2be97f6c"
+source = "git+https://github.com/daygle/DaygleVE-schema?branch=main#3d101c9bad53775c637d6f90d508f507cdb5b7a1"
 dependencies = [
  "serde",
  "serde_json",

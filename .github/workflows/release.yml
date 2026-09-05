@@ -15,11 +15,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release binary
         run: cargo build --release
-      - name: Package binary
+      - name: Package binaries
         run: |
           install -Dm755 target/release/daygleve-backend dist/daygleve-backend
-          tar -czf "daygleve-backend-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" -C dist daygleve-backend
-          sha256sum daygleve-backend-*.tar.gz > daygleve-backend-${{ github.ref_name }}.sha256
+          install -Dm755 target/release/daygleve-broker dist/daygleve-broker
+          tar -czf "daygleve-backend-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" -C dist daygleve-backend daygleve-broker
+          sha256sum "daygleve-backend-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" > "daygleve-backend-${{ github.ref_name }}.sha256"
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:

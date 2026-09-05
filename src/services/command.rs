@@ -1,36 +1,18 @@
-//! Thin async wrapper around spawning host commands.
+//! Host command routing and the broker privilege boundary.
 //!
-//! The service layer drives the host by shelling out to `virsh`, `qemu-img`,
-//! `zfs`/`zpool`, `ip`/`bridge`, `lxc-*` and friends (the same approach
-//! Proxmox takes). Centralising the spawn here gives every call uniform error
-//! mapping into [`AppError`] and one place to reason about failures.
-//!
-//! ## Why this wrapper is necessary but not sufficient for security
-//!
-//! This module constrains *how* host commands are launched: fixed absolute paths,
-//! cleared inherited environment, deterministic locale, allowed-program allowlist,
-//! and timeouts. That eliminates PATH/loader/shell-based control surfaces for the
-//! current architecture.
-//!
-//! It does **not** constrain *who* is allowed to perform privileged host actions.
-//! The backend still runs with the privileges required to invoke libvirt, ZFS,
-//! LXC, PCI sysfs, and networking/mount tooling. Removing that privilege requires
-//! the [`crate::services::HostBroker`] split: a small root-owned broker accepts
-//! authenticated local requests and performs only the operations each subsystem
-//! is authorized to request.
-//!
-//! Until that broker exists, this module is a command safety boundary, not a
-//! privilege boundary.
+//! When `DAYGLEVE_BROKER_SOCKET` is set, privileged operations are sent to the
+//! root-owned `daygleve-broker` over its authenticated Unix socket. The direct
+//! command path remains available only when the broker is not configured, which
+//! keeps local development and unit tests usable without a Linux appliance.
 
+use std::path::Path;
 use std::time::Duration;
 
 use tokio::process::Command;
 
-/// Upper bound for a host command invoked by an HTTP request. Long-running
-/// workflows should move to the job system instead of extending this limit.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
-
 use crate::error::{ApiResult, AppError};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn program_path(program: &str) -> Option<&'static str> {
     Some(match program {
@@ -54,8 +36,6 @@ fn program_path(program: &str) -> Option<&'static str> {
     })
 }
 
-/// Return a validation error when a call site attempts to invoke an
-/// unapproved host program.
 fn validate_program(program: &str) -> ApiResult<&'static str> {
     program_path(program)
         .ok_or_else(|| AppError::internal(format!("host program `{program}` is not permitted")))
@@ -72,26 +52,34 @@ fn command_for(executable: &str) -> Command {
     command
 }
 
-/// Build a host-tool command with a fixed executable path and a minimal
-/// environment. This prevents PATH lookup and loader-related environment
-/// variables from becoming an execution-control surface.
-///
-/// This is a **safety** boundary for the current architecture, not a complete
-/// privilege boundary. Who can perform which host operation is still determined by
-/// the service layer and the planned [`crate::services::HostBroker`] split.
-pub(crate) fn new(program: &str) -> ApiResult<Command> {
-    let executable = validate_program(program)?;
-    Ok(command_for(executable))
+#[cfg(unix)]
+fn broker_client() -> Option<crate::broker::client::BrokerClient> {
+    std::env::var("DAYGLEVE_BROKER_SOCKET")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .map(crate::broker::client::BrokerClient::new)
 }
 
-/// Run `program args...`, returning captured stdout on success.
-///
-/// A non-zero exit maps to a `HypervisorError` carrying the trimmed stderr; a
-/// spawn failure (including the binary not being installed) maps the same way.
+#[cfg(unix)]
+fn broker_error(error: impl std::fmt::Display) -> AppError {
+    AppError::hypervisor(format!("root-owned broker request failed: {error}"))
+}
+
+/// Execute an allowlisted command through the broker when configured, otherwise
+/// use the fixed-path direct development path.
 pub async fn run(program: &str, args: &[&str]) -> ApiResult<String> {
     let executable = validate_program(program)?;
-    let output = run_with_timeout(executable, args, COMMAND_TIMEOUT).await?;
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        return client
+            .exec(program, args)
+            .await
+            .map(|output| output.stdout)
+            .map_err(broker_error);
+    }
 
+    let output = run_with_timeout(executable, args, COMMAND_TIMEOUT).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::hypervisor(format!(
@@ -103,36 +91,23 @@ pub async fn run(program: &str, args: &[&str]) -> ApiResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Run a command purely for its side effect, discarding stdout.
 pub async fn run_ok(program: &str, args: &[&str]) -> ApiResult<()> {
     run(program, args).await.map(|_| ())
 }
 
-async fn run_with_timeout(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> ApiResult<std::process::Output> {
-    tokio::time::timeout(
-        timeout,
-        command_for(program).kill_on_drop(true).args(args).output(),
-    )
-    .await
-    .map_err(|_| {
-        AppError::hypervisor(format!(
-            "`{program}` timed out after {} seconds",
-            timeout.as_secs()
-        ))
-    })?
-    .map_err(|e| AppError::hypervisor(format!("failed to run `{program}`: {e}")))
-}
-
-/// Like [`run`], but returns `Ok(None)` when the binary is not installed.
-///
-/// List/inventory endpoints use this so a development host without `zfs`/`virsh`
-/// degrades to "nothing to show" instead of a 502. A tool that *is* present but
-/// exits non-zero still surfaces as an error.
+/// Like [`run`], but a missing executable is treated as an unavailable optional
+/// host feature. A configured broker is never bypassed if it is unavailable.
 pub async fn run_optional(program: &str, args: &[&str]) -> ApiResult<Option<String>> {
+    validate_program(program)?;
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        return match client.exec(program, args).await {
+            Ok(output) => Ok(Some(output.stdout)),
+            Err(crate::broker::client::BrokerError::SpawnNotFound(_)) => Ok(None),
+            Err(error) => Err(broker_error(error)),
+        };
+    }
+
     let executable = validate_program(program)?;
     match tokio::time::timeout(
         COMMAND_TIMEOUT,
@@ -165,6 +140,184 @@ pub async fn run_optional(program: &str, args: &[&str]) -> ApiResult<Option<Stri
     }
 }
 
+/// Build a direct command for the two streaming helpers' development fallback.
+/// Callers must use [`stream_to_file`] / [`stream_from_file`] for privileged
+/// backup paths; this function is not a broker bypass.
+pub(crate) fn new(program: &str) -> ApiResult<Command> {
+    if broker_configured() {
+        return Err(AppError::internal(
+            "direct host command construction is disabled while the broker is configured",
+        ));
+    }
+    Ok(command_for(validate_program(program)?))
+}
+
+fn broker_configured() -> bool {
+    std::env::var("DAYGLEVE_BROKER_SOCKET")
+        .ok()
+        .is_some_and(|path| !path.is_empty())
+}
+
+/// Stream an allowlisted command's stdout into a file. Backup send operations
+/// use this so `zfs send` never executes in the backend when the broker is on.
+pub async fn stream_to_file(program: &str, args: &[&str], path: &Path) -> ApiResult<u64> {
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        let mut file = tokio::fs::File::create(path)
+            .await
+            .map_err(|e| AppError::internal(format!("create {}: {e}", path.display())))?;
+        client
+            .exec_streamed(program, args, Option::<tokio::io::Empty>::None, &mut file)
+            .await
+            .map_err(broker_error)?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|e| AppError::internal(format!("stat {}: {e}", path.display())))?;
+        return Ok(metadata.len());
+    }
+
+    let mut child = new(program)?
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| AppError::hypervisor(format!("failed to start {program}: {e}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::internal("stream stdout was not captured"))?;
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| AppError::internal(format!("create {}: {e}", path.display())))?;
+    let copied = tokio::time::timeout(
+        Duration::from_secs(24 * 60 * 60),
+        tokio::io::copy(&mut stdout, &mut file),
+    )
+    .await
+    .map_err(|_| AppError::hypervisor(format!("{program} stream timed out")))?
+    .map_err(|e| AppError::internal(format!("write stream: {e}")))?;
+    use tokio::io::AsyncWriteExt;
+    file.flush()
+        .await
+        .map_err(|e| AppError::internal(format!("flush stream: {e}")))?;
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| AppError::hypervisor(format!("wait for {program}: {e}")))?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(AppError::hypervisor(format!(
+            "{program} stream failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(copied)
+}
+
+/// Stream a file into an allowlisted command's stdin. Backup restore uses this
+/// for `zfs receive`.
+pub async fn stream_from_file(program: &str, args: &[&str], path: &Path) -> ApiResult<()> {
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| AppError::internal(format!("open {}: {e}", path.display())))?;
+        let mut sink = tokio::io::sink();
+        client
+            .exec_streamed(program, args, Some(file), &mut sink)
+            .await
+            .map_err(broker_error)?;
+        return Ok(());
+    }
+
+    let mut child = new(program)?
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| AppError::hypervisor(format!("failed to start {program}: {e}")))?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::internal("stream stdin was not captured"))?;
+    let mut source = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| AppError::internal(format!("open {}: {e}", path.display())))?;
+    tokio::time::timeout(
+        Duration::from_secs(24 * 60 * 60),
+        tokio::io::copy(&mut source, &mut input),
+    )
+    .await
+    .map_err(|_| AppError::hypervisor(format!("{program} stream timed out")))?
+    .map_err(|e| AppError::internal(format!("read stream: {e}")))?;
+    drop(input);
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| AppError::hypervisor(format!("wait for {program}: {e}")))?;
+    if !output.status.success() {
+        return Err(AppError::hypervisor(format!(
+            "{program} stream failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Delegate a constrained vfio sysfs write when the broker is enabled.
+pub async fn pci_write(kind: crate::broker::PciWriteKind, address: &str) -> ApiResult<()> {
+    crate::broker::validate_pci_address(address).map_err(AppError::validation)?;
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        return client.pci_write(kind, address).await.map_err(broker_error);
+    }
+    let (path, value) = crate::broker::pci_write_target(kind, address);
+    tokio::fs::write(&path, value.as_bytes())
+        .await
+        .map_err(|e| AppError::hypervisor(format!("write {}: {e}", path.display())))
+}
+
+/// Delegate a constrained LXC config append when the broker is enabled.
+pub async fn append_lxc_config(name: &str, block: &str) -> ApiResult<()> {
+    crate::broker::validate_lxc_name(name).map_err(AppError::validation)?;
+    crate::broker::validate_lxc_config_block(block).map_err(AppError::validation)?;
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        return client
+            .lxc_config_append(name, block)
+            .await
+            .map_err(broker_error);
+    }
+    let path = Path::new("/var/lib/lxc").join(name).join("config");
+    let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    tokio::fs::write(&path, format!("{existing}{block}"))
+        .await
+        .map_err(|e| AppError::hypervisor(format!("write {}: {e}", path.display())))
+}
+
+async fn run_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> ApiResult<std::process::Output> {
+    tokio::time::timeout(
+        timeout,
+        command_for(program).kill_on_drop(true).args(args).output(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::hypervisor(format!(
+            "`{program}` timed out after {} seconds",
+            timeout.as_secs()
+        ))
+    })?
+    .map_err(|e| AppError::hypervisor(format!("failed to run `{program}`: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,7 +341,6 @@ mod tests {
             Duration::from_millis(10),
         )
         .await;
-
         let error = result.expect_err("the command should time out");
         assert!(error.message().contains("timed out"));
     }

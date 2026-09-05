@@ -19,7 +19,40 @@ pub fn routes() -> Router<AppState> {
 
 async fn broker_split(user: AuthUser) -> ApiResult<Json<BrokerSplitInventory>> {
     user.require(Permission::OperationsRead)?;
-    Ok(Json(BrokerSplitInventory::current(
-        crate::services::now_ts(),
-    )))
+    let broker_enabled: bool = {
+        #[cfg(unix)]
+        {
+            match std::env::var_os("DAYGLEVE_BROKER_SOCKET")
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from)
+            {
+                Some(path) => crate::broker::client::BrokerClient::new(path)
+                    .ping()
+                    .await
+                    .is_ok(),
+                None => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    };
+    let inventory = if broker_enabled {
+        let mut inventory = BrokerSplitInventory::current(crate::services::now_ts());
+        inventory.current_execution = daygleve_schema::broker::HostExecution::Broker;
+        inventory.broker_split_incomplete = false;
+        inventory.note = Some(
+            "Privileged host requests are configured to use the root-owned broker; real-host systemd/AppArmor validation remains required.".to_string(),
+        );
+        for subsystem in &mut inventory.subsystems {
+            subsystem.mode = daygleve_schema::broker::BrokerMode::Delegated;
+            subsystem.execution = daygleve_schema::broker::HostExecution::Broker;
+            subsystem.current_actions.clear();
+        }
+        inventory
+    } else {
+        BrokerSplitInventory::current(crate::services::now_ts())
+    };
+    Ok(Json(inventory))
 }
