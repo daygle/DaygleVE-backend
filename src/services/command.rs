@@ -4,6 +4,23 @@
 //! `zfs`/`zpool`, `ip`/`bridge`, `lxc-*` and friends (the same approach
 //! Proxmox takes). Centralising the spawn here gives every call uniform error
 //! mapping into [`AppError`] and one place to reason about failures.
+//!
+//! ## Why this wrapper is necessary but not sufficient for security
+//!
+//! This module constrains *how* host commands are launched: fixed absolute paths,
+//! cleared inherited environment, deterministic locale, allowed-program allowlist,
+//! and timeouts. That eliminates PATH/loader/shell-based control surfaces for the
+//! current architecture.
+//!
+//! It does **not** constrain *who* is allowed to perform privileged host actions.
+//! The backend still runs with the privileges required to invoke libvirt, ZFS,
+//! LXC, PCI sysfs, and networking/mount tooling. Removing that privilege requires
+//! the [`crate::services::HostBroker`] split: a small root-owned broker accepts
+//! authenticated local requests and performs only the operations each subsystem
+//! is authorized to request.
+//!
+//! Until that broker exists, this module is a command safety boundary, not a
+//! privilege boundary.
 
 use std::time::Duration;
 
@@ -58,6 +75,10 @@ fn command_for(executable: &str) -> Command {
 /// Build a host-tool command with a fixed executable path and a minimal
 /// environment. This prevents PATH lookup and loader-related environment
 /// variables from becoming an execution-control surface.
+///
+/// This is a **safety** boundary for the current architecture, not a complete
+/// privilege boundary. Who can perform which host operation is still determined by
+/// the service layer and the planned [`crate::services::HostBroker`] split.
 pub(crate) fn new(program: &str) -> ApiResult<Command> {
     let executable = validate_program(program)?;
     Ok(command_for(executable))

@@ -84,16 +84,27 @@ restrictions; AppArmor is also shipped by the ISO. A root-only preparation unit
 creates/migrates the state directory before the backend starts.
 
 The engine expects these host components (the DaygleVE ISO ships all of them):
+
 `libvirt`/`qemu-system-x86_64`, `lxc`, `zfsutils-linux`, `iproute2`, and (for
 passthrough) `vfio-pci`. It also needs a writable `DAYGLEVE_STATE_DIR` (default
-`/var/lib/daygleve`). Some direct LXC, ZFS, networking, and vfio operations
-still require high-risk capabilities; production multi-tenant deployments
-should put those operations behind a small root-owned broker.
+`/var/lib/daygleve`).
+
+Some direct LXC, ZFS, networking, and vfio operations still require high-risk
+capabilities; production multi-tenant deployments should put those operations
+behind a small root-owned broker.
 
 > **Validation status:** the crate builds clean and its host-independent paths
 > (auth, RBAC, `/proc` metrics, the JSON store, graceful degradation) are
 > covered by a runtime smoke test. The libvirt/LXC/ZFS/vfio paths issue the
 > correct host commands but are exercised on a real node, not in CI.
+>
+> **Security completion status:** the backend is hardened but not fully
+> privilege-separated. The current service layer documents the residual
+> root-equivalent surface and the planned broker split explicitly, but the
+> broker itself is not deployed. Real-host validation of the systemd/AppArmor
+> sandbox and the command wrapper is still required before production exposure.
+>
+> Last revised: 2026-09-05
 
 ## API
 

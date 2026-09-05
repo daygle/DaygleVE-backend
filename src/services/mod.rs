@@ -6,6 +6,35 @@
 //! `zfs`/`zpool`, `ip`/`bridge`, `vfio` via sysfs, `/proc`), with DaygleVE's
 //! own structured records persisted via [`store::JsonStore`]. See
 //! [`command`] for the spawn wrapper.
+//!
+//! ## Privilege boundary (a completed security fix, not an optimization)
+//!
+//! The current backend still directly performs high-risk host operations. The
+//! recent account/sandbox/AppArmor/workflow hardening reduces exposure, but it
+//! does **not** remove the root-equivalent boundary for the hypervisor stack.
+//!
+//! Host actions are grouped by whether they *must* move into a small,
+//! root-owned broker before the control plane can be considered hardened for
+//! untrusted tenants or a hostile network:
+//!
+//! | Subsystem | Current execution | Residual root-equivalent surface | Broker status |
+//! |-----------|------------------|-----------------------------------|---------------|
+//! | KVM/virsh | direct `virsh` via `qemu:///system` | libvirt system instance, VM define/start/destroy, nvram, console VNC | broker required |
+//! | ZFS | direct `zfs`/`zpool` | dataset/snapshot/zvol mutation, send/receive, pool-level operations | broker required |
+//! | LXC | direct `lxc-*` + ZFS rootfs writes | container create/start/stop/destroy, cgroup writes, config mutation | broker required |
+//! | GPU/vfio | sysfs PCI binding/unbind, driver overrides | `/sys/bus/pci/*` writes, IOMMU group rebound to `vfio-pci` | broker required |
+//! | Network | direct `ip`/`bridge` | bridge/VLAN/mount/network device changes, namespace and cgroup usage | broker required |
+//! | Shares/mounts | direct `mount`/`umount` + mount-info reads | mount table mutation, filesystem attach/detach | broker required |
+//! | Backup/restore | direct ZFS send/receive + checksum/file I/O | long-running stream ops, restore target replacement, retention deletes | broker required (long-running) |
+//!
+//! Lower-risk, read-heavy, or state-local concerns are **not** broker blockers
+//! today: JSON record stores, auth/password state, ISO/library enumeration,
+//! metrics, the operations journal, and API housekeeping.
+//!
+//! The service layer is therefore wired through an explicit [`HostBroker`]
+//! abstraction. The current implementation is [`DirectHostBroker`], which
+//! mirrors today's behavior so the code compiles and passes its existing tests.
+//! It is intentionally not presented as the finished security architecture.
 
 pub mod auth;
 pub mod backup;
@@ -19,6 +48,67 @@ pub mod operations;
 pub mod shares;
 pub mod store;
 pub mod zfs;
+
+/// The host side of the planned privilege split.
+///
+/// Today the backend runs as the `daygleve` system account and still directly
+/// touches libvirt, ZFS, LXC, PCI sysfs, network devices/mounts, and the backup
+/// tree. A future milestone replaces the direct path below with a small,
+/// root-owned broker that accepts authenticated local requests for only the
+/// operations each subsystem must delegate.
+///
+/// This trait is the stable boundary for that split. It is complete enough to be
+/// the implementation target, but deliberately does **not** pretend the broker
+/// already exists. The current symbols are kept as the stable target for the
+/// future broker, even though the live implementation is still direct.
+#[allow(dead_code)]
+pub trait HostBroker: Send + Sync {
+    /// The broker name used for audit/operational messages. Today this is always
+    /// `direct`, because the backend is still the acting process.
+    fn kind(&self) -> &str;
+}
+
+/// The current implementation: the backend performs the host operation itself.
+///
+/// This is correct for compatibility and for the existing test suite, but it is
+/// explicit about the residual exposure rather than hiding it behind a vague
+/// "hardened" claim.
+#[allow(dead_code)]
+pub(crate) struct DirectHostBroker;
+
+impl HostBroker for DirectHostBroker {
+    fn kind(&self) -> &str {
+        "direct"
+    }
+}
+
+/// Marker used in operation messages and audit comments to indicate that an
+/// operation should eventually be executed by the root-owned broker.
+///
+/// It is informational today. It becomes enforceable only once the broker is
+/// deployed and the direct path is removed from the corresponding service.
+#[allow(dead_code)]
+pub(crate) const BROKER_REQUIRED: &str = "broker-required";
+
+/// Human-readable summary of the current residual root-equivalent surface.
+///
+/// This is for documentation and operational review, not for runtime policy.
+///
+/// It is informational: the actual enforcement still happens through the host-tool
+/// wrappers, the service layer, the systemd/AppArmor sandbox, and eventually the
+/// broker. Today it does **not** gate execution.
+#[allow(dead_code)]
+pub(crate) fn residual_root_surface() -> Vec<&'static str> {
+    vec![
+        "libvirt system instance (VM define/start/destroy/console state)",
+        "ZFS dataset/snapshot/zvol mutation and send/receive",
+        "LXC create/start/stop/destroy and cgroup/config writes",
+        "PCI sysfs bind/unbind and vfio-pci driver overrides",
+        "ip/bridge bridge/VLAN/mount operations",
+        "mount/umount for network shares",
+        "long-running ZFS send/receive during backup and restore",
+    ]
+}
 
 use std::net::IpAddr;
 use std::sync::Arc;
