@@ -15,6 +15,7 @@ mod users;
 mod vms;
 
 pub mod auth;
+mod backups;
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request};
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .merge(health::routes())
         .merge(auth::routes())
+        .merge(backups::routes())
         .merge(users::routes())
         .merge(vms::routes())
         .merge(containers::routes())

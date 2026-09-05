@@ -501,6 +501,8 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 MetricsRead,
                 OperationsRead,
                 OperationsWrite,
+                BackupRead,
+                BackupWrite,
                 UserAdmin,
             ],
             Role::Operator => &[
@@ -519,6 +521,8 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 MetricsRead,
                 OperationsRead,
                 OperationsWrite,
+                BackupRead,
+                BackupWrite,
             ],
             Role::Viewer => &[
                 VmRead,
@@ -528,6 +532,7 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 GpuRead,
                 MetricsRead,
                 OperationsRead,
+                BackupRead,
             ],
         };
         for p in granted {
@@ -559,6 +564,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             iso_dir: dir.join("isos"),
             mounts_dir: dir.join("mounts"),
+            backup_dir: dir.join("backups"),
             token_ttl_secs: 3600,
             admin_password: Some(rand_password()),
             tls_cert: None,

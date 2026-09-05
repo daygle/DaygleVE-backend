@@ -8,6 +8,7 @@
 //! [`command`] for the spawn wrapper.
 
 pub mod auth;
+pub mod backup;
 pub mod command;
 pub mod gpu;
 pub mod kvm;
@@ -27,6 +28,7 @@ use crate::config::Config;
 /// Aggregate of every subsystem service, owned by [`crate::state::AppState`].
 pub struct Services {
     pub auth: auth::AuthService,
+    pub backup: Arc<backup::BackupService>,
     pub kvm: kvm::KvmService,
     pub lxc: lxc::LxcService,
     pub zfs: zfs::ZfsService,
@@ -44,6 +46,7 @@ impl Services {
         let shares = Arc::new(shares::ShareService::new(config.clone()));
         Self {
             auth: auth::AuthService::new(config.clone()),
+            backup: Arc::new(backup::BackupService::new(config.clone())),
             kvm: kvm::KvmService::new(config.clone(), shares.clone()),
             lxc: lxc::LxcService::new(config.clone()),
             zfs: zfs::ZfsService::new(config.clone()),

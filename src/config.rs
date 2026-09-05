@@ -28,6 +28,9 @@ pub struct Config {
     /// subdirectory per share id. `DAYGLEVE_MOUNTS_DIR`, default
     /// `<state_dir>/mounts`.
     pub mounts_dir: PathBuf,
+    /// Root directory for local ZFS send-stream backups. `DAYGLEVE_BACKUP_DIR`,
+    /// default `<state_dir>/backups`.
+    pub backup_dir: PathBuf,
     /// Lifetime of an issued bearer token, in seconds. `DAYGLEVE_TOKEN_TTL_SECS`,
     /// default 12 hours.
     pub token_ttl_secs: u64,
@@ -87,6 +90,12 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| state_dir.join("mounts"));
 
+        let backup_dir = std::env::var("DAYGLEVE_BACKUP_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("backups"));
+
         let token_ttl_secs = std::env::var("DAYGLEVE_TOKEN_TTL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -113,6 +122,7 @@ impl Config {
             state_dir,
             iso_dir,
             mounts_dir,
+            backup_dir,
             token_ttl_secs,
             admin_password,
             tls_cert,

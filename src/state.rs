@@ -30,6 +30,7 @@ impl AppState {
                 "startup recovered interrupted operations; inspect the operations endpoint"
             );
         }
+        services.backup.start_scheduler(services.clone());
         let startup_job = services
             .operations
             .enqueue_reconciliation(services.clone())

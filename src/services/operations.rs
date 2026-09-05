@@ -505,6 +505,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             iso_dir: dir.join("isos"),
             mounts_dir: dir.join("mounts"),
+            backup_dir: dir.join("backups"),
             token_ttl_secs: 3600,
             admin_password: Some("test-password-generated-at-runtime".into()),
             tls_cert: None,
