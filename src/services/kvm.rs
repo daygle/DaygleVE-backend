@@ -385,46 +385,43 @@ impl KvmService {
     /// about VMs that exist in one but not the other.
     ///
     /// Read-only: never modifies the host or the store.
-    pub async fn reconcile_with_host(
-        &self,
-        stored_ids: &std::collections::HashSet<String>,
-    ) -> ApiResult<(Vec<String>, Vec<String>)> {
+    pub async fn reconcile_with_host(&self) -> ApiResult<(Vec<String>, Vec<String>)> {
         let mut missing_in_host = Vec::new();
         let mut missing_in_store = Vec::new();
+        let stored: Vec<Vm> = self.store.list().await?;
 
-        // VMs that are in the store but not defined in libvirt.
-        for id in stored_ids {
-            let exists = match self.virsh_opt(&["domstate", id]).await {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
-                Err(_) => {
-                    // If libvirt can't even be queried, stop the comparison —
-                    // don't report individual VMs as missing (would be noisy).
-                    return Err(AppError::hypervisor(
-                        "libvirt is unavailable; cannot reconcile VMs",
-                    ));
-                }
-            };
-            if !exists {
-                let name = self
-                    .get_stored(id)
-                    .await
-                    .map(|vm| vm.name)
-                    .unwrap_or_default();
-                missing_in_host.push(format!("{} ({})", name, id));
+        // VMs that are in the store but not defined in libvirt. Match by the
+        // stable libvirt domain name, but return DaygleVE's UUID for repair.
+        let all_domains = self.list_all_domains().await?;
+        let host_names: std::collections::HashSet<&str> = all_domains
+            .iter()
+            .map(|domain| domain.name.as_str())
+            .collect();
+        for vm in &stored {
+            if !host_names.contains(vm.name.as_str()) {
+                missing_in_host.push(vm.id.clone());
             }
         }
 
         // Domains defined in libvirt but not tracked in the DaygleVE store.
-        // `list` returns all domains; filter out our known ids.
-        let all_domains = self.list_all_domains().await?;
-        for dom in all_domains {
-            if !stored_ids.contains(&dom.id) {
-                missing_in_store.push(dom.id);
+        let stored_names: std::collections::HashSet<&str> =
+            stored.iter().map(|vm| vm.name.as_str()).collect();
+        for domain in all_domains {
+            if !stored_names.contains(domain.name.as_str()) {
+                missing_in_store.push(domain.name);
             }
         }
 
         Ok((missing_in_host, missing_in_store))
+    }
+
+    /// Re-define a persisted VM missing from libvirt. This is non-destructive:
+    /// it never starts the VM or changes its disks.
+    pub async fn repair_missing_from_host(&self, id: &str) -> ApiResult<()> {
+        let vm = self.get_stored(id).await?;
+        self.require_stopped(&vm, "repairing its libvirt definition")
+            .await?;
+        self.define(&vm).await
     }
 
     /// All libvirt domains visible under `qemu:///system`, as summaries.
@@ -433,7 +430,11 @@ impl KvmService {
             .await
         {
             Ok(Some(o)) => o,
-            Ok(None) => return Ok(Vec::new()),
+            Ok(None) => {
+                return Err(AppError::hypervisor(
+                    "virsh is not installed; cannot reconcile VMs",
+                ))
+            }
             Err(e) => return Err(e),
         };
 

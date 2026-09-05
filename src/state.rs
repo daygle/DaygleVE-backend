@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::Config;
+use daygleve_schema::operations::{ReconcileRequest, ReconciliationMode};
+
 use crate::services::Services;
 
 /// Cheap-to-clone handle to everything a handler needs: configuration, the
@@ -33,7 +35,14 @@ impl AppState {
         services.backup.start_scheduler(services.clone());
         let startup_job = services
             .operations
-            .enqueue_reconciliation(services.clone())
+            .enqueue_reconciliation(
+                services.clone(),
+                ReconcileRequest {
+                    mode: ReconciliationMode::DryRun,
+                    approval_id: None,
+                    quarantine_unmanaged: true,
+                },
+            )
             .await?;
         tracing::info!(operation_id = %startup_job.id, "queued startup host reconciliation");
         Ok(Self {

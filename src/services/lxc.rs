@@ -268,19 +268,15 @@ impl LxcService {
     /// about containers that exist in one but not the other.
     ///
     /// Read-only: never modifies the host or the store.
-    pub async fn reconcile_with_host(
-        &self,
-        stored_ids: &std::collections::HashSet<String>,
-    ) -> ApiResult<(Vec<String>, Vec<String>)> {
+    pub async fn reconcile_with_host(&self) -> ApiResult<(Vec<String>, Vec<String>)> {
         let mut missing_in_host = Vec::new();
         let mut missing_in_store = Vec::new();
+        let stored: Vec<Lxc> = self.store.list().await?;
+        let stored_names: std::collections::HashSet<&str> =
+            stored.iter().map(|ct| ct.name.as_str()).collect();
 
         // Containers that are in the store but not in lxc.
-        for id in stored_ids {
-            let ct = match self.get_stored(id).await {
-                Ok(ct) => ct,
-                Err(_) => continue,
-            };
+        for ct in &stored {
             let exists = match command::run_optional("lxc-info", &["-n", &ct.name, "-sH"]).await {
                 Ok(Some(_)) => true,
                 Ok(None) => false,
@@ -292,14 +288,14 @@ impl LxcService {
                 }
             };
             if !exists {
-                missing_in_host.push(ct.name.clone());
+                missing_in_host.push(ct.id.clone());
             }
         }
 
         // Containers defined in lxc but not tracked in the store.
         let all_containers = self.list_all_containers().await?;
         for ct in all_containers {
-            if !stored_ids.contains(&ct.id) {
+            if !stored_names.contains(ct.name.as_str()) {
                 missing_in_store.push(ct.name);
             }
         }
@@ -307,9 +303,17 @@ impl LxcService {
         Ok((missing_in_host, missing_in_store))
     }
 
+    /// Recreate a persisted container definition when its host entry is absent.
+    /// This deliberately does not start the container or recreate its rootfs.
+    pub async fn repair_missing_from_host(&self, id: &str) -> ApiResult<()> {
+        let ct = self.get_stored(id).await?;
+        self.write_config(&ct.name, ct.vcpus, ct.memory_mib, &ct.networks)
+            .await
+    }
+
     /// All lxc containers visible on the host, as summaries.
     async fn list_all_containers(&self) -> ApiResult<Vec<LxcSummary>> {
-        let out = match command::run_optional("lxc-ls", &["-1", "--active", "--nesting"]).await {
+        let out = match command::run_optional("lxc-ls", &["-1", "--nesting"]).await {
             Ok(Some(o)) => o,
             Ok(None) => return Ok(Vec::new()),
             Err(e) => return Err(e),

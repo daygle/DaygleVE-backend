@@ -8,7 +8,11 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use daygleve_schema::operations::{OperationRecord, OperationStatus};
+use daygleve_schema::operations::{
+    OperationRecord, OperationStatus, QuarantineDecision, QuarantineStatus, ReconcileRequest,
+    ReconciliationFinding, ReconciliationFindingKind, ReconciliationMode,
+    ReconciliationQuarantineRecord,
+};
 
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
@@ -30,6 +34,7 @@ pub(crate) struct RecoverySummary {
 
 pub struct OperationService {
     store: JsonStore,
+    quarantine: JsonStore,
     _config: Arc<Config>,
 }
 
@@ -37,6 +42,7 @@ impl OperationService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             store: JsonStore::new(&config.state_dir, "operations"),
+            quarantine: JsonStore::new(&config.state_dir, "reconciliation_quarantine"),
             _config: config,
         }
     }
@@ -165,155 +171,363 @@ impl OperationService {
         Ok(record)
     }
 
-    /// Enqueue a read-only host inventory scan. Listing services overlay their
-    /// live host state onto persisted records, making this an automatic
-    /// reconciliation pass without risking an unsolicited host mutation.
-    ///
-    /// The scan also compares persisted records to live host state and reports
-    /// drift findings (VMs/containers/bridges that exist in one but not the
-    /// other). Drift is informational only — the scan never auto-corrects.
+    /// Enqueue a reconciliation pass. Dry runs only inventory and persist
+    /// structured findings. Repair runs require a successful dry-run approval
+    /// and only perform explicitly marked non-destructive repairs; unmanaged
+    /// host resources are quarantined instead of silently adopted or deleted.
     pub(crate) async fn enqueue_reconciliation(
         self: &Arc<Self>,
         services: Arc<Services>,
+        request: ReconcileRequest,
     ) -> ApiResult<OperationRecord> {
-        self.enqueue(
+        let approved_findings = if request.mode == ReconciliationMode::Repair {
+            let approval_id = request.approval_id.as_deref().ok_or_else(|| {
+                AppError::validation("repair requires approval_id from a dry run")
+            })?;
+            let approval = self.get(approval_id).await?;
+            if approval.kind != "host.reconcile"
+                || approval.status != OperationStatus::Succeeded
+                || approval.reconciliation_mode != Some(ReconciliationMode::DryRun)
+                || approval.findings.is_none()
+            {
+                return Err(AppError::conflict(
+                    "approval_id must reference a completed reconciliation dry run",
+                ));
+            }
+            approval.findings.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if request.mode == ReconciliationMode::Repair && !request.quarantine_unmanaged {
+            return Err(AppError::validation(
+                "repair requires quarantine_unmanaged=true; unmanaged resources are never auto-adopted",
+            ));
+        }
+        let mode = request.mode;
+        let record = self
+            .enqueue(
             "host.reconcile",
             Some("node"),
             None,
             move |operations, handle| async move {
+                operations.set_reconciliation_mode(&handle.id, mode).await?;
                 operations
                     .update_progress(&handle.id, 5, Some("scanning virtual machines"))
                     .await?;
                 let vms = services.kvm.list().await?.len();
-
                 operations
                     .update_progress(&handle.id, 25, Some("scanning containers"))
                     .await?;
                 let containers = services.lxc.list().await?.len();
-
                 operations
                     .update_progress(&handle.id, 45, Some("scanning storage"))
                     .await?;
                 let datasets = services.zfs.list_datasets().await?.len();
-
                 operations
                     .update_progress(&handle.id, 65, Some("scanning network"))
                     .await?;
                 let bridges = services.network.list_bridges().await?.len();
                 let shares = services.shares.list().await?.len();
-
                 operations
                     .update_progress(&handle.id, 85, Some("scanning passthrough devices"))
                     .await?;
                 let gpus = services.gpu.list().await?.len();
-
-                // Phase 2: drift detection — compare persisted records to live state.
                 operations
                     .update_progress(&handle.id, 90, Some("checking for drift"))
                     .await?;
-                let drift = Self::detect_drift(
-                    &services,
-                    &operations.store,
-                )
-                .await?;
-
+                let findings = if mode == ReconciliationMode::DryRun {
+                    Self::detect_drift(&services).await?
+                } else {
+                    approved_findings
+                };
+                operations.set_findings(&handle.id, findings.clone()).await?;
+                operations.persist_unmanaged_findings(&findings).await?;
+                if mode == ReconciliationMode::Repair {
+                    operations
+                        .update_progress(&handle.id, 94, Some("applying approved repairs"))
+                        .await?;
+                    Self::repair_findings(&services, &operations, &findings).await?;
+                }
                 let mut msg = format!(
                     "reconciled {vms} VMs, {containers} containers, {datasets} datasets, {bridges} bridges, {shares} shares, and {gpus} GPUs"
                 );
-                if !drift.is_empty() {
-                    msg.push_str(&format!(
-                        "; drift: {drift}"
-                    ));
+                if !findings.is_empty() {
+                    msg.push_str(&format!("; {} drift findings", findings.len()));
+                }
+                if mode == ReconciliationMode::Repair {
+                    msg.push_str("; approved non-destructive repairs applied and unmanaged resources quarantined");
                 }
                 Ok(Some(msg))
             },
-        )
-        .await
+            )
+            .await?;
+        self.get(&record.id).await
     }
 
-    /// Compare persisted records to live host state and return a human-readable
-    /// summary of discrepancies. Read-only: never modifies the host or store.
-    async fn detect_drift(services: &Arc<Services>, store: &JsonStore) -> ApiResult<String> {
-        let mut findings: Vec<String> = Vec::new();
+    async fn repair_findings(
+        services: &Arc<Services>,
+        operations: &OperationService,
+        findings: &[ReconciliationFinding],
+    ) -> ApiResult<()> {
+        for finding in findings {
+            if finding.kind == ReconciliationFindingKind::UnmanagedHost {
+                if let Some(host_id) = &finding.host_id {
+                    operations
+                        .quarantine(&finding.resource_type, host_id, &finding.message)
+                        .await?;
+                }
+                continue;
+            }
+            if !finding.repairable || finding.destructive {
+                continue;
+            }
+            match finding.resource_type.as_str() {
+                "vm" => {
+                    services
+                        .kvm
+                        .repair_missing_from_host(&finding.resource_id)
+                        .await?
+                }
+                "container" => {
+                    services
+                        .lxc
+                        .repair_missing_from_host(&finding.resource_id)
+                        .await?
+                }
+                "bridge" => {
+                    services
+                        .network
+                        .repair_missing_from_host(&finding.resource_id)
+                        .await?
+                }
+                "vlan" => {
+                    services
+                        .network
+                        .repair_vlan_from_host(&finding.resource_id)
+                        .await?
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Compare persisted records to live host state and return structured,
+    /// auditable discrepancies. This function never changes host or store state.
+    async fn detect_drift(services: &Arc<Services>) -> ApiResult<Vec<ReconciliationFinding>> {
+        let mut findings: Vec<ReconciliationFinding> = Vec::new();
 
         // VMs.
-        let stored_vm_ids: std::collections::HashSet<String> = store
-            .list::<daygleve_schema::vm::Vm>()
-            .await?
-            .into_iter()
-            .map(|vm| vm.id)
-            .collect();
-        let (vm_missing_host, vm_missing_store) =
-            services.kvm.reconcile_with_host(&stored_vm_ids).await?;
-        if !vm_missing_host.is_empty() {
-            findings.push(format!(
-                "{} VMs missing from libvirt: {}",
-                vm_missing_host.len(),
-                vm_missing_host.join(", ")
-            ));
+        let (vm_missing_host, vm_missing_store) = services.kvm.reconcile_with_host().await?;
+        for item in vm_missing_host {
+            findings.push(ReconciliationFinding {
+                resource_type: "vm".to_string(),
+                resource_id: item.clone(),
+                host_id: None,
+                kind: ReconciliationFindingKind::MissingFromHost,
+                message: format!("VM record is missing from libvirt: {item}"),
+                repairable: true,
+                destructive: false,
+            });
         }
-        if !vm_missing_store.is_empty() {
-            findings.push(format!(
-                "{} VMs in libvirt but not in store: {}",
-                vm_missing_store.len(),
-                vm_missing_store.join(", ")
-            ));
+        for host_id in vm_missing_store {
+            findings.push(ReconciliationFinding {
+                resource_type: "vm".to_string(),
+                resource_id: host_id.clone(),
+                host_id: Some(host_id.clone()),
+                kind: ReconciliationFindingKind::UnmanagedHost,
+                message: format!("VM {host_id} exists in libvirt but is not tracked"),
+                repairable: false,
+                destructive: false,
+            });
         }
 
         // Containers.
-        let stored_ct_ids: std::collections::HashSet<String> = store
-            .list::<daygleve_schema::lxc::Lxc>()
-            .await?
-            .into_iter()
-            .map(|ct| ct.id)
-            .collect();
-        let (ct_missing_host, ct_missing_store) =
-            services.lxc.reconcile_with_host(&stored_ct_ids).await?;
-        if !ct_missing_host.is_empty() {
-            findings.push(format!(
-                "{} containers missing from lxc: {}",
-                ct_missing_host.len(),
-                ct_missing_host.join(", ")
-            ));
+        let (ct_missing_host, ct_missing_store) = services.lxc.reconcile_with_host().await?;
+        for name in ct_missing_host {
+            findings.push(ReconciliationFinding {
+                resource_type: "container".to_string(),
+                resource_id: name.clone(),
+                host_id: None,
+                kind: ReconciliationFindingKind::MissingFromHost,
+                message: format!(
+                    "container {name} is missing from LXC; restore or import is required"
+                ),
+                repairable: false,
+                destructive: true,
+            });
         }
-        if !ct_missing_store.is_empty() {
-            findings.push(format!(
-                "{} containers in lxc but not in store: {}",
-                ct_missing_store.len(),
-                ct_missing_store.join(", ")
-            ));
+        for host_id in ct_missing_store {
+            findings.push(ReconciliationFinding {
+                resource_type: "container".to_string(),
+                resource_id: host_id.clone(),
+                host_id: Some(host_id.clone()),
+                kind: ReconciliationFindingKind::UnmanagedHost,
+                message: format!("container {host_id} exists in LXC but is not tracked"),
+                repairable: false,
+                destructive: false,
+            });
         }
 
         // Network.
-        let mut stored_net_ids: std::collections::HashSet<String> = store
-            .list::<daygleve_schema::network::Bridge>()
+        let (net_missing_host, net_missing_store) = services.network.reconcile_with_host().await?;
+        for resource_id in net_missing_host {
+            findings.push(ReconciliationFinding {
+                resource_type: if resource_id.starts_with("vlan:") {
+                    "vlan"
+                } else {
+                    "bridge"
+                }
+                .to_string(),
+                resource_id: resource_id
+                    .strip_prefix("vlan:")
+                    .unwrap_or(&resource_id)
+                    .to_string(),
+                host_id: None,
+                kind: ReconciliationFindingKind::MissingFromHost,
+                message: format!("network resource {resource_id} is missing from host"),
+                repairable: true,
+                destructive: false,
+            });
+        }
+        for host_id in net_missing_store {
+            findings.push(ReconciliationFinding {
+                resource_type: "bridge".to_string(),
+                resource_id: host_id.clone(),
+                host_id: Some(host_id.clone()),
+                kind: ReconciliationFindingKind::UnmanagedHost,
+                message: format!("network resource {host_id} exists on host but is not tracked"),
+                repairable: false,
+                destructive: false,
+            });
+        }
+
+        Ok(findings)
+    }
+
+    async fn set_reconciliation_mode(&self, id: &str, mode: ReconciliationMode) -> ApiResult<()> {
+        let mut record = self.get(id).await?;
+        record.reconciliation_mode = Some(mode);
+        self.store.put(&record.id, &record).await
+    }
+
+    pub(crate) async fn set_findings(
+        &self,
+        id: &str,
+        findings: Vec<ReconciliationFinding>,
+    ) -> ApiResult<()> {
+        let mut record = self.get(id).await?;
+        record.findings = Some(findings);
+        record.drift = record
+            .findings
+            .as_ref()
+            .filter(|items| !items.is_empty())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            });
+        self.store.put(&record.id, &record).await
+    }
+
+    pub(crate) async fn quarantine(
+        &self,
+        resource_type: &str,
+        host_id: &str,
+        message: &str,
+    ) -> ApiResult<ReconciliationQuarantineRecord> {
+        if let Some(existing) = self
+            .quarantine
+            .list::<ReconciliationQuarantineRecord>()
             .await?
             .into_iter()
-            .map(|b| b.id)
-            .collect();
-        let vlans: Vec<daygleve_schema::network::Vlan> = store.list().await?;
-        stored_net_ids.extend(vlans.into_iter().map(|v| v.id));
+            .find(|item| {
+                item.status == QuarantineStatus::Pending
+                    && item.resource_type == resource_type
+                    && item.host_id == host_id
+            })
+        {
+            return Ok(existing);
+        }
+        let record = ReconciliationQuarantineRecord {
+            id: new_id(),
+            resource_type: resource_type.to_string(),
+            host_id: host_id.to_string(),
+            message: message.to_string(),
+            status: QuarantineStatus::Pending,
+            created_at: now_ts(),
+            decided_at: None,
+            decided_by: None,
+            decision_message: None,
+        };
+        self.quarantine.put(&record.id, &record).await?;
+        Ok(record)
+    }
 
-        let (net_missing_host, net_missing_store) = services
-            .network
-            .reconcile_with_host(&stored_net_ids)
-            .await?;
-        if !net_missing_host.is_empty() {
-            findings.push(format!(
-                "{} network resources missing from host: {}",
-                net_missing_host.len(),
-                net_missing_host.join(", ")
+    async fn persist_unmanaged_findings(
+        &self,
+        findings: &[ReconciliationFinding],
+    ) -> ApiResult<()> {
+        for finding in findings {
+            if finding.kind == ReconciliationFindingKind::UnmanagedHost {
+                if let Some(host_id) = finding.host_id.as_deref() {
+                    self.quarantine(&finding.resource_type, host_id, &finding.message)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn list_quarantine(&self) -> ApiResult<Vec<ReconciliationQuarantineRecord>> {
+        let mut records: Vec<ReconciliationQuarantineRecord> = self.quarantine.list().await?;
+        records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(records)
+    }
+
+    /// Apply an explicit quarantine decision and persist the decision as an
+    /// audit record. Unmanaged resources are never adopted implicitly by repair.
+    pub(crate) async fn decide_quarantine(
+        &self,
+        services: &Arc<Services>,
+        id: &str,
+        decision: QuarantineDecision,
+        actor: &str,
+        message: Option<&str>,
+    ) -> ApiResult<ReconciliationQuarantineRecord> {
+        let mut record: ReconciliationQuarantineRecord = self
+            .quarantine
+            .get(id)
+            .await?
+            .ok_or_else(|| AppError::not_found("quarantine record not found"))?;
+        if record.status != QuarantineStatus::Pending {
+            return Err(AppError::conflict(
+                "quarantine record already has a decision",
             ));
         }
-        if !net_missing_store.is_empty() {
-            findings.push(format!(
-                "{} network resources on host but not in store: {}",
-                net_missing_store.len(),
-                net_missing_store.join(", ")
-            ));
+        match decision {
+            QuarantineDecision::Adopt => match record.resource_type.as_str() {
+                "bridge" => {
+                    services.network.adopt_bridge(&record.host_id).await?;
+                    record.status = QuarantineStatus::Adopted;
+                }
+                _ => {
+                    return Err(AppError::validation(
+                        "this resource type requires an explicit import workflow before adoption",
+                    ));
+                }
+            },
+            QuarantineDecision::Release => {
+                record.status = QuarantineStatus::Released;
+            }
         }
-
-        Ok(findings.join("; "))
+        record.decided_at = Some(now_ts());
+        record.decided_by = Some(actor.to_string());
+        record.decision_message = message.map(str::to_string);
+        self.quarantine.put(&record.id, &record).await?;
+        Ok(record)
     }
 
     /// List operation records, newest first.
@@ -394,11 +608,13 @@ impl OperationService {
             id: new_id(),
             kind: kind.to_string(),
             status,
+            reconciliation_mode: None,
             progress_pct: None,
             resource_type: resource_type.map(str::to_string),
             resource_id: resource_id.map(str::to_string),
             result_id: None,
             drift: None,
+            findings: None,
             created_at: now,
             started_at,
             finished_at: None,

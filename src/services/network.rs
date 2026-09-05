@@ -146,6 +146,38 @@ impl NetworkService {
         command::run_ok("ip", &["link", "set", "dev", &req.name, "up"]).await
     }
 
+    /// Recreate a persisted bridge that is missing from the host. This is
+    /// non-destructive and does not adopt or delete unmanaged interfaces.
+    pub async fn repair_missing_from_host(&self, name: &str) -> ApiResult<()> {
+        let bridge: Bridge = self
+            .bridges
+            .get(name)
+            .await?
+            .ok_or_else(|| AppError::not_found("bridge record not found"))?;
+        crate::services::ensure_safe_id(&bridge.name)?;
+        let add = [
+            "link",
+            "add",
+            "name",
+            bridge.name.as_str(),
+            "type",
+            "bridge",
+        ];
+        command::run_ok("ip", &add).await?;
+        let req = CreateBridgeRequest {
+            name: bridge.name.clone(),
+            ports: bridge.ports.clone(),
+            vlan_aware: bridge.vlan_aware,
+            address: bridge.address.clone(),
+            mtu: Some(bridge.mtu),
+        };
+        if let Err(error) = self.configure_bridge(&req).await {
+            let _ = command::run_optional("ip", &["link", "del", "dev", &bridge.name]).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub async fn list_vlans(&self) -> ApiResult<Vec<Vlan>> {
         self.vlans.list().await
     }
@@ -201,10 +233,7 @@ impl NetworkService {
     /// Compare persisted bridge/VLAN records to live host state, returning findings.
     ///
     /// Read-only: never modifies the host or the store.
-    pub async fn reconcile_with_host(
-        &self,
-        stored_ids: &std::collections::HashSet<String>,
-    ) -> ApiResult<(Vec<String>, Vec<String>)> {
+    pub async fn reconcile_with_host(&self) -> ApiResult<(Vec<String>, Vec<String>)> {
         let mut missing_in_host = Vec::new();
         let mut missing_in_store = Vec::new();
 
@@ -213,15 +242,20 @@ impl NetworkService {
         let live_bridges = self.list_bridges().await?;
         let live_bridge_names: std::collections::HashSet<&str> =
             live_bridges.iter().map(|b| b.name.as_str()).collect();
-        for bridge in stored_bridges {
+        for bridge in &stored_bridges {
             if !live_bridge_names.contains(bridge.name.as_str()) {
                 missing_in_host.push(bridge.name.clone());
             }
         }
 
-        // Bridges present on the host but not recorded.
+        // Bridges present on the host but not recorded. The caller quarantines
+        // these names; adoption is an explicit operator decision.
+        let stored_names: std::collections::HashSet<&str> = stored_bridges
+            .iter()
+            .map(|bridge| bridge.name.as_str())
+            .collect();
         for bridge in live_bridges {
-            if !stored_ids.contains(bridge.id.as_str()) {
+            if !stored_names.contains(bridge.name.as_str()) {
                 missing_in_store.push(bridge.name.clone());
             }
         }
@@ -231,13 +265,45 @@ impl NetworkService {
         for vlan in stored_vlans {
             if let Ok(Some(result)) = self.vlan_exists_on_host(&vlan).await {
                 if !result {
-                    missing_in_host.push(format!("vlan {}", vlan.tag));
+                    missing_in_host.push(format!("vlan:{}", vlan.id));
                 }
             }
             // Don't fail the whole reconciliation for a single VLAN check failure.
         }
 
         Ok((missing_in_host, missing_in_store))
+    }
+
+    /// Adopt a live bridge into the DaygleVE inventory after explicit review.
+    /// Existing host ports and addresses are recorded as observed state; no
+    /// host mutation is performed.
+    pub async fn adopt_bridge(&self, name: &str) -> ApiResult<Bridge> {
+        crate::services::ensure_safe_id(name)?;
+        let bridge = self
+            .list_bridges()
+            .await?
+            .into_iter()
+            .find(|bridge| bridge.name == name)
+            .ok_or_else(|| AppError::not_found("bridge no longer exists on the host"))?;
+        self.bridges.put(&bridge.id, &bridge).await?;
+        Ok(bridge)
+    }
+
+    /// Recreate a persisted VLAN registration on the host. This is the only
+    /// supported automatic VLAN repair and is non-destructive.
+    pub async fn repair_vlan_from_host(&self, id: &str) -> ApiResult<()> {
+        let vlan: Vlan = self
+            .vlans
+            .get(id)
+            .await?
+            .ok_or_else(|| AppError::not_found("VLAN record not found"))?;
+        crate::services::ensure_safe_id(&vlan.bridge)?;
+        let tag = vlan.tag.to_string();
+        command::run_ok(
+            "bridge",
+            &["vlan", "add", "vid", &tag, "dev", &vlan.bridge, "self"],
+        )
+        .await
     }
 
     /// Check whether a VLAN exists on the host via `bridge vlan show`.
