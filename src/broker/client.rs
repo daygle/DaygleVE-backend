@@ -54,6 +54,7 @@ impl std::fmt::Display for BrokerError {
 impl std::error::Error for BrokerError {}
 
 /// Outcome of a broker exec that captured stdout.
+#[derive(Debug)]
 pub struct ExecOutput {
     /// Captured stdout of the child process.
     pub stdout: String,
@@ -414,7 +415,7 @@ mod tests {
             .exec_streamed(
                 "zfs",
                 &["send", "pool/ds@snap"],
-                Option::<std::io::Empty>::None,
+                Option::<tokio::io::Empty>::None,
                 &mut sink,
             )
             .await
@@ -432,7 +433,14 @@ mod tests {
     where
         F: Fn() -> Response + Send + 'static,
     {
-        let dir = std::env::temp_dir().join(format!("daygleve-broker-stub-{}", std::process::id()));
+        // Cargo runs tests in parallel threads within one process, so a per-PID
+        // socket path would be shared by every spawn_stub caller and race. Give
+        // each call a unique path via a monotonic counter.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = STUB_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("daygleve-broker-stub-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let socket_path = dir.join("stub.sock");
         let _ = std::fs::remove_file(&socket_path);
