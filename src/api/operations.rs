@@ -5,13 +5,15 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
-use daygleve_schema::operations::{
-    OperationRecord, QuarantineDecisionRequest, ReconcileRequest, ReconciliationQuarantineRecord,
-};
+use daygleve_schema::operations::{ReconcileRequest, QuarantineDecisionRequest};
+use daygleve_schema::broker::BrokerSplitInventory;
+
+use crate::services::operations::OperationsService;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
 use crate::state::AppState;
+use crate::services::now_ts;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -20,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/operations/quarantine", get(list_quarantine))
         .route("/operations/quarantine/{id}", patch(decide_quarantine))
         .route("/operations/{id}", get(get_one))
+        .route("/system/broker-split", get(broker_split))
 }
 
 async fn list(
@@ -85,4 +88,16 @@ async fn decide_quarantine(
         )
         .await?;
     Ok(Json(record))
+}
+
+async fn broker_split(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<BrokerSplitInventory>> {
+    user.require(Permission::SecurityRead)?;
+    let inventory = BrokerSplitInventory::current(now_ts());
+    if state.config.broker_socket.is_some() {
+        inventory.broker_split_incomplete = false;
+    }
+    Ok(Json(inventory))
 }
