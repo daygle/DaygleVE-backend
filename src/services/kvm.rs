@@ -1059,7 +1059,7 @@ fn map_vm_state(s: &str) -> VmState {
 /// as an `i64` (rows whose columns don't parse are skipped), so the current-time
 /// fallback covers just the theoretical case of a `secs` outside the range
 /// `DateTime` can represent.
-fn ts_from_unix(secs: i64) -> daygleve_schema::common::Timestamp {
+pub(crate) fn ts_from_unix(secs: i64) -> daygleve_schema::common::Timestamp {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(now_ts)
@@ -1121,7 +1121,7 @@ pub(crate) fn is_missing_dataset(e: &AppError) -> bool {
 
 /// True when a `zfs snapshot` error indicates the snapshot already exists, so a
 /// racing create can be reported as a 409 instead of a 502.
-fn is_already_exists(e: &AppError) -> bool {
+pub(crate) fn is_already_exists(e: &AppError) -> bool {
     e.message().to_ascii_lowercase().contains("already exists")
 }
 
