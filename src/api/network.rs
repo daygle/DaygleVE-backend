@@ -34,11 +34,13 @@ async fn create_bridge(
     user.require(Permission::NetworkWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "network.create_bridge",
             Some("bridge"),
             None,
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("creating bridge"))
                     .await?;
@@ -64,11 +66,13 @@ async fn create_vlan(
     user.require(Permission::NetworkWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "network.create_vlan",
             Some("vlan"),
             None,
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("creating VLAN"))
                     .await?;

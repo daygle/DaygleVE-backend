@@ -42,6 +42,7 @@ impl AppState {
                     approval_id: None,
                     quarantine_unmanaged: true,
                 },
+                None,
             )
             .await?;
         tracing::info!(operation_id = %startup_job.id, "queued startup host reconciliation");

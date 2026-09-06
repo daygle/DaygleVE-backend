@@ -33,11 +33,13 @@ async fn bind(
     let services = state.services.clone();
     let operations = services.operations.clone();
     let resource_id = pci_address.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "gpu.bind",
             Some("gpu"),
             Some(&resource_id),
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("binding to vfio-pci"))
                     .await?;

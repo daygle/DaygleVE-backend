@@ -155,9 +155,10 @@ impl BackupService {
         plan_id: &str,
         operations: Arc<OperationService>,
         services: Arc<Services>,
+        actor: Option<&str>,
     ) -> ApiResult<daygleve_schema::operations::OperationRecord> {
         let plan = self.get_plan(plan_id).await?;
-        self.enqueue_backup_for_plan(plan, operations, services)
+        self.enqueue_backup_for_plan(plan, operations, services, actor)
             .await
     }
 
@@ -166,6 +167,7 @@ impl BackupService {
         plan: BackupPlan,
         operations: Arc<OperationService>,
         services: Arc<Services>,
+        actor: Option<&str>,
     ) -> ApiResult<daygleve_schema::operations::OperationRecord> {
         {
             let mut running = self.running.lock().await;
@@ -177,6 +179,7 @@ impl BackupService {
         }
         let plan_id = plan.id.clone();
         let resource_id = plan_id.clone();
+        let actor = actor.map(str::to_string);
         let worker = Arc::clone(self);
         let plan_for_worker = plan.clone();
         let cleanup_id = plan_id.clone();
@@ -185,6 +188,7 @@ impl BackupService {
                 "backup.run",
                 Some("backup_plan"),
                 Some(&resource_id),
+                actor.as_deref(),
                 move |ops, handle| async move {
                     let result = worker
                         .run_backup(&plan_for_worker, &services, &ops, &handle.id)
@@ -212,6 +216,7 @@ impl BackupService {
         artifact_id: &str,
         req: RestoreBackupRequest,
         operations: Arc<OperationService>,
+        actor: Option<&str>,
     ) -> ApiResult<daygleve_schema::operations::OperationRecord> {
         let artifact = self.get_artifact(artifact_id).await?;
         if !artifact.verified {
@@ -244,6 +249,7 @@ impl BackupService {
                 "backup.restore",
                 Some("dataset"),
                 Some(&operation_target),
+                actor,
                 move |ops, handle| async move {
                     ops.update_progress(&handle.id, 10, Some("verifying backup file"))
                         .await?;
@@ -287,6 +293,7 @@ impl BackupService {
                                 plan,
                                 services.operations.clone(),
                                 services.clone(),
+                                None,
                             )
                             .await
                         {

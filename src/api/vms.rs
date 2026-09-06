@@ -69,11 +69,13 @@ async fn create(
     user.require(Permission::VmWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "vm.create",
             Some("vm"),
             None,
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("provisioning disk"))
                     .await?;
@@ -106,11 +108,13 @@ async fn update(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let vm = operations
         .run(
             "vm.update",
             Some("vm"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.kvm.update(&id, req).await },
         )
         .await?;
@@ -127,11 +131,13 @@ async fn delete(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     operations
         .run(
             "vm.delete",
             Some("vm"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.kvm.delete(&id).await },
         )
         .await?;
@@ -149,11 +155,13 @@ async fn power(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let vm = operations
         .run(
             "vm.power",
             Some("vm"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.kvm.power(&id, req.action).await },
         )
         .await?;
@@ -170,11 +178,13 @@ async fn clone_vm(
     let services = state.services.clone();
     let operations = services.operations.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "vm.clone",
             Some("vm"),
             Some(&resource_id),
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("cloning disks"))
                     .await?;
@@ -207,11 +217,13 @@ async fn create_snapshot(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let snap = operations
         .run(
             "vm.create_snapshot",
             Some("vm"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.kvm.create_snapshot(&id, req).await },
         )
         .await?;
@@ -228,11 +240,13 @@ async fn rollback_snapshot(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     operations
         .run(
             "vm.rollback_snapshot",
             Some("vm"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.kvm.rollback_snapshot(&id, &name).await },
         )
         .await?;
@@ -249,11 +263,13 @@ async fn delete_snapshot(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     operations
         .run(
             "vm.delete_snapshot",
             Some("vm"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.kvm.delete_snapshot(&id, &name).await },
         )
         .await?;

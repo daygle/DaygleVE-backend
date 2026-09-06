@@ -48,11 +48,13 @@ async fn create(
     user.require(Permission::LxcWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "container.create",
             Some("container"),
             None,
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("downloading template"))
                     .await?;
@@ -85,11 +87,13 @@ async fn update(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let ct = operations
         .run(
             "container.update",
             Some("container"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.lxc.update(&id, req).await },
         )
         .await?;
@@ -106,11 +110,13 @@ async fn delete(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     operations
         .run(
             "container.delete",
             Some("container"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.lxc.delete(&id).await },
         )
         .await?;
@@ -168,11 +174,13 @@ async fn power(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let ct = operations
         .run(
             "container.power",
             Some("container"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.lxc.power(&id, req.action).await },
         )
         .await?;

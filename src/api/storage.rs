@@ -49,11 +49,13 @@ async fn create_dataset(
     user.require(Permission::StorageWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "storage.create_dataset",
             Some("dataset"),
             None,
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("creating dataset"))
                     .await?;
@@ -85,11 +87,13 @@ async fn create_snapshot(
     let services = state.services.clone();
     let operations = services.operations.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "storage.create_snapshot",
             Some("snapshot"),
             Some(&resource_id),
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("snapshotting"))
                     .await?;
@@ -112,11 +116,13 @@ async fn clone_snapshot(
     let services = state.services.clone();
     let operations = services.operations.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "storage.clone_snapshot",
             Some("dataset"),
             Some(&resource_id),
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("cloning snapshot"))
                     .await?;
@@ -147,11 +153,13 @@ async fn create_share(
     user.require(Permission::StorageWrite)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
+    let actor = user.0.user.id.clone();
     let record = operations
         .enqueue(
             "storage.create_share",
             Some("share"),
             None,
+            Some(&actor),
             move |ops, handle| async move {
                 ops.update_progress(&handle.id, 10, Some("mounting share"))
                     .await?;
@@ -174,11 +182,13 @@ async fn delete_share(
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
     operations
         .run(
             "storage.delete_share",
             Some("share"),
             Some(&resource_id),
+            Some(&actor),
             move || async move { operation_services.shares.delete(&id).await },
         )
         .await?;

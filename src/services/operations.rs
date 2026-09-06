@@ -72,18 +72,20 @@ impl OperationService {
     }
 
     /// Run a synchronous operation with a durable journal record around it.
+    /// `actor` is the authenticated caller's user id, when triggered by a user.
     pub(crate) async fn run<T, F, Fut>(
         &self,
         kind: &str,
         resource_type: Option<&str>,
         resource_id: Option<&str>,
+        actor: Option<&str>,
         operation: F,
     ) -> ApiResult<T>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = ApiResult<T>>,
     {
-        let handle = self.begin(kind, resource_type, resource_id).await?;
+        let handle = self.begin(kind, resource_type, resource_id, actor).await?;
         match operation().await {
             Ok(value) => {
                 if let Err(error) = self
@@ -119,13 +121,14 @@ impl OperationService {
         kind: &str,
         resource_type: Option<&str>,
         resource_id: Option<&str>,
+        actor: Option<&str>,
         operation: F,
     ) -> ApiResult<OperationRecord>
     where
         F: FnOnce(Arc<Self>, OperationHandle) -> Fut + Send + 'static,
         Fut: Future<Output = ApiResult<Option<String>>> + Send + 'static,
     {
-        let (handle, record) = self.queue(kind, resource_type, resource_id).await?;
+        let (handle, record) = self.queue(kind, resource_type, resource_id, actor).await?;
         let worker = Arc::clone(self);
         let record_resource_type = resource_type.map(str::to_string);
         let record_resource_id = resource_id.map(str::to_string);
@@ -179,6 +182,7 @@ impl OperationService {
         self: &Arc<Self>,
         services: Arc<Services>,
         request: ReconcileRequest,
+        actor: Option<&str>,
     ) -> ApiResult<OperationRecord> {
         let approved_findings = if request.mode == ReconciliationMode::Repair {
             let approval_id = request.approval_id.as_deref().ok_or_else(|| {
@@ -209,6 +213,7 @@ impl OperationService {
             "host.reconcile",
             Some("node"),
             None,
+            actor,
             move |operations, handle| async move {
                 operations.set_reconciliation_mode(&handle.id, mode).await?;
                 operations
@@ -575,9 +580,16 @@ impl OperationService {
         kind: &str,
         resource_type: Option<&str>,
         resource_id: Option<&str>,
+        actor: Option<&str>,
     ) -> ApiResult<OperationHandle> {
         let (handle, _) = self
-            .create_record(kind, OperationStatus::Running, resource_type, resource_id)
+            .create_record(
+                kind,
+                OperationStatus::Running,
+                resource_type,
+                resource_id,
+                actor,
+            )
             .await?;
         Ok(handle)
     }
@@ -587,9 +599,16 @@ impl OperationService {
         kind: &str,
         resource_type: Option<&str>,
         resource_id: Option<&str>,
+        actor: Option<&str>,
     ) -> ApiResult<(OperationHandle, OperationRecord)> {
-        self.create_record(kind, OperationStatus::Queued, resource_type, resource_id)
-            .await
+        self.create_record(
+            kind,
+            OperationStatus::Queued,
+            resource_type,
+            resource_id,
+            actor,
+        )
+        .await
     }
 
     async fn create_record(
@@ -598,6 +617,7 @@ impl OperationService {
         status: OperationStatus,
         resource_type: Option<&str>,
         resource_id: Option<&str>,
+        actor: Option<&str>,
     ) -> ApiResult<(OperationHandle, OperationRecord)> {
         if kind.trim().is_empty() {
             return Err(AppError::validation("operation kind must not be empty"));
@@ -608,6 +628,7 @@ impl OperationService {
             id: new_id(),
             kind: kind.to_string(),
             status,
+            actor: actor.map(str::to_string),
             reconciliation_mode: None,
             progress_pct: None,
             resource_type: resource_type.map(str::to_string),
@@ -734,7 +755,10 @@ mod tests {
     async fn interrupted_operations_are_marked_for_review() {
         let dir = std::env::temp_dir().join(format!("daygleve-operations-test-{}", new_id()));
         let service = OperationService::new(test_config(&dir));
-        let handle = service.begin("vm.create", Some("vm"), None).await.unwrap();
+        let handle = service
+            .begin("vm.create", Some("vm"), None, None)
+            .await
+            .unwrap();
 
         let summary = service.recover_interrupted().await.unwrap();
         assert_eq!(summary.interrupted, 1);
@@ -753,7 +777,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("daygleve-operations-test-{}", new_id()));
         let service = OperationService::new(test_config(&dir));
         let handle = service
-            .begin("network.create_bridge", Some("bridge"), None)
+            .begin("network.create_bridge", Some("bridge"), None, None)
             .await
             .unwrap();
         service
@@ -779,6 +803,7 @@ mod tests {
                 "test.job",
                 Some("node"),
                 None,
+                Some("user-123"),
                 |operations, handle| async move {
                     operations
                         .update_progress(&handle.id, 50, Some("halfway"))

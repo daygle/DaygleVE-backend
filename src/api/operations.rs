@@ -53,7 +53,7 @@ async fn reconcile(
     let record = state
         .services
         .operations
-        .enqueue_reconciliation(state.services.clone(), request)
+        .enqueue_reconciliation(state.services.clone(), request, Some(&user.0.user.id))
         .await?;
     Ok((StatusCode::ACCEPTED, Json(record)))
 }

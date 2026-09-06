@@ -90,6 +90,7 @@ async fn run_plan(
             &id,
             state.services.operations.clone(),
             state.services.clone(),
+            Some(&user.0.user.id),
         )
         .await?;
     Ok((StatusCode::ACCEPTED, Json(operation)))
@@ -125,7 +126,12 @@ async fn restore(
     let operation = state
         .services
         .backup
-        .enqueue_restore(&id, req, state.services.operations.clone())
+        .enqueue_restore(
+            &id,
+            req,
+            state.services.operations.clone(),
+            Some(&user.0.user.id),
+        )
         .await?;
     Ok((StatusCode::ACCEPTED, Json(operation)))
 }
