@@ -351,7 +351,11 @@ impl BackupService {
                 operations
                     .update_progress(
                         operation_id,
-                        ((index as u8) * 70 / datasets.len() as u8).max(5),
+                        // Compute in usize before the u8 cast: `index * 70`
+                        // overflows a u8 at four or more datasets (4*70=280).
+                        // datasets is non-empty (checked above), so the divide
+                        // is safe and the result is in 0..=70.
+                        ((index * 70 / datasets.len()) as u8).max(5),
                         Some("creating backup snapshot"),
                     )
                     .await?;

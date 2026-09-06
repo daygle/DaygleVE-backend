@@ -137,13 +137,25 @@ impl AuthService {
         // Snapshot the id + hash under a read lock, then run the CPU-heavy
         // argon2 verification with no lock held, so concurrent logins aren't
         // serialized behind each other's hashing.
-        let (user_id, hash) = {
+        let found = {
             let users = self.users.read().expect("user lock");
-            let stored = users
+            users
                 .values()
                 .find(|u| u.user.username == req.username)
-                .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
-            (stored.user.id.clone(), stored.password_hash.clone())
+                .map(|stored| (stored.user.id.clone(), stored.password_hash.clone()))
+        };
+
+        let (user_id, hash) = match found {
+            Some(pair) => pair,
+            None => {
+                // Verify against a dummy hash so an unknown username costs the
+                // same argon2 time as a real account with a wrong password.
+                // Without this, the fast "no such user" path is measurably
+                // quicker than the hashing path, leaking whether an account
+                // exists (username enumeration).
+                let _ = verify_password(&req.password, dummy_password_hash());
+                return Err(AppError::unauthorized("invalid credentials"));
+            }
         };
 
         verify_password(&req.password, &hash)?;
@@ -427,6 +439,16 @@ fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error>
         .to_string())
 }
 
+/// A process-wide dummy argon2 hash, used to spend the same verification time
+/// on a login for a non-existent user as a real account would. It carries the
+/// same `Argon2::default()` parameters as every stored hash (it is produced by
+/// the same hasher), so the timing matches. Computed once, of a random
+/// throwaway secret that no login can ever match.
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hash_password(&mint_token()).expect("hash dummy password"))
+}
+
 /// Verify a plaintext password against a stored PHC hash.
 fn verify_password(password: &str, hash: &str) -> ApiResult<()> {
     let parsed = PasswordHash::new(hash)
@@ -620,6 +642,59 @@ mod tests {
         assert_eq!(svc2.list_users().len(), 1);
         let admin_id = svc2.list_users()[0].id.clone();
         assert!(svc2.delete_user(&admin_id).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_unknown_user_and_wrong_password() {
+        let dir = std::env::temp_dir().join(format!("daygleve-login-test-{}", new_id()));
+        let password = rand_password();
+        let config = Arc::new(Config {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            cors_origins: vec![],
+            default_pool: "tank".into(),
+            web_root: None,
+            state_dir: dir.clone(),
+            iso_dir: dir.join("isos"),
+            mounts_dir: dir.join("mounts"),
+            backup_dir: dir.join("backups"),
+            token_ttl_secs: 3600,
+            admin_password: Some(password.clone()),
+            tls_cert: None,
+            tls_key: None,
+            broker_socket: None,
+        });
+        let svc = AuthService::new(config);
+        svc.load_or_seed().await.unwrap();
+
+        // An unknown username is rejected — and still runs through the dummy-hash
+        // verification so it can't be told apart from a wrong password by timing.
+        assert!(svc
+            .login(LoginRequest {
+                username: "ghost".into(),
+                password: password.clone(),
+            })
+            .is_err());
+        // A known username with the wrong password is rejected.
+        assert!(svc
+            .login(LoginRequest {
+                username: "admin".into(),
+                password: rand_password(),
+            })
+            .is_err());
+        // Correct credentials succeed.
+        let ok = svc
+            .login(LoginRequest {
+                username: "admin".into(),
+                password,
+            })
+            .unwrap();
+        assert_eq!(ok.user.username, "admin");
+
+        // The dummy hash must parse as a valid PHC string, or the enumeration
+        // hardening would error out early instead of spending argon2 time.
+        assert!(PasswordHash::new(dummy_password_hash()).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
