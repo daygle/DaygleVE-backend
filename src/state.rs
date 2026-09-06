@@ -3,9 +3,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::Config;
 use daygleve_schema::operations::{ReconcileRequest, ReconciliationMode};
+use tokio::sync::Mutex;
 
+use crate::config::Config;
+use crate::services::login_throttle::LoginThrottle;
 use crate::services::Services;
 
 /// Cheap-to-clone handle to everything a handler needs: configuration, the
@@ -15,6 +17,10 @@ pub struct AppState {
     /// Shared configuration; read by the API layer (CORS) and handlers.
     pub config: Arc<Config>,
     pub services: Arc<Services>,
+    /// Brute-force resistance for the login endpoint: per-IP and per-account
+    /// exponential backoff. Lock-guarded because penalties mutate on every
+    /// failed login.
+    pub login_throttle: Arc<Mutex<LoginThrottle>>,
     pub started_at: Instant,
 }
 
@@ -49,6 +55,7 @@ impl AppState {
         Ok(Self {
             config,
             services,
+            login_throttle: Arc::new(Mutex::new(LoginThrottle::new())),
             started_at: Instant::now(),
         })
     }

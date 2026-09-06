@@ -57,6 +57,11 @@ impl AppError {
     pub fn hypervisor(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::HypervisorError, message)
     }
+    /// 429: the caller is rate limited and must retry later (e.g. repeated
+    /// failed logins under the login throttle).
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::RateLimited, message)
+    }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
     }
@@ -74,6 +79,7 @@ impl AppError {
             ErrorCode::NotFound => StatusCode::NOT_FOUND,
             ErrorCode::Conflict => StatusCode::CONFLICT,
             ErrorCode::HypervisorError => StatusCode::BAD_GATEWAY,
+            ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

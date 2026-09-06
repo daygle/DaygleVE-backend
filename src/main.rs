@@ -62,7 +62,7 @@ async fn main() -> anyhow_lite::Result<()> {
             .map_err(|e| anyhow_lite::err(format!("load TLS cert/key: {e}")))?;
         tracing::info!(%addr, "DaygleVE backend listening (HTTPS)");
         axum_server::bind_rustls(addr, tls)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|e| anyhow_lite::err(format!("serve https: {e}")))?;
     } else {
@@ -70,9 +70,12 @@ async fn main() -> anyhow_lite::Result<()> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| anyhow_lite::err(format!("bind {addr}: {e}")))?;
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| anyhow_lite::err(format!("serve: {e}")))?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| anyhow_lite::err(format!("serve: {e}")))?;
     }
 
     Ok(())

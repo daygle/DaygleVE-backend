@@ -47,6 +47,7 @@ pub mod backup;
 pub mod command;
 pub mod gpu;
 pub mod kvm;
+pub mod login_throttle;
 pub mod lxc;
 pub mod metrics;
 pub mod network;
