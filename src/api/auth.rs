@@ -105,7 +105,7 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     // IPv6-mapped IPv4 and loopback prefixes are folded to their IPv4 form so
     // per-IP buckets line up across dual-stack sockets.
     match ip {
-        IpAddr::V6(v6) if let Some(v4) = v6.to_ipv4_mapped() => IpAddr::V4(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         other => other,
     }
 }

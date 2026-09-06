@@ -213,7 +213,7 @@ fn command_for(executable: &str) -> Command {
 }
 
 async fn spawn_child(command: &mut Command) -> Result<tokio::process::Child, ServeError> {
-    command.spawn().await.map_err(|e| {
+    command.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ServeError::SpawnNotFound(e.to_string())
         } else {
@@ -261,7 +261,7 @@ async fn unary_exec(
 }
 
 async fn stream_exec(
-    mut reader: tokio::net::unix::OwnedReadHalf,
+    reader: tokio::net::unix::OwnedReadHalf,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     program: &str,
     args: &[String],
@@ -314,14 +314,14 @@ async fn stream_exec(
 
     let deadline = tokio::time::Instant::now() + timeout;
     let mut chunk = vec![0u8; CHUNK_PAYLOAD_MAX];
-    let result = loop {
+    loop {
         match tokio::time::timeout_at(deadline, stdout.read(&mut chunk)).await {
             Err(_) => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 let stderr = stderr_task.await.unwrap_or_default();
                 send_exit(&mut writer, -1, stderr, true).await?;
-                break ();
+                break;
             }
             Ok(Err(error)) => {
                 let _ = child.start_kill();
@@ -334,7 +334,7 @@ async fn stream_exec(
                     false,
                 )
                 .await?;
-                break ();
+                break;
             }
             Ok(Ok(0)) => {
                 let status = child
@@ -343,7 +343,7 @@ async fn stream_exec(
                     .map_err(|e| ServeError::Exec(format!("wait for child: {e}")))?;
                 let stderr = stderr_task.await.unwrap_or_default();
                 send_exit(&mut writer, status.code().unwrap_or(-1), stderr, false).await?;
-                break ();
+                break;
             }
             Ok(Ok(size)) => {
                 let frame = StreamFrame::Stdout {
@@ -354,12 +354,12 @@ async fn stream_exec(
                     .map_err(|e| ServeError::Exec(e.0))?;
             }
         }
-    };
+    }
 
     if let Some(task) = stdin_pump {
         let _ = task.await;
     }
-    Ok(result)
+    Ok(())
 }
 
 async fn send_exit(

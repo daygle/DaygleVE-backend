@@ -684,7 +684,7 @@ fn validate_exec_args(program: &str, args: &[String]) -> Result<(), String> {
         "zpool" => validate_zpool_args(args)?,
         name if name.starts_with("lxc-") => {
             if let Some(container) = arg_after(args, "-n") {
-                if !validate_lxc_name(container).is_ok() {
+                if validate_lxc_name(container).is_err() {
                     return Err("LXC target name is unsafe".to_string());
                 }
             }
