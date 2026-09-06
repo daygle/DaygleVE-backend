@@ -141,7 +141,10 @@ impl AuthService {
             let users = self.users.read().expect("user lock");
             users
                 .values()
-                .find(|u| u.user.username == req.username)
+                // Usernames are unique case-insensitively (see create_user) and
+                // stored trimmed, so match the same way here — otherwise an
+                // account created as "Admin" could never log in as "admin".
+                .find(|u| u.user.username.eq_ignore_ascii_case(req.username.trim()))
                 .map(|stored| (stored.user.id.clone(), stored.password_hash.clone()))
         };
 
@@ -683,10 +686,12 @@ mod tests {
                 password: rand_password(),
             })
             .is_err());
-        // Correct credentials succeed.
+        // Correct credentials succeed — and the username match is
+        // case-insensitive and trim-tolerant, consistent with how usernames are
+        // stored and uniqueness is enforced.
         let ok = svc
             .login(LoginRequest {
-                username: "admin".into(),
+                username: "  ADMIN ".into(),
                 password,
             })
             .unwrap();

@@ -7,15 +7,28 @@
 //!
 //! [`node`]: MetricsService::node
 
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use daygleve_schema::metrics::NodeMetrics;
 use tokio::fs;
 
-use crate::services::now_ts;
+use crate::services::{new_id, now_ts};
 
 /// Delta window for rate calculations.
 const SAMPLE_WINDOW: Duration = Duration::from_millis(200);
+
+/// How long a minted SSE stream ticket stays valid. Short: the browser mints a
+/// fresh one for every (re)connection.
+const STREAM_TICKET_TTL: Duration = Duration::from_secs(30);
+
+/// A pending SSE stream ticket, minted for an already-authenticated caller so
+/// the long-lived bearer token never has to travel in the stream URL.
+struct StreamTicket {
+    user_id: String,
+    expires_at: Instant,
+}
 
 pub struct MetricsService {
     /// The last sample and when it was taken, shared so concurrent SSE streams
@@ -23,12 +36,56 @@ pub struct MetricsService {
     /// async mutex is held across the refresh so only one sampler runs at a
     /// time (no thundering herd of concurrent samples).
     cache: tokio::sync::Mutex<Option<(Instant, NodeMetrics)>>,
+    /// Live stream tickets, keyed by the opaque ticket value.
+    stream_tickets: RwLock<HashMap<String, StreamTicket>>,
 }
 
 impl MetricsService {
     pub fn new() -> Self {
         Self {
             cache: tokio::sync::Mutex::new(None),
+            stream_tickets: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Mint a short-lived, one-time ticket authorizing an SSE metrics stream for
+    /// `user_id`. The caller must already hold `MetricsRead`; the ticket lets the
+    /// browser open `EventSource` without putting its bearer token in the URL.
+    /// Returns the ticket and its RFC-3339 expiry.
+    pub fn mint_stream_ticket(&self, user_id: &str) -> (String, String) {
+        let ticket = new_id();
+        let now = Instant::now();
+        {
+            let mut tickets = self.stream_tickets.write().expect("stream ticket lock");
+            // Opportunistically drop expired tickets so the map can't grow
+            // unbounded from tickets that were minted but never redeemed.
+            tickets.retain(|_, t| t.expires_at > now);
+            tickets.insert(
+                ticket.clone(),
+                StreamTicket {
+                    user_id: user_id.to_string(),
+                    expires_at: now + STREAM_TICKET_TTL,
+                },
+            );
+        }
+        let expires_at = (chrono::Utc::now()
+            + chrono::Duration::from_std(STREAM_TICKET_TTL).unwrap())
+        .to_rfc3339();
+        (ticket, expires_at)
+    }
+
+    /// Validate and consume a stream ticket, returning the user id it was minted
+    /// for. One-time: the ticket is removed on success, so the browser mints a
+    /// fresh one for every reconnection.
+    pub fn redeem_stream_ticket(&self, ticket: &str) -> Option<String> {
+        let mut tickets = self.stream_tickets.write().expect("stream ticket lock");
+        match tickets.get(ticket) {
+            Some(t) if t.expires_at > Instant::now() => {
+                let user_id = t.user_id.clone();
+                tickets.remove(ticket);
+                Some(user_id)
+            }
+            _ => None,
         }
     }
 
