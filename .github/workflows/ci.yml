@@ -1,0 +1,40 @@
+name: CI
+
+# Gate every push to main (and every PR) on the full local check suite so a
+# commit that breaks the build, fails formatting, or trips clippy is caught
+# before it can land on main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache the registry and build artifacts keyed on the lockfile so the
+      # schema git dependency and crate set are part of the cache key.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # The backend pulls daygleve-schema from git; a fresh cache-less build
+      # resolves it exactly as a local build would.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
