@@ -1,14 +1,15 @@
-//! User-management and self-service password endpoints.
+//! User-management endpoints (admin account CRUD).
 //!
-//! Account CRUD requires the `UserAdmin` permission; changing one's *own*
-//! password only requires being authenticated.
+//! Account CRUD requires the `UserAdmin` permission. Changing one's *own*
+//! password only requires being authenticated and lives with the other
+//! `/auth/*` routes in [`crate::api::auth`].
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
-use daygleve_schema::auth::{ChangePasswordRequest, CreateUserRequest, UpdateUserRequest, User};
+use daygleve_schema::auth::{CreateUserRequest, UpdateUserRequest, User};
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
@@ -18,7 +19,6 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/users", get(list).post(create))
         .route("/users/{id}", patch(update).delete(delete))
-        .route("/auth/change-password", post(change_password))
 }
 
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<User>>> {
@@ -53,19 +53,5 @@ async fn delete(
 ) -> ApiResult<StatusCode> {
     user.require(Permission::UserAdmin)?;
     state.services.auth.delete_user(&id).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Change the authenticated caller's own password.
-async fn change_password(
-    user: AuthUser,
-    State(state): State<AppState>,
-    Json(req): Json<ChangePasswordRequest>,
-) -> ApiResult<StatusCode> {
-    state
-        .services
-        .auth
-        .change_password(&user.0.user.id, &user.1, req)
-        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
