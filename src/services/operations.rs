@@ -35,7 +35,18 @@ pub(crate) struct RecoverySummary {
 pub struct OperationService {
     store: JsonStore,
     quarantine: JsonStore,
+    /// Dry-run approval ids already spent on a repair, so an approval cannot be
+    /// replayed to drive repeated repairs. Persisted so the guard survives a
+    /// restart.
+    consumed_approvals: JsonStore,
     _config: Arc<Config>,
+}
+
+/// A persisted marker that a reconciliation dry-run approval has been used.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConsumedApproval {
+    id: String,
+    consumed_at: String,
 }
 
 impl OperationService {
@@ -43,6 +54,10 @@ impl OperationService {
         Self {
             store: JsonStore::new(&config.state_dir, "operations"),
             quarantine: JsonStore::new(&config.state_dir, "reconciliation_quarantine"),
+            consumed_approvals: JsonStore::new(
+                &config.state_dir,
+                "reconciliation_consumed_approvals",
+            ),
             _config: config,
         }
     }
@@ -198,6 +213,11 @@ impl OperationService {
                     "approval_id must reference a completed reconciliation dry run",
                 ));
             }
+            // A dry-run approval is single-use: mark it consumed before the
+            // repair is enqueued so it cannot be replayed to drive repeated
+            // repairs. Consuming up front (rather than on success) keeps the
+            // approval one-shot regardless of how the repair itself ends.
+            self.consume_approval(approval_id).await?;
             approval.findings.unwrap_or_default()
         } else {
             Vec::new()
@@ -408,6 +428,30 @@ impl OperationService {
         }
 
         Ok(findings)
+    }
+
+    /// Mark a dry-run approval as spent, rejecting a second use. Persisted so
+    /// the single-use guarantee holds across restarts.
+    async fn consume_approval(&self, approval_id: &str) -> ApiResult<()> {
+        if self
+            .consumed_approvals
+            .get::<ConsumedApproval>(approval_id)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::conflict(
+                "this dry-run approval has already been used for a repair",
+            ));
+        }
+        self.consumed_approvals
+            .put(
+                approval_id,
+                &ConsumedApproval {
+                    id: approval_id.to_string(),
+                    consumed_at: now_ts(),
+                },
+            )
+            .await
     }
 
     async fn set_reconciliation_mode(&self, id: &str, mode: ReconciliationMode) -> ApiResult<()> {
@@ -791,6 +835,24 @@ mod tests {
         assert_eq!(records[0].status, OperationStatus::Succeeded);
         assert_eq!(records[0].resource_id.as_deref(), Some("br-1"));
         assert_eq!(records[0].progress_pct, Some(100));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_approval_can_only_be_consumed_once() {
+        let dir = std::env::temp_dir().join(format!("daygleve-operations-test-{}", new_id()));
+        let service = OperationService::new(test_config(&dir));
+        let approval_id = new_id();
+
+        // First use succeeds; a replay of the same approval is rejected.
+        service.consume_approval(&approval_id).await.unwrap();
+        assert!(service.consume_approval(&approval_id).await.is_err());
+
+        // The guard is persistent: a fresh service over the same dir still
+        // rejects the already-spent approval.
+        let reopened = OperationService::new(test_config(&dir));
+        assert!(reopened.consume_approval(&approval_id).await.is_err());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

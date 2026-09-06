@@ -240,6 +240,11 @@ impl BackupService {
             }
         };
         ensure_safe_zfs_dataset(&target)?;
+        // Confine the restore target to a dataset *under* the managed pool. A
+        // restore with `force` runs `zfs destroy -r <target>`, so without this an
+        // operator (or a typo) could recursively destroy the pool root itself or
+        // an unrelated pool/system dataset.
+        ensure_within_managed_pool(&target, &self.config.default_pool)?;
         let force = req.force;
         let file = artifact.files[0].clone();
         let worker = Arc::clone(self);
@@ -486,6 +491,20 @@ impl BackupService {
     }
 }
 
+/// Require `target` to be a dataset strictly *under* the managed pool
+/// (`<pool>/…`), never the pool root or another pool. Restore is destructive
+/// (`zfs destroy -r` under `force`), so its blast radius must stay inside the
+/// datasets DaygleVE manages.
+fn ensure_within_managed_pool(target: &str, default_pool: &str) -> ApiResult<()> {
+    let prefix = format!("{default_pool}/");
+    if !target.starts_with(&prefix) {
+        return Err(AppError::validation(format!(
+            "restore target must be a dataset under the managed pool {default_pool:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_plan_request(req: &CreateBackupPlanRequest) -> ApiResult<()> {
     if req.name.trim().is_empty() || req.name.trim().len() > 64 {
         return Err(AppError::validation(
@@ -603,6 +622,18 @@ mod tests {
         assert!(validate_destination("../outside").is_err());
         assert!(validate_destination("/etc").is_err());
         assert!(validate_destination("nas\\outside").is_err());
+    }
+
+    #[test]
+    fn restore_target_must_be_under_the_managed_pool() {
+        assert!(ensure_within_managed_pool("tank/vms/abc", "tank").is_ok());
+        assert!(ensure_within_managed_pool("tank/lxc/web", "tank").is_ok());
+        // The pool root itself is refused (a forced restore would `zfs destroy -r`
+        // the whole pool).
+        assert!(ensure_within_managed_pool("tank", "tank").is_err());
+        // Another pool or a lookalike prefix is refused.
+        assert!(ensure_within_managed_pool("other/vms/abc", "tank").is_err());
+        assert!(ensure_within_managed_pool("tank2/vms/abc", "tank").is_err());
     }
 
     #[test]

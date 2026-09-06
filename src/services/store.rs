@@ -130,9 +130,16 @@ impl JsonStore {
             let bytes = fs::read(&path)
                 .await
                 .map_err(|e| AppError::internal(format!("read {}: {e}", path.display())))?;
-            let value = serde_json::from_slice(&bytes)
-                .map_err(|e| AppError::internal(format!("parse {}: {e}", path.display())))?;
-            out.push(value);
+            // Skip (don't fail the whole listing on) a single unparseable record:
+            // one corrupt or schema-incompatible file must not take down every
+            // record of this kind — which for the operations store would also
+            // break startup recovery. The bad file is logged and left in place.
+            match serde_json::from_slice(&bytes) {
+                Ok(value) => out.push(value),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping unparseable record");
+                }
+            }
         }
         Ok(out)
     }
