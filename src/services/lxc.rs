@@ -27,7 +27,6 @@ use crate::services::{
 
 pub struct LxcService {
     store: JsonStore,
-    snapshot_store: JsonStore,
     config: Arc<Config>,
 }
 
@@ -35,7 +34,6 @@ impl LxcService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             store: JsonStore::new(&config.state_dir, "containers"),
-            snapshot_store: JsonStore::new(&config.state_dir, "container_snapshots"),
             config,
         }
     }
@@ -332,42 +330,70 @@ impl LxcService {
         }
         Ok(out_vec)
     }
-    /// Snapshot a container's ZFS-backed rootfs.
-    pub async fn snapshot(&self, id: &str, name: &str) -> ApiResult<LxcSnapshotRecord> {
+    /// Snapshot a container's ZFS-backed rootfs. ZFS snapshots are
+    /// crash-consistent, so capture works whether or not the container is
+    /// running; rollback is the guarded operation, not capture.
+    pub async fn snapshot(
+        &self,
+        id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> ApiResult<LxcSnapshotRecord> {
         let ct = self.get_stored(id).await?;
-        crate::services::kvm::ensure_safe_snapshot(name)?;
-        let full = format!("{0}@{name}", ct.rootfs_dataset);
-        command::run_ok("zfs", &["snapshot", &full]).await?;
+        // ensure_safe_snapshot also rejects the reserved clone-base prefix.
+        let tag = crate::services::kvm::ensure_safe_snapshot(name)?;
+        // Reject a duplicate up front so a repeat capture is a clean 409.
+        if self.list_snapshots(id).await?.iter().any(|s| s.name == tag) {
+            return Err(AppError::conflict(format!(
+                "a snapshot named {tag:?} already exists"
+            )));
+        }
+        let full = format!("{0}@{tag}", ct.rootfs_dataset);
+        if let Err(e) = command::run_ok("zfs", &["snapshot", &full]).await {
+            // The pre-check narrows the window, but a concurrent request can still
+            // win the race; surface that as a 409 rather than a 502.
+            if crate::services::kvm::is_already_exists(&e) {
+                return Err(AppError::conflict(format!(
+                    "a snapshot named {tag:?} already exists"
+                )));
+            }
+            return Err(e);
+        }
 
-        let out = command::run("zfs", &["list", "-Hp", "-o", "name,used", &full]).await?;
-        let line = out
-            .lines()
-            .next()
-            .ok_or_else(|| AppError::internal("snapshot created but could not be read back"))?;
-        let parts: Vec<&str> = line.split('\t').collect();
-        let used_bytes = parts
-            .get(1)
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        if let Some(desc) = description.map(str::trim).filter(|d| !d.is_empty()) {
+            // The description is read back from tab-delimited `zfs list -H` output,
+            // so collapse any control whitespace to spaces before storing it, or a
+            // value with a tab/newline would corrupt that parse.
+            let sanitized: String = desc
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let prop = format!("daygleve:description={}", sanitized.trim());
+            // The snapshot is already captured; a failed annotation must not fail
+            // the whole operation.
+            let _ = command::run_ok("zfs", &["set", &prop, &full]).await;
+        }
 
-        let snapshot = LxcSnapshotRecord {
-            id: new_id(),
-            name: name.to_string(),
-            container_id: ct.id.clone(),
-            dataset: ct.rootfs_dataset.clone(),
-            used_bytes,
-            created_at: now_ts(),
-        };
-        // Persist the snapshot record.
-        self.snapshot_store.put(&snapshot.id, &snapshot).await?;
-        Ok(snapshot)
+        self.list_snapshots(id)
+            .await?
+            .into_iter()
+            .find(|s| s.name == tag)
+            .ok_or_else(|| AppError::internal("snapshot created but could not be read back"))
     }
 
-    /// Roll a snapshot back to, restoring the container's rootfs.
+    /// Roll the container's rootfs back to the named snapshot. Destructive of any
+    /// newer snapshots (`zfs rollback -r`) and only allowed while the container is
+    /// stopped, or a live rollback would corrupt the running rootfs.
     pub async fn rollback_snapshot(&self, id: &str, name: &str) -> ApiResult<()> {
         let ct = self.get_stored(id).await?;
-        crate::services::kvm::ensure_safe_snapshot(name)?;
-        let target = format!("{0}@{name}", ct.rootfs_dataset);
+        let tag = crate::services::kvm::ensure_safe_snapshot(name)?;
+        self.require_stopped(&ct, "rolling back a snapshot").await?;
+        // Confirm the snapshot exists before the destructive call, so a missing
+        // snapshot is a clean 404 rather than a 502 from `zfs rollback`.
+        if !self.snapshot_exists(&ct.rootfs_dataset, tag).await? {
+            return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
+        }
+        let target = format!("{0}@{tag}", ct.rootfs_dataset);
         command::run_ok("zfs", &["rollback", "-r", &target]).await?;
         Ok(())
     }
@@ -375,21 +401,19 @@ impl LxcService {
     /// Delete a snapshot.
     pub async fn delete_snapshot(&self, id: &str, name: &str) -> ApiResult<()> {
         let ct = self.get_stored(id).await?;
-        crate::services::kvm::ensure_safe_snapshot(name)?;
-        let target = format!("{0}@{name}", ct.rootfs_dataset);
-        command::run_ok("zfs", &["destroy", &target]).await?;
-        // Remove the stored record.
-        let snapshots = self.snapshot_store.list::<LxcSnapshotRecord>().await?;
-        for snap in snapshots
-            .into_iter()
-            .filter(|s| s.container_id == id && s.name == name)
-        {
-            let _ = self.snapshot_store.delete(&snap.id).await;
+        let tag = crate::services::kvm::ensure_safe_snapshot(name)?;
+        // A missing snapshot is a 404, not a 502 from `zfs destroy`.
+        if !self.snapshot_exists(&ct.rootfs_dataset, tag).await? {
+            return Err(AppError::not_found(format!("no snapshot named {tag:?}")));
         }
+        let target = format!("{0}@{tag}", ct.rootfs_dataset);
+        command::run_ok("zfs", &["destroy", &target]).await?;
         Ok(())
     }
 
-    /// List snapshots for a container.
+    /// List snapshots for a container, read straight from ZFS (the source of
+    /// truth) so `used_bytes` and `created_at` reflect the real dataset and each
+    /// snapshot keeps a stable id across calls.
     pub async fn list_snapshots(&self, id: &str) -> ApiResult<Vec<LxcSnapshotRecord>> {
         let ct = self.get_stored(id).await?;
         let prefix = format!("{0}@", ct.rootfs_dataset);
@@ -401,7 +425,7 @@ impl LxcService {
                 "snapshot",
                 "-Hp",
                 "-o",
-                "name,used",
+                "name,used,creation,daygleve:description",
                 "-d",
                 "1",
                 &ct.rootfs_dataset,
@@ -416,32 +440,67 @@ impl LxcService {
         };
         let mut snapshots = Vec::new();
         for line in out.lines().filter(|l| !l.trim().is_empty()) {
-            if !line.starts_with(&prefix) {
+            let mut cols = line.split('\t');
+            let full = cols.next().unwrap_or_default();
+            let name = match full.strip_prefix(&prefix) {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            // `-p` always emits numeric used/creation; skip a row that doesn't
+            // parse rather than fabricate a 0-byte / epoch-0 entry.
+            let (Some(used_bytes), Some(creation)) = (
+                cols.next().and_then(|s| s.parse::<u64>().ok()),
+                cols.next().and_then(|s| s.parse::<i64>().ok()),
+            ) else {
                 continue;
-            }
-            let parts: Vec<&str> = line.split('\t').collect();
-            let name = parts
-                .first()
-                .and_then(|s| s.strip_prefix(&prefix))
-                .unwrap_or("");
-            if name.is_empty() {
-                continue;
-            }
-            let used_bytes = parts
-                .get(1)
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            let snapshot = LxcSnapshotRecord {
-                id: new_id(),
+            };
+            let desc = cols.next().unwrap_or("-");
+            let description = (desc != "-" && !desc.is_empty()).then(|| desc.to_string());
+            snapshots.push(LxcSnapshotRecord {
+                id: snapshot_id(&ct.id, name),
                 name: name.to_string(),
                 container_id: ct.id.clone(),
                 dataset: ct.rootfs_dataset.clone(),
                 used_bytes,
-                created_at: now_ts(),
-            };
-            snapshots.push(snapshot);
+                description,
+                created_at: crate::services::kvm::ts_from_unix(creation),
+            });
         }
         Ok(snapshots)
+    }
+
+    /// Whether `dataset@tag` exists, so a caller can reject a missing snapshot
+    /// before a destructive `zfs` call. A missing `zfs` binary is an operational
+    /// error on these endpoints (502), not a 404.
+    async fn snapshot_exists(&self, dataset: &str, tag: &str) -> ApiResult<bool> {
+        let target = format!("{dataset}@{tag}");
+        match command::run_optional(
+            "zfs",
+            &["list", "-H", "-o", "name", "-t", "snapshot", &target],
+        )
+        .await
+        {
+            Ok(Some(o)) if !o.trim().is_empty() => Ok(true),
+            // Empty output, or a "does not exist" error: the snapshot is absent.
+            Ok(Some(_)) => Ok(false),
+            Err(e) if crate::services::kvm::is_missing_dataset(&e) => Ok(false),
+            Ok(None) => Err(AppError::hypervisor(
+                "zfs is not installed; cannot manage snapshots",
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether the container is stopped, so a destructive rollback can be
+    /// rejected while it is running/frozen. `None` (state indeterminate — e.g. a
+    /// dev host without `lxc`) is treated as permissible, matching the VM path.
+    async fn require_stopped(&self, ct: &Lxc, action: &str) -> ApiResult<()> {
+        match self.live_state(&ct.name).await {
+            Some(LxcState::Stopped) | None => Ok(()),
+            Some(_) => Err(AppError::conflict(format!(
+                "stop the container before {action}"
+            ))),
+        }
     }
 
     /// Write CPU/memory cgroup limits and vet the bridge name.
@@ -477,6 +536,17 @@ impl LxcService {
 
         command::append_lxc_config(name, &block).await
     }
+}
+
+/// A stable, deterministic id for a container snapshot, so the same
+/// `container@name` snapshot keeps one id across `list` calls (the UI keys on
+/// it). Derived as a UUIDv5 over `container_id@name`.
+fn snapshot_id(container_id: &str, name: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("{container_id}@{name}").as_bytes(),
+    )
+    .to_string()
 }
 
 fn summary_of(ct: &Lxc) -> LxcSummary {

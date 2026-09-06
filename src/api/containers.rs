@@ -139,7 +139,11 @@ async fn create_snapshot(
     Json(req): Json<CreateLxcSnapshotRequest>,
 ) -> ApiResult<(StatusCode, Json<LxcSnapshot>)> {
     user.require(Permission::LxcWrite)?;
-    let snapshot = state.services.lxc.snapshot(&id, &req.name).await?;
+    let snapshot = state
+        .services
+        .lxc
+        .snapshot(&id, &req.name, req.description.as_deref())
+        .await?;
     Ok((StatusCode::CREATED, Json(snapshot)))
 }
 
