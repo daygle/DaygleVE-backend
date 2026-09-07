@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use daygleve_schema::vm::{
     CloneVmRequest, CloudInitRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest,
-    DiskBus, Firmware, GuestAgentInfo, IsoImage, NicModel, ResizeVmDiskRequest, UpdateVmRequest,
-    Vm, VmDisk, VmFirewall, VmFirewallAction, VmFirewallDirection, VmNic, VmPowerAction,
-    VmPowerResponse, VmSnapshot, VmSnapshotType, VmState, VmSummary,
+    DiskBus, DisplayProtocol, Firmware, GuestAgentInfo, IsoImage, NicModel, ResizeVmDiskRequest,
+    UpdateVmRequest, Vm, VmDisk, VmFirewall, VmFirewallAction, VmFirewallDirection, VmNic,
+    VmPowerAction, VmPowerResponse, VmSnapshot, VmSnapshotType, VmState, VmSummary,
 };
 
 use crate::config::Config;
@@ -142,6 +142,7 @@ impl KvmService {
             vcpus: req.vcpus,
             memory_mib: req.memory_mib,
             firmware: req.firmware,
+            display: req.display,
             disks: req.disks,
             nics,
             gpus: req.gpus,
@@ -248,6 +249,7 @@ impl KvmService {
             validate_firewall(fw)?;
         }
         let hardware_change = req.firmware.is_some()
+            || req.display.is_some()
             || req.disks.is_some()
             || req.nics.is_some()
             || req.guest_agent.is_some()
@@ -255,12 +257,15 @@ impl KvmService {
         if hardware_change {
             self.require_stopped(
                 &vm,
-                "changing its firmware, disks, NICs, guest agent or cloud-init",
+                "changing its firmware, display, disks, NICs, guest agent or cloud-init",
             )
             .await?;
         }
         if let Some(firmware) = req.firmware {
             vm.firmware = firmware;
+        }
+        if let Some(display) = req.display {
+            vm.display = display;
         }
         if let Some(nics) = req.nics {
             vm.nics = normalize_nics(nics)?;
@@ -457,6 +462,7 @@ impl KvmService {
             vcpus: src.vcpus,
             memory_mib: src.memory_mib,
             firmware: src.firmware,
+            display: src.display,
             disks: new_disks,
             // Give each NIC a freshly-generated MAC (recorded in the VM), so the
             // clone never inherits the source's MAC and we always know what it is.
@@ -762,6 +768,29 @@ impl KvmService {
         pty: &str,
     ) -> ApiResult<(command::ConsoleReadHalf, command::ConsoleWriteHalf)> {
         command::console_attach(pty).await
+    }
+
+    /// Build a `remote-viewer` connection file (`.vv`) for the VM's SPICE
+    /// display. Only valid when the VM uses SPICE and is running; the port is
+    /// resolved live from libvirt and the host is the configured SPICE address.
+    pub async fn spice_connection(&self, id: &str) -> ApiResult<String> {
+        let vm = self.get_stored(id).await?;
+        if vm.display != DisplayProtocol::Spice {
+            return Err(AppError::conflict(
+                "this VM does not use SPICE; set its display to spice first",
+            ));
+        }
+        let uri = self
+            .virsh(&["domdisplay", "--type", "spice", id])
+            .await
+            .map_err(|_| AppError::conflict("start the VM to open its SPICE display"))?;
+        let port = parse_spice_port(uri.trim())
+            .ok_or_else(|| AppError::hypervisor("could not resolve the VM's SPICE port"))?;
+        Ok(spice_connection_file(
+            &vm.name,
+            &self.config.spice_listen,
+            port,
+        ))
     }
 
     // --- guest agent ------------------------------------------------------
@@ -1541,7 +1570,7 @@ impl KvmService {
     async fn define(&self, vm: &Vm) -> ApiResult<()> {
         // vm.id is a backend-minted UUID, but validate before it reaches a path.
         crate::services::ensure_safe_id(&vm.id)?;
-        let xml = domain_xml(vm);
+        let xml = domain_xml(vm, &self.config.spice_listen);
         let dir = self.config.state_dir.join("tmp");
         tokio::fs::create_dir_all(&dir)
             .await
@@ -1896,6 +1925,51 @@ fn parse_vnc_display(display: &str) -> Option<String> {
     Some(format!("{host}:{}", 5900 + n))
 }
 
+/// Extract the SPICE port from `virsh domdisplay --type spice` output, which is
+/// a URI like `spice://127.0.0.1:5901` or `spice://127.0.0.1?port=5901`.
+fn parse_spice_port(uri: &str) -> Option<u16> {
+    // Prefer an explicit `port` query parameter (matched as a whole key, so
+    // `tls-port=` is never mistaken for it), else the `:port` after the host.
+    if let Some(query) = uri.split('?').nth(1) {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("port=") {
+                if let Ok(port) = value.parse::<u16>() {
+                    return Some(port);
+                }
+            }
+        }
+    }
+    let after_scheme = uri.strip_prefix("spice://").unwrap_or(uri);
+    let host_port = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme);
+    let (_, port) = host_port.rsplit_once(':')?;
+    port.parse::<u16>().ok()
+}
+
+/// A `remote-viewer` connection file (`.vv`, an INI document) for a SPICE
+/// display. `delete-this-file=1` asks the viewer to remove the downloaded file
+/// after connecting, since it names the reachable host and port.
+fn spice_connection_file(vm_name: &str, host: &str, port: u16) -> String {
+    // Strip any characters that could break the INI line; names are host-safe
+    // already, but the title is cosmetic so keep it conservative.
+    let title: String = vm_name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\n')
+        .collect();
+    format!(
+        "[virt-viewer]\n\
+         type=spice\n\
+         host={host}\n\
+         port={port}\n\
+         title={title} - SPICE\n\
+         delete-this-file=1\n\
+         toggle-fullscreen=shift+f11\n\
+         release-cursor=shift+f12\n"
+    )
+}
+
 /// Guest-visible target name for disk `index` on `bus`, matching what
 /// [`domain_xml`] renders for the same position (single-letter scheme) plus
 /// the two-letter CD-ROMs at the end of the SATA alphabet.
@@ -2153,8 +2227,10 @@ fn cloud_init_user_data(req: &CloudInitRequest) -> String {
     b
 }
 
-/// Render libvirt domain XML for a VM.
-fn domain_xml(vm: &Vm) -> String {
+/// Render libvirt domain XML for a VM. `spice_listen` is the address a SPICE
+/// display binds to (ignored for VNC, which stays on localhost behind the
+/// backend's websocket proxy).
+fn domain_xml(vm: &Vm, spice_listen: &str) -> String {
     // When an install ISO is attached, boot order is expressed per-device
     // (`<boot order=…>` on the cdrom and first disk) so the CD-ROM comes first;
     // this is mutually exclusive with the `<os><boot dev=…></os>` form, so the
@@ -2218,6 +2294,24 @@ fn domain_xml(vm: &Vm) -> String {
         .map(|d| format!("  <description>{}</description>\n", xml_escape(d)))
         .unwrap_or_default();
 
+    // Graphics + video are chosen by display protocol. VNC stays on localhost
+    // (the backend proxies it to the browser via noVNC); SPICE binds the
+    // configured address so an external remote-viewer can reach it, paired with
+    // a QXL model for the richer SPICE features.
+    let graphics = match vm.display {
+        DisplayProtocol::Vnc => {
+            "<graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>\n    \
+             <video><model type='virtio' heads='1'/></video>"
+                .to_string()
+        }
+        DisplayProtocol::Spice => format!(
+            "<graphics type='spice' autoport='yes' listen='{listen}'>\
+             <image compression='off'/></graphics>\n    \
+             <video><model type='qxl' ram='65536' vram='65536' heads='1'/></video>",
+            listen = xml_escape(spice_listen),
+        ),
+    };
+
     format!(
         "<domain type='kvm'>\n  \
         <name>{name}</name>\n  \
@@ -2237,8 +2331,7 @@ fn domain_xml(vm: &Vm) -> String {
         <emulator>/usr/bin/qemu-system-x86_64</emulator>\n\
         {disks}{cdrom}{cloud_init_cdrom}{nics}{hostdevs}    \
         {guest_agent_channel}    \
-        <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>\n    \
-        <video><model type='virtio' heads='1'/></video>\n    \
+        {graphics}\n    \
         <memballoon model='virtio'/>\n    \
         <serial type='pty'><target type='isa-serial' port='0'/></serial>\n    \
         <console type='pty'><target type='serial' port='0'/></console>\n  \
@@ -2256,6 +2349,7 @@ fn domain_xml(vm: &Vm) -> String {
         nics = nics,
         hostdevs = hostdevs,
         guest_agent_channel = guest_agent_channel,
+        graphics = graphics,
     )
 }
 
@@ -2427,6 +2521,7 @@ mod tests {
             vcpus: 2,
             memory_mib: 2048,
             firmware: Firmware::Uefi,
+            display: DisplayProtocol::Vnc,
             disks: vec![VmDisk {
                 dataset: "tank/vms/web01-disk0".to_string(),
                 size_gib: 20,
@@ -2506,7 +2601,7 @@ mod tests {
                 product_id: "0003".into(),
             },
         ];
-        let xml = domain_xml(&vm);
+        let xml = domain_xml(&vm, "127.0.0.1");
         assert!(xml.contains("<hostdev mode='subsystem' type='usb'>"));
         assert!(xml.contains("<vendor id='0x1d6b'/><product id='0x0003'/>"));
         assert!(!xml.contains("0xzzzz"), "malformed id must be dropped");
@@ -2519,7 +2614,7 @@ mod tests {
         vm.pci_devices = vec![PciAssignment {
             pci_address: "0000:03:00.0".into(),
         }];
-        let xml = domain_xml(&vm);
+        let xml = domain_xml(&vm, "127.0.0.1");
         assert!(xml.contains("<hostdev mode='subsystem' type='pci' managed='yes'>"));
         assert!(xml.contains("domain='0x0000' bus='0x03' slot='0x00' function='0x0'"));
     }
@@ -2560,7 +2655,7 @@ mod tests {
 
     #[test]
     fn domain_xml_without_cdrom_boots_from_disk() {
-        let xml = domain_xml(&sample_vm());
+        let xml = domain_xml(&sample_vm(), "127.0.0.1");
         assert!(xml.contains("<boot dev='hd'/>"), "should boot from disk");
         assert!(!xml.contains("device='cdrom'"), "no cdrom device");
         assert!(!xml.contains("<boot order="), "no per-device boot order");
@@ -2570,7 +2665,7 @@ mod tests {
     fn domain_xml_with_cdrom_boots_from_media_then_disk() {
         let mut vm = sample_vm();
         vm.cdrom = Some("/var/lib/daygleve/isos/debian.iso".to_string());
-        let xml = domain_xml(&vm);
+        let xml = domain_xml(&vm, "127.0.0.1");
 
         // Per-device boot order replaces the fixed <os><boot dev=…>.
         assert!(!xml.contains("<boot dev='hd'/>"));
@@ -2592,14 +2687,14 @@ mod tests {
         // BIOS without media: legacy <os> block boots from disk.
         let mut vm = sample_vm();
         vm.firmware = Firmware::Bios;
-        let xml = domain_xml(&vm);
+        let xml = domain_xml(&vm, "127.0.0.1");
         assert!(xml.contains("<os>\n"), "BIOS uses the plain <os> block");
         assert!(!xml.contains("firmware='efi'"), "BIOS is not EFI");
         assert!(xml.contains("<boot dev='hd'/>"), "BIOS boots from disk");
 
         // BIOS with media: switches to the boot menu + per-device order.
         vm.cdrom = Some("/var/lib/daygleve/isos/debian.iso".to_string());
-        let xml = domain_xml(&vm);
+        let xml = domain_xml(&vm, "127.0.0.1");
         assert!(!xml.contains("firmware='efi'"), "still BIOS");
         assert!(!xml.contains("<boot dev='hd'/>"));
         assert!(xml.contains("<bootmenu enable='yes'/>"));
@@ -2668,7 +2763,7 @@ mod tests {
         let mut vm = sample_vm();
         vm.guest_agent = true;
         vm.cloud_init_iso = Some("/var/lib/daygleve/cloud-init/web01-seed.iso".to_string());
-        let xml = domain_xml(&vm);
+        let xml = domain_xml(&vm, "127.0.0.1");
         // The agent channel targets the well-known virtio name and lets libvirt
         // allocate the unix socket itself.
         assert!(xml.contains("<channel type='unix'>"));
@@ -2680,14 +2775,50 @@ mod tests {
         // Disabled agent renders no channel at all.
         let mut off = sample_vm();
         off.guest_agent = false;
-        assert!(!domain_xml(&off).contains("<channel"));
+        assert!(!domain_xml(&off, "127.0.0.1").contains("<channel"));
+    }
+
+    #[test]
+    fn spice_display_renders_qxl_graphics() {
+        let mut vm = sample_vm();
+        vm.display = DisplayProtocol::Spice;
+        let xml = domain_xml(&vm, "10.0.0.5");
+        assert!(xml.contains("<graphics type='spice' autoport='yes' listen='10.0.0.5'>"));
+        assert!(xml.contains("<model type='qxl'"));
+        assert!(!xml.contains("type='vnc'"));
+        // The default stays VNC on localhost.
+        let vnc = domain_xml(&sample_vm(), "10.0.0.5");
+        assert!(vnc.contains("<graphics type='vnc'"));
+        assert!(!vnc.contains("type='spice'"));
+    }
+
+    #[test]
+    fn spice_port_parses_uri_forms() {
+        assert_eq!(parse_spice_port("spice://127.0.0.1:5901"), Some(5901));
+        assert_eq!(parse_spice_port("spice://127.0.0.1?port=5902"), Some(5902));
+        assert_eq!(
+            parse_spice_port("spice://host?tls-port=5903&port=5904"),
+            Some(5904)
+        );
+        assert_eq!(parse_spice_port("spice://127.0.0.1"), None);
+        assert_eq!(parse_spice_port(""), None);
+    }
+
+    #[test]
+    fn spice_connection_file_is_a_virt_viewer_ini() {
+        let vv = spice_connection_file("web01", "10.0.0.5", 5901);
+        assert!(vv.starts_with("[virt-viewer]\n"));
+        assert!(vv.contains("type=spice\n"));
+        assert!(vv.contains("host=10.0.0.5\n"));
+        assert!(vv.contains("port=5901\n"));
+        assert!(vv.contains("delete-this-file=1\n"));
     }
 
     #[test]
     fn domain_xml_renders_serial_and_console_pty() {
         // Every VM gets a pty-backed serial port plus a console aliased to it,
         // so `virsh ttyconsole` resolves a device for the text console.
-        let xml = domain_xml(&sample_vm());
+        let xml = domain_xml(&sample_vm(), "127.0.0.1");
         assert!(xml.contains("<serial type='pty'><target type='isa-serial' port='0'/></serial>"));
         assert!(xml.contains("<console type='pty'><target type='serial' port='0'/></console>"));
     }

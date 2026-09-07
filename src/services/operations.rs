@@ -788,6 +788,7 @@ mod tests {
             template_dir: dir.join("templates"),
             mounts_dir: dir.join("mounts"),
             max_upload_bytes: 16 * 1024 * 1024 * 1024,
+            spice_listen: "127.0.0.1".to_string(),
             backup_dir: dir.join("backups"),
             token_ttl_secs: 3600,
             admin_password: Some("test-password-generated-at-runtime".into()),
