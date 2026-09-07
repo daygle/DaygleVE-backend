@@ -94,6 +94,7 @@ impl KvmService {
         }
         let nics = normalize_nics(req.nics)?;
         validate_gpu_assignments(&req.gpus)?;
+        validate_usb_assignments(&req.usb_devices)?;
 
         // Validate any requested install ISO against the node's library before
         // it reaches libvirt (prevents pointing a VM at an arbitrary host file).
@@ -135,6 +136,7 @@ impl KvmService {
             disks: req.disks,
             nics,
             gpus: req.gpus,
+            usb_devices: req.usb_devices,
             cdrom,
             cloud_init_iso,
             description: req.description,
@@ -456,8 +458,9 @@ impl KvmService {
                     ..n.clone()
                 })
                 .collect(),
-            gpus: Vec::new(), // passthrough can't be shared
-            cdrom: None,      // install media isn't carried over
+            gpus: Vec::new(),        // passthrough can't be shared
+            usb_devices: Vec::new(), // nor can USB passthrough
+            cdrom: None,             // install media isn't carried over
             cloud_init_iso: None,
             description: req.description.or(src.description.clone()),
             guest_agent: false,
@@ -2150,6 +2153,11 @@ fn domain_xml(vm: &Vm) -> String {
         .gpus
         .iter()
         .filter_map(|g| pci_hostdev_xml(&g.pci_address))
+        .chain(
+            vm.usb_devices
+                .iter()
+                .filter_map(|u| usb_hostdev_xml(&u.vendor_id, &u.product_id)),
+        )
         .collect();
     let guest_agent_channel: String = if vm.guest_agent {
         guest_agent_channel_xml()
@@ -2311,6 +2319,34 @@ fn pci_hostdev_xml(pci_address: &str) -> Option<String> {
     ))
 }
 
+/// A `<hostdev>` USB passthrough element matched by USB vendor:product. Returns
+/// `None` for a malformed id so a bad value can never reach the domain XML.
+fn usb_hostdev_xml(vendor_id: &str, product_id: &str) -> Option<String> {
+    if !crate::services::is_hex4(vendor_id) || !crate::services::is_hex4(product_id) {
+        return None;
+    }
+    Some(format!(
+        "    <hostdev mode='subsystem' type='usb'>\n      \
+        <source><vendor id='0x{vendor_id}'/><product id='0x{product_id}'/></source>\n    \
+        </hostdev>\n",
+    ))
+}
+
+/// Validate USB passthrough assignments: each id must be four hex digits (the
+/// USB `vendor`/`product` shape), or the resulting `<hostdev>` would be
+/// malformed.
+fn validate_usb_assignments(devices: &[daygleve_schema::usb::UsbAssignment]) -> ApiResult<()> {
+    for dev in devices {
+        if !crate::services::is_hex4(&dev.vendor_id) || !crate::services::is_hex4(&dev.product_id) {
+            return Err(AppError::validation(format!(
+                "USB id must be four hex digits: {}:{}",
+                dev.vendor_id, dev.product_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -2340,6 +2376,7 @@ mod tests {
             }],
             nics: vec![],
             gpus: vec![],
+            usb_devices: vec![],
             cdrom: None,
             cloud_init_iso: None,
             description: None,
@@ -2393,6 +2430,47 @@ mod tests {
             order,
             vec!["first", "second", "third-unordered", "fourth-unordered"]
         );
+    }
+
+    #[test]
+    fn domain_xml_renders_usb_hostdevs_and_drops_bad_ids() {
+        use daygleve_schema::usb::UsbAssignment;
+        let mut vm = sample_vm();
+        vm.usb_devices = vec![
+            UsbAssignment {
+                vendor_id: "1d6b".into(),
+                product_id: "0003".into(),
+            },
+            // A malformed id must not reach the XML.
+            UsbAssignment {
+                vendor_id: "zzzz".into(),
+                product_id: "0003".into(),
+            },
+        ];
+        let xml = domain_xml(&vm);
+        assert!(xml.contains("<hostdev mode='subsystem' type='usb'>"));
+        assert!(xml.contains("<vendor id='0x1d6b'/><product id='0x0003'/>"));
+        assert!(!xml.contains("0xzzzz"), "malformed id must be dropped");
+    }
+
+    #[test]
+    fn usb_assignments_are_validated() {
+        use daygleve_schema::usb::UsbAssignment;
+        assert!(validate_usb_assignments(&[UsbAssignment {
+            vendor_id: "1d6b".into(),
+            product_id: "0003".into(),
+        }])
+        .is_ok());
+        for (v, p) in [("1d6", "0003"), ("1d6b", "003"), ("g1d6", "0003"), ("", "")] {
+            assert!(
+                validate_usb_assignments(&[UsbAssignment {
+                    vendor_id: v.into(),
+                    product_id: p.into(),
+                }])
+                .is_err(),
+                "{v}:{p} must be rejected"
+            );
+        }
     }
 
     #[test]

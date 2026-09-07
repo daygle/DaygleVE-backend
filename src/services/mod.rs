@@ -54,6 +54,7 @@ pub mod network;
 pub mod operations;
 pub mod shares;
 pub mod store;
+pub mod usb;
 pub mod zfs;
 
 /// The host side of the planned privilege split.
@@ -129,6 +130,7 @@ pub struct Services {
     pub network: network::NetworkService,
     pub operations: Arc<operations::OperationService>,
     pub gpu: gpu::GpuService,
+    pub usb: usb::UsbService,
     pub metrics: metrics::MetricsService,
     /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
     /// enumerate ISOs living on mounted shares.
@@ -147,6 +149,7 @@ impl Services {
             network: network::NetworkService::new(config.clone()),
             operations: Arc::new(operations::OperationService::new(config.clone())),
             gpu: gpu::GpuService::new(),
+            usb: usb::UsbService::new(),
             metrics: metrics::MetricsService::new(),
             shares,
         }
@@ -310,6 +313,13 @@ pub(crate) fn now_ts() -> daygleve_schema::common::Timestamp {
 /// Fresh opaque resource id.
 pub(crate) fn new_id() -> daygleve_schema::common::ResourceId {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Whether `s` is exactly four ASCII hex digits — the shape of a USB
+/// `vendor`/`product` id. Used to vet ids before they reach a domain XML
+/// `<hostdev>` source or a sysfs comparison.
+pub(crate) fn is_hex4(s: &str) -> bool {
+    s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
