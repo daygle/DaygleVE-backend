@@ -12,6 +12,7 @@ mod network;
 mod operations;
 mod security;
 mod storage;
+mod usb;
 mod users;
 mod vms;
 
@@ -46,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         .merge(operations::routes())
         .merge(security::routes())
         .merge(gpus::routes())
+        .merge(usb::routes())
         .merge(metrics::routes());
 
     let cors = cors_layer(&state.config.cors_origins);
