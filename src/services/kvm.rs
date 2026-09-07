@@ -45,10 +45,18 @@ const ISO_SCAN_DEPTH: u32 = 4;
 /// snapshot list.
 const CLONE_SNAPSHOT_PREFIX: &str = "daygleve-clone-";
 
-/// A pending console ticket bound to a domain's VNC socket.
+/// What a redeemed console ticket connects the browser to.
+pub enum ConsoleTarget {
+    /// A VNC TCP socket address (`host:port`) — the graphical console.
+    Vnc(String),
+    /// A serial console pty device path (`/dev/pts/<n>`) — the text console.
+    Serial(String),
+}
+
+/// A pending console ticket bound to a domain's console endpoint.
 struct Ticket {
     vm_id: String,
-    vnc_addr: String,
+    target: ConsoleTarget,
     expires_at: Instant,
 }
 
@@ -685,6 +693,29 @@ impl KvmService {
         let vnc_addr = parse_vnc_display(display.trim())
             .ok_or_else(|| AppError::hypervisor("could not resolve the VM's VNC port"))?;
 
+        self.mint_ticket(id, "console", ConsoleTarget::Vnc(vnc_addr))
+    }
+
+    /// Mint a serial (text) console ticket. Resolves the domain's console pty
+    /// with `virsh ttyconsole`; the pty is opened only later, through the
+    /// broker, when the websocket redeems the ticket.
+    pub async fn serial_console(&self, id: &str) -> ApiResult<ConsoleTicket> {
+        let _ = self.get_stored(id).await?;
+        let pty = self
+            .virsh(&["ttyconsole", id])
+            .await
+            .map_err(|_| AppError::conflict("start the VM to open a serial console"))?;
+        let pty = pty.trim().to_string();
+        // Constrain to a pty device before it is stored or opened; the broker
+        // re-validates, but reject an unexpected shape early.
+        crate::broker::validate_console_pty(&pty)
+            .map_err(|_| AppError::hypervisor("could not resolve the VM's serial console"))?;
+        self.mint_ticket(id, "serial-console", ConsoleTarget::Serial(pty))
+    }
+
+    /// Store a one-time ticket for `target` and return the console handshake
+    /// pointing at `{kind}/ws`.
+    fn mint_ticket(&self, id: &str, kind: &str, target: ConsoleTarget) -> ApiResult<ConsoleTicket> {
         let ticket = new_id();
         {
             let mut tickets = self.tickets.write().expect("ticket lock");
@@ -696,32 +727,41 @@ impl KvmService {
                 ticket.clone(),
                 Ticket {
                     vm_id: id.to_string(),
-                    vnc_addr,
+                    target,
                     expires_at: now + TICKET_TTL,
                 },
             );
         }
 
         Ok(ConsoleTicket {
-            websocket_path: format!("/api/v1/vms/{id}/console/ws?ticket={ticket}"),
+            websocket_path: format!("/api/v1/vms/{id}/{kind}/ws?ticket={ticket}"),
             ticket,
             expires_at: (chrono::Utc::now() + chrono::Duration::from_std(TICKET_TTL).unwrap())
                 .to_rfc3339(),
         })
     }
 
-    /// Validate and consume a console ticket, returning the VNC socket address
-    /// to proxy to. One-time: the ticket is removed on success.
-    pub fn redeem_ticket(&self, vm_id: &str, ticket: &str) -> ApiResult<String> {
+    /// Validate and consume a console ticket, returning what to connect to.
+    /// One-time: the ticket is removed on success.
+    pub fn redeem_ticket(&self, vm_id: &str, ticket: &str) -> ApiResult<ConsoleTarget> {
         let mut tickets = self.tickets.write().expect("ticket lock");
         match tickets.get(ticket) {
             Some(t) if t.vm_id == vm_id && t.expires_at > Instant::now() => {
-                let addr = t.vnc_addr.clone();
-                tickets.remove(ticket);
-                Ok(addr)
+                // Consume only on a valid match, so a wrong-VM guess can't burn
+                // another VM's pending ticket.
+                Ok(tickets.remove(ticket).expect("ticket present").target)
             }
             _ => Err(AppError::unauthorized("invalid or expired console ticket")),
         }
+    }
+
+    /// Open a live bridge to a serial console pty (through the broker on the
+    /// appliance). The pty comes from a previously-redeemed serial ticket.
+    pub async fn attach_serial_console(
+        &self,
+        pty: &str,
+    ) -> ApiResult<(command::ConsoleReadHalf, command::ConsoleWriteHalf)> {
+        command::console_attach(pty).await
     }
 
     // --- guest agent ------------------------------------------------------
@@ -2200,7 +2240,8 @@ fn domain_xml(vm: &Vm) -> String {
         <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>\n    \
         <video><model type='virtio' heads='1'/></video>\n    \
         <memballoon model='virtio'/>\n    \
-        <console type='pty'/>\n  \
+        <serial type='pty'><target type='isa-serial' port='0'/></serial>\n    \
+        <console type='pty'><target type='serial' port='0'/></console>\n  \
         </devices>\n\
         </domain>\n",
         name = xml_escape(&vm.name),
@@ -2640,6 +2681,15 @@ mod tests {
         let mut off = sample_vm();
         off.guest_agent = false;
         assert!(!domain_xml(&off).contains("<channel"));
+    }
+
+    #[test]
+    fn domain_xml_renders_serial_and_console_pty() {
+        // Every VM gets a pty-backed serial port plus a console aliased to it,
+        // so `virsh ttyconsole` resolves a device for the text console.
+        let xml = domain_xml(&sample_vm());
+        assert!(xml.contains("<serial type='pty'><target type='isa-serial' port='0'/></serial>"));
+        assert!(xml.contains("<console type='pty'><target type='serial' port='0'/></console>"));
     }
 
     #[test]

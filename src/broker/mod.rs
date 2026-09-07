@@ -96,6 +96,22 @@ pub enum Op {
         /// The config lines to append.
         block: String,
     },
+    /// Attach to a running guest's console pty and bridge it to the client.
+    ///
+    /// The backend resolves the device with an allowlisted `virsh ttyconsole`
+    /// and passes it here; the broker independently constrains it to a
+    /// `/dev/pts/<n>` device, opens it read-write, and streams it using the same
+    /// [`StreamFrame`] `Stdin`/`Stdout` chunks a streaming exec uses (`Stdout`
+    /// carries console output, `Stdin` carries keystrokes). The session ends
+    /// with an `Exit` frame when the pty closes, the client disconnects, or the
+    /// timeout elapses.
+    ConsoleAttach {
+        /// Console pty device, e.g. `/dev/pts/3`.
+        pty: String,
+        /// Session timeout in seconds, capped by [`EXEC_TIMEOUT_CAP`].
+        #[serde(default = "default_timeout_secs")]
+        timeout_secs: u64,
+    },
 }
 
 fn default_timeout_secs() -> u64 {
@@ -432,6 +448,7 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
                     | "undefine"
                     | "domrename"
                     | "vncdisplay"
+                    | "ttyconsole"
                     // Guest agent + RAM-state snapshot + disk hotplug/resize.
                     | "qemu-agent-command"
                     | "domifaddr"
@@ -965,8 +982,31 @@ pub fn validate_request(req: &Request) -> Result<(), String> {
             validate_lxc_name(name)?;
             validate_lxc_config_block(block)?;
         }
+        Op::ConsoleAttach { pty, timeout_secs } => {
+            validate_console_pty(pty)?;
+            if *timeout_secs == 0 || *timeout_secs > EXEC_TIMEOUT_CAP.as_secs() {
+                return Err("timeout_secs out of range".to_string());
+            }
+        }
     }
     Ok(())
+}
+
+/// Validate a console pty device path: exactly `/dev/pts/<digits>`.
+///
+/// The broker opens this device read-write, so it must be constrained to the
+/// kernel's pty namespace and nothing else — no traversal, no arbitrary device
+/// or file path.
+pub fn validate_console_pty(pty: &str) -> Result<(), String> {
+    let index = pty
+        .strip_prefix("/dev/pts/")
+        .ok_or_else(|| "console pty must be a /dev/pts/ device".to_string())?;
+    let valid = !index.is_empty() && index.len() <= 10 && index.bytes().all(|b| b.is_ascii_digit());
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("invalid console pty: {pty:?}"))
+    }
 }
 
 #[cfg(test)]
@@ -1172,6 +1212,20 @@ mod tests {
         assert!(validate_lxc_name("/abs").is_err());
         assert!(validate_lxc_name(".hidden").is_err());
         assert!(validate_lxc_name("").is_err());
+    }
+
+    #[test]
+    fn console_ptys_are_constrained_to_dev_pts() {
+        assert!(validate_console_pty("/dev/pts/0").is_ok());
+        assert!(validate_console_pty("/dev/pts/42").is_ok());
+        // Anything but a /dev/pts/<digits> device is rejected.
+        assert!(validate_console_pty("/dev/pts/").is_err());
+        assert!(validate_console_pty("/dev/pts/1a").is_err());
+        assert!(validate_console_pty("/dev/pts/../sda").is_err());
+        assert!(validate_console_pty("/dev/sda").is_err());
+        assert!(validate_console_pty("/etc/passwd").is_err());
+        assert!(validate_console_pty("pts/0").is_err());
+        assert!(validate_console_pty("").is_err());
     }
 
     #[test]

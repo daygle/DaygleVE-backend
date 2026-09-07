@@ -187,6 +187,10 @@ async fn handle_connection(
             };
             reply_response(&mut stream, response).await
         }
+        Op::ConsoleAttach { pty, timeout_secs } => {
+            let (reader, writer) = stream.into_split();
+            stream_console(reader, writer, &pty, timeout_secs).await
+        }
     }
 }
 
@@ -394,6 +398,108 @@ async fn feed_stdin(
                 if stdin.write_all(&bytes).await.is_err() {
                     break;
                 }
+            }
+            Ok(StreamFrame::StdinEof) | Err(_) => break,
+            Ok(_) => break,
+        }
+    }
+}
+
+/// Bridge a guest console pty to the client, reusing the streaming-exec frames:
+/// the pty's output flows out as `Stdout` chunks and the client's `Stdin` chunks
+/// are written to the pty. The pty is opened read-write (a second write handle
+/// is opened for keystrokes so reads and writes proceed concurrently), and is
+/// confirmed to be a character device before any I/O so a swapped path cannot
+/// turn this into a write to a regular file. The session ends with an `Exit`
+/// frame on pty EOF/error, client disconnect, or the deadline.
+async fn stream_console(
+    reader: tokio::net::unix::OwnedReadHalf,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    pty: &str,
+    timeout_secs: u64,
+) -> Result<(), ServeError> {
+    if let Err(reason) = super::validate_console_pty(pty) {
+        return send_exit(&mut writer, -1, reason, false).await;
+    }
+    let mut read_file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pty)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) => return send_exit(&mut writer, -1, format!("open {pty}: {e}"), false).await,
+    };
+    match read_file.metadata().await {
+        Ok(meta) if meta.file_type().is_char_device() => {}
+        Ok(_) => {
+            return send_exit(
+                &mut writer,
+                -1,
+                format!("{pty} is not a console device"),
+                false,
+            )
+            .await
+        }
+        Err(e) => return send_exit(&mut writer, -1, format!("stat {pty}: {e}"), false).await,
+    }
+    let write_file = match tokio::fs::OpenOptions::new().write(true).open(pty).await {
+        Ok(file) => file,
+        Err(e) => return send_exit(&mut writer, -1, format!("open {pty}: {e}"), false).await,
+    };
+
+    let stdin_task = tokio::spawn(feed_console(reader, write_file));
+
+    // The timeout is an idle window, reset on console output, rather than an
+    // absolute cap: an actively-used console must not be dropped mid-session,
+    // but one with no output for the whole window is reclaimed.
+    let timeout = Duration::from_secs(timeout_secs.min(EXEC_TIMEOUT_CAP.as_secs()));
+    let mut chunk = vec![0u8; CHUNK_PAYLOAD_MAX];
+    loop {
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, read_file.read(&mut chunk)).await {
+            Err(_) => {
+                send_exit(&mut writer, 0, String::new(), true).await?;
+                break;
+            }
+            Ok(Ok(0)) => {
+                send_exit(&mut writer, 0, String::new(), false).await?;
+                break;
+            }
+            Ok(Err(error)) => {
+                send_exit(&mut writer, -1, format!("read {pty}: {error}"), false).await?;
+                break;
+            }
+            Ok(Ok(size)) => {
+                let frame = StreamFrame::Stdout {
+                    d: base64::engine::general_purpose::STANDARD.encode(&chunk[..size]),
+                };
+                if framing::write_json(&mut writer, &frame).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    stdin_task.abort();
+    let _ = stdin_task.await;
+    Ok(())
+}
+
+/// Pump client `Stdin` frames (keystrokes) into the console pty until the client
+/// signals EOF, disconnects, or sends a malformed frame.
+async fn feed_console(mut reader: tokio::net::unix::OwnedReadHalf, mut pty: tokio::fs::File) {
+    loop {
+        match framing::read_json::<_, StreamFrame>(&mut reader).await {
+            Ok(StreamFrame::Stdin { d }) => {
+                let bytes = match base64::engine::general_purpose::STANDARD.decode(d) {
+                    Ok(bytes) if bytes.len() <= CHUNK_PAYLOAD_MAX => bytes,
+                    _ => break,
+                };
+                if pty.write_all(&bytes).await.is_err() {
+                    break;
+                }
+                let _ = pty.flush().await;
             }
             Ok(StreamFrame::StdinEof) | Err(_) => break,
             Ok(_) => break,
