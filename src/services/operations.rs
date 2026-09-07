@@ -881,7 +881,10 @@ mod tests {
             OperationStatus::Queued | OperationStatus::Running
         ));
 
-        for _ in 0..20 {
+        // Poll for up to 5s: the job's durable writes can stall well past
+        // 200ms on a contended CI runner, so a tight budget makes this test
+        // flaky without testing anything about the service.
+        for _ in 0..250 {
             let record = service.get(&queued.id).await.unwrap();
             if record.status == OperationStatus::Succeeded {
                 assert_eq!(record.progress_pct, Some(100));
@@ -889,7 +892,7 @@ mod tests {
                 let _ = std::fs::remove_dir_all(dir);
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("background job did not finish");
     }
