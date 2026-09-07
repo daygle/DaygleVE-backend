@@ -13,7 +13,8 @@
 use std::sync::Arc;
 
 use daygleve_schema::lxc::{
-    CreateLxcRequest, Lxc, LxcNetwork, LxcPowerAction, LxcState, LxcSummary, UpdateLxcRequest,
+    CreateLxcRequest, Lxc, LxcMount, LxcNetwork, LxcPowerAction, LxcState, LxcSummary,
+    UpdateLxcRequest,
 };
 
 use daygleve_schema::lxc_snapshot::LxcSnapshotRecord;
@@ -81,6 +82,9 @@ impl LxcService {
                 ensure_safe_cidr(ip, "network.ip")?;
             }
         }
+        for mount in &req.mounts {
+            validate_mount(mount)?;
+        }
         let (dist, release) = req.template.split_once('-').ok_or_else(|| {
             AppError::validation("template must be <dist>-<release>, e.g. debian-bookworm")
         })?;
@@ -132,7 +136,13 @@ impl LxcService {
             return Err(e);
         }
         if let Err(e) = self
-            .write_config(&req.name, req.vcpus, req.memory_mib, &req.networks)
+            .write_config(
+                &req.name,
+                req.vcpus,
+                req.memory_mib,
+                &req.networks,
+                &req.mounts,
+            )
             .await
         {
             let _ = command::run_optional("lxc-destroy", &["-n", &req.name, "-f"]).await;
@@ -149,6 +159,7 @@ impl LxcService {
             vcpus: req.vcpus,
             memory_mib: req.memory_mib,
             networks: req.networks,
+            mounts: req.mounts,
             unprivileged: req.unprivileged,
             description: req.description,
             created_at: now_ts(),
@@ -305,7 +316,7 @@ impl LxcService {
     /// This deliberately does not start the container or recreate its rootfs.
     pub async fn repair_missing_from_host(&self, id: &str) -> ApiResult<()> {
         let ct = self.get_stored(id).await?;
-        self.write_config(&ct.name, ct.vcpus, ct.memory_mib, &ct.networks)
+        self.write_config(&ct.name, ct.vcpus, ct.memory_mib, &ct.networks, &ct.mounts)
             .await
     }
 
@@ -512,6 +523,7 @@ impl LxcService {
         vcpus: u32,
         memory_mib: u64,
         networks: &[LxcNetwork],
+        mounts: &[LxcMount],
     ) -> ApiResult<()> {
         let mut block = String::from("\n# --- DaygleVE limits & networking ---\n");
         block.push_str(&format!(
@@ -533,9 +545,70 @@ impl LxcService {
                 block.push_str(&format!("lxc.net.{i}.ipv4.address = {ip}\n"));
             }
         }
+        for mount in mounts {
+            // Re-validate at render time (the same check create runs) so a
+            // record that somehow carried an unsafe mount can't reach the config
+            // writer. The destination is made relative to the container rootfs.
+            validate_mount(mount)?;
+            block.push_str(&mount_entry_line(mount));
+        }
 
         command::append_lxc_config(name, &block).await
     }
+}
+
+/// Render one validated bind mount as an `lxc.mount.entry` line. The container
+/// destination is relative to the rootfs (LXC requirement), so the leading `/`
+/// is stripped; `create=dir` makes the mountpoint if it does not exist.
+fn mount_entry_line(mount: &LxcMount) -> String {
+    let dest_rel = mount.destination.trim_start_matches('/');
+    let opts = if mount.read_only {
+        "bind,ro,create=dir"
+    } else {
+        "bind,rw,create=dir"
+    };
+    format!(
+        "lxc.mount.entry = {} {} none {} 0 0\n",
+        mount.source.trim(),
+        dest_rel,
+        opts
+    )
+}
+
+/// Validate a container bind mount before it is written into the config. Bind
+/// mounting host paths into a container is a privileged capability, so the paths
+/// are held to strict rules: both absolute, no `..` traversal, no whitespace or
+/// control characters (an `lxc.mount.entry` is whitespace-delimited, so a space
+/// would split a path into extra fields). Mirrors the broker's independent
+/// `lxc.mount.entry` check.
+fn validate_mount(mount: &LxcMount) -> ApiResult<()> {
+    let safe_abs = |p: &str, field: &str| -> ApiResult<()> {
+        if !p.starts_with('/') {
+            return Err(AppError::validation(format!(
+                "{field} must be an absolute path"
+            )));
+        }
+        if p.split('/').any(|c| c == "..") {
+            return Err(AppError::validation(format!(
+                "{field} must not contain `..`"
+            )));
+        }
+        if p.len() > 1024 || p.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(AppError::validation(format!(
+                "{field} contains whitespace, control characters, or is too long"
+            )));
+        }
+        Ok(())
+    };
+    safe_abs(mount.source.trim(), "mount.source")?;
+    safe_abs(mount.destination.trim(), "mount.destination")?;
+    // A destination of exactly `/` would strip to an empty container path.
+    if mount.destination.trim().trim_start_matches('/').is_empty() {
+        return Err(AppError::validation(
+            "mount.destination must not be the container root",
+        ));
+    }
+    Ok(())
 }
 
 /// A stable, deterministic id for a container snapshot, so the same
@@ -567,5 +640,48 @@ fn map_lxc_state(s: &str) -> LxcState {
         "FROZEN" => LxcState::Frozen,
         "STARTING" | "STOPPING" | "ABORTING" | "FREEZING" | "THAWED" => LxcState::Transitioning,
         _ => LxcState::Stopped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount(source: &str, destination: &str, read_only: bool) -> LxcMount {
+        LxcMount {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn valid_mounts_are_accepted_and_bad_ones_rejected() {
+        assert!(validate_mount(&mount("/srv/data", "/data", true)).is_ok());
+        assert!(validate_mount(&mount("/srv/data", "/mnt/data", false)).is_ok());
+        // Relative source, `..` traversal, whitespace, and container-root dest.
+        assert!(validate_mount(&mount("srv/data", "/data", true)).is_err());
+        assert!(validate_mount(&mount("/srv/../etc", "/data", true)).is_err());
+        assert!(validate_mount(&mount("/srv/data", "/a/../..", true)).is_err());
+        assert!(validate_mount(&mount("/srv da ta", "/data", true)).is_err());
+        assert!(validate_mount(&mount("/srv/data", "/", true)).is_err());
+    }
+
+    #[test]
+    fn rendered_mount_entry_relativizes_dest_and_passes_the_broker() {
+        let ro = mount_entry_line(&mount("/srv/data", "/data", true));
+        assert_eq!(
+            ro,
+            "lxc.mount.entry = /srv/data data none bind,ro,create=dir 0 0\n"
+        );
+        let rw = mount_entry_line(&mount("/srv/data", "/mnt/data", false));
+        assert_eq!(
+            rw,
+            "lxc.mount.entry = /srv/data mnt/data none bind,rw,create=dir 0 0\n"
+        );
+        // The line the service renders must satisfy the broker's independent
+        // config-block validator (defense in depth).
+        assert!(crate::broker::validate_lxc_config_block(&ro).is_ok());
+        assert!(crate::broker::validate_lxc_config_block(&rw).is_ok());
     }
 }
