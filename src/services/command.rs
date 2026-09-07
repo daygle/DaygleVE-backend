@@ -28,6 +28,12 @@ fn program_path(program: &str) -> Option<&'static str> {
         "lxc-stop" => "/usr/bin/lxc-stop",
         "lxc-unfreeze" => "/usr/bin/lxc-unfreeze",
         "mount" => "/usr/bin/mount",
+        // Per-VM firewall: only driven through `nft -f <batch file>` whose
+        // content is generated from validated MAC/CIDR inputs (see kvm.rs).
+        "nft" => "/usr/sbin/nft",
+        // Cloud-init NoCloud seed ISO generation (make an ISO-9660 filesystem).
+        "genisoimage" => "/usr/bin/genisoimage",
+        "xorriso" => "/usr/bin/xorriso",
         "umount" => "/usr/bin/umount",
         "virsh" => "/usr/bin/virsh",
         "zfs" => "/usr/sbin/zfs",

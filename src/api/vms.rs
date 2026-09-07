@@ -13,8 +13,9 @@ use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::operations::OperationRecord;
 use daygleve_schema::vm::{
-    CloneVmRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, IsoImage,
-    UpdateVmRequest, Vm, VmPowerRequest, VmSnapshot, VmSummary,
+    CloneVmRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, GuestAgentInfo,
+    IsoImage, ResizeVmDiskRequest, UpdateVmRequest, Vm, VmDisk, VmPowerRequest, VmPowerResponse,
+    VmSnapshot, VmSummary,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -42,6 +43,17 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/vms/{id}/snapshots/{name}/rollback",
             post(rollback_snapshot),
+        )
+        .route(
+            "/vms/{id}/snapshots/{name}/restore",
+            post(restore_ram_snapshot),
+        )
+        .route("/vms/{id}/guest-agent", get(guest_agent))
+        .route("/vms/{id}/disks/{index}/resize", post(resize_disk))
+        .route("/vms/{id}/disks", get(list_disks).post(attach_disk))
+        .route(
+            "/vms/{id}/disks/{index}",
+            axum::routing::delete(detach_disk),
         )
         .route("/vms/{id}/console", post(console))
         .route("/vms/{id}/console/ws", get(console_ws))
@@ -149,14 +161,14 @@ async fn power(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<VmPowerRequest>,
-) -> ApiResult<(StatusCode, Json<Vm>)> {
+) -> ApiResult<(StatusCode, Json<VmPowerResponse>)> {
     user.require(Permission::VmPower)?;
     let services = state.services.clone();
     let operations = services.operations.clone();
     let operation_services = services.clone();
     let resource_id = id.clone();
     let actor = user.0.user.id.clone();
-    let vm = operations
+    let response = operations
         .run(
             "vm.power",
             Some("vm"),
@@ -165,7 +177,131 @@ async fn power(
             move || async move { operation_services.kvm.power(&id, req.action).await },
         )
         .await?;
-    Ok((StatusCode::ACCEPTED, Json(vm)))
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// Guest-agent status and reported guest info (IPs, OS) for a running VM.
+async fn guest_agent(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<GuestAgentInfo>> {
+    user.require(Permission::VmRead)?;
+    Ok(Json(state.services.kvm.guest_agent_info(&id).await?))
+}
+
+/// Restore a RAM-state snapshot: resume the VM from its saved memory image.
+async fn restore_ram_snapshot(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<Json<Vm>> {
+    user.require(Permission::VmPower)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.restore_ram_snapshot",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move {
+                operation_services
+                    .kvm
+                    .restore_ram_snapshot(&id, &name)
+                    .await
+            },
+        )
+        .await?;
+    Ok(Json(vm))
+}
+
+/// The VM's disks (a focused view of the same data the detail endpoint has).
+async fn list_disks(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<VmDisk>>> {
+    user.require(Permission::VmRead)?;
+    let vm = state.services.kvm.get(&id).await?;
+    Ok(Json(vm.disks))
+}
+
+/// Grow a disk's backing zvol (and notify the running guest).
+async fn resize_disk(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((id, index)): Path<(String, usize)>,
+    Json(req): Json<ResizeVmDiskRequest>,
+) -> ApiResult<Json<Vm>> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.resize_disk",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move { operation_services.kvm.resize_disk(&id, index, req).await },
+        )
+        .await?;
+    Ok(Json(vm))
+}
+
+/// Hot-attach an additional disk.
+async fn attach_disk(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(disk): Json<VmDisk>,
+) -> ApiResult<(StatusCode, Json<Vm>)> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.attach_disk",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move { operation_services.kvm.attach_disk(&id, disk).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(vm)))
+}
+
+/// Detach a disk by index (its zvol and data are kept).
+async fn detach_disk(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path((id, index)): Path<(String, usize)>,
+) -> ApiResult<Json<Vm>> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.detach_disk",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move { operation_services.kvm.detach_disk(&id, index).await },
+        )
+        .await?;
+    Ok(Json(vm))
 }
 
 async fn clone_vm(

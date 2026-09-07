@@ -17,9 +17,10 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use daygleve_schema::vm::{
-    CloneVmRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, DiskBus, Firmware,
-    IsoImage, NicModel, UpdateVmRequest, Vm, VmDisk, VmNic, VmPowerAction, VmSnapshot, VmState,
-    VmSummary,
+    CloneVmRequest, CloudInitRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest,
+    DiskBus, Firmware, GuestAgentInfo, IsoImage, NicModel, ResizeVmDiskRequest, UpdateVmRequest,
+    Vm, VmDisk, VmFirewall, VmFirewallAction, VmFirewallDirection, VmNic, VmPowerAction,
+    VmPowerResponse, VmSnapshot, VmSnapshotType, VmState, VmSummary,
 };
 
 use crate::config::Config;
@@ -27,8 +28,8 @@ use crate::error::{ApiResult, AppError};
 use crate::services::shares::ShareService;
 use crate::services::store::JsonStore;
 use crate::services::{
-    command, ensure_safe_id, ensure_safe_mac, ensure_safe_pci_address, ensure_safe_zfs_dataset,
-    new_id, now_ts,
+    command, ensure_safe_cidr, ensure_safe_id, ensure_safe_mac, ensure_safe_pci_address,
+    ensure_safe_zfs_dataset, new_id, now_ts,
 };
 
 /// How long a console ticket is valid before the client must re-request one.
@@ -105,6 +106,20 @@ impl KvmService {
             }
         }
 
+        // Cloud-init provisioning: generate a NoCloud seed ISO up front so its
+        // path can land in the domain XML. Tracked for rollback alongside the
+        // zvols (it is a file, removed by path, not a dataset).
+        let cloud_init_iso = match req.cloud_init.as_ref() {
+            Some(ci) => match self.create_cloud_init_iso(&req.name, ci).await {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    self.cleanup_created_zvols(&created_zvols).await;
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+
         let vm = Vm {
             id: new_id(),
             name: req.name,
@@ -116,14 +131,33 @@ impl KvmService {
             nics,
             gpus: req.gpus,
             cdrom,
+            cloud_init_iso,
             description: req.description,
+            guest_agent: req.guest_agent,
+            firewall: req.firewall,
             created_at: now_ts(),
             updated_at: None,
         };
 
         if let Err(e) = self.define(&vm).await {
             self.cleanup_created_zvols(&created_zvols).await;
+            if let Some(iso) = &vm.cloud_init_iso {
+                let _ = tokio::fs::remove_file(iso).await;
+            }
             return Err(e);
+        }
+
+        // Apply the firewall after a successful define; on failure, tear the
+        // definition back down like the other post-define failures.
+        if vm.firewall.enabled {
+            if let Err(e) = self.apply_firewall(&vm.id, &vm, true).await {
+                let _ = self.virsh_opt(&["undefine", &vm.id, "--nvram"]).await;
+                self.cleanup_created_zvols(&created_zvols).await;
+                if let Some(iso) = &vm.cloud_init_iso {
+                    let _ = tokio::fs::remove_file(iso).await;
+                }
+                return Err(e);
+            }
         }
 
         let mut vm = vm;
@@ -180,17 +214,28 @@ impl KvmService {
         }
 
         // Firmware, disk and NIC changes rewrite the guest hardware, so they are
-        // only allowed while the VM is stopped.
+        // only allowed while the VM is stopped. Guest-agent enablement, firewall
+        // and cloud-init changes likewise rewrite the domain XML.
         if let Some(disks) = req.disks.as_ref() {
             validate_disks(disks)?;
         }
         if let Some(nics) = req.nics.as_ref() {
             validate_nics(nics)?;
         }
-        let hardware_change = req.firmware.is_some() || req.disks.is_some() || req.nics.is_some();
+        if let Some(fw) = req.firewall.as_ref() {
+            validate_firewall(fw)?;
+        }
+        let hardware_change = req.firmware.is_some()
+            || req.disks.is_some()
+            || req.nics.is_some()
+            || req.guest_agent.is_some()
+            || req.cloud_init.is_some();
         if hardware_change {
-            self.require_stopped(&vm, "changing its firmware, disks or NICs")
-                .await?;
+            self.require_stopped(
+                &vm,
+                "changing its firmware, disks, NICs, guest agent or cloud-init",
+            )
+            .await?;
         }
         if let Some(firmware) = req.firmware {
             vm.firmware = firmware;
@@ -219,6 +264,21 @@ impl KvmService {
         } else if let Some(path) = req.cdrom {
             vm.cdrom = Some(self.resolve_iso(&path).await?);
         }
+        if let Some(guest_agent) = req.guest_agent {
+            vm.guest_agent = guest_agent;
+        }
+        if let Some(firewall) = req.firewall {
+            vm.firewall = firewall;
+        }
+        if let Some(cloud_init) = req.cloud_init {
+            // Regenerate the seed ISO from the new request; the old one (if any)
+            // is replaced once the new file exists.
+            let new_iso = self.create_cloud_init_iso(&vm.name, &cloud_init).await?;
+            let old_iso = vm.cloud_init_iso.replace(new_iso);
+            if let Some(old) = old_iso {
+                let _ = tokio::fs::remove_file(&old).await;
+            }
+        }
 
         // A rename must happen before the redefine (libvirt keys the domain by
         // uuid+name) and requires the domain to be inactive.
@@ -229,6 +289,12 @@ impl KvmService {
         }
         self.define(&vm).await?;
 
+        // Keep the host-side firewall in sync with the (possibly new) config.
+        // Apply-after-define; a failed apply must not leave the stored config
+        // claiming rules that are not active, so failures propagate.
+        self.apply_firewall(&vm.id, &vm, vm.firewall.enabled)
+            .await?;
+
         vm.updated_at = Some(now_ts());
         self.store.put(&vm.id, &vm).await?;
         self.get(id).await
@@ -236,7 +302,11 @@ impl KvmService {
 
     pub async fn delete(&self, id: &str) -> ApiResult<()> {
         // Must exist as a DaygleVE resource first.
-        let _ = self.get_stored(id).await?;
+        let vm = self.get_stored(id).await?;
+        // If the VM has firewall rules, tear them down before removing the domain.
+        if vm.firewall.enabled {
+            let _ = self.apply_firewall(id, &vm, false).await;
+        }
         // Force off if running, then remove the persistent definition. Both are
         // best-effort: a domain that is already gone is not an error. Disks
         // (zvols) are intentionally left intact.
@@ -358,7 +428,10 @@ impl KvmService {
                 .collect(),
             gpus: Vec::new(), // passthrough can't be shared
             cdrom: None,      // install media isn't carried over
+            cloud_init_iso: None,
             description: req.description.or(src.description.clone()),
+            guest_agent: false,
+            firewall: VmFirewall::default(),
             created_at: now_ts(),
             updated_at: None,
         };
@@ -454,23 +527,54 @@ impl KvmService {
         Ok(out_vec)
     }
 
-    pub async fn power(&self, id: &str, action: VmPowerAction) -> ApiResult<Vm> {
+    pub async fn power(&self, id: &str, action: VmPowerAction) -> ApiResult<VmPowerResponse> {
         let mut vm = self.get_stored(id).await?;
         let subcommand = match action {
             VmPowerAction::Start => "start",
-            VmPowerAction::Shutdown => "shutdown",
             VmPowerAction::Stop => "destroy",
             VmPowerAction::Reboot => "reboot",
             VmPowerAction::Reset => "reset",
             VmPowerAction::Pause => "suspend",
             VmPowerAction::Resume => "resume",
+            VmPowerAction::Shutdown => {
+                // Prefer guest-agent shutdown when the agent is enabled and the VM is
+                // running — the guest can then quiesce (flush writes, stop services)
+                // before power-off. Fall back to the ACPI button press when the agent
+                // is not connected (it may not be installed in the guest yet).
+                if vm.guest_agent && self.live_state(&vm.id).await == Some(VmState::Running) {
+                    match self.virsh(&["shutdown", "--mode", "agent", id]).await {
+                        Ok(_) => {
+                            vm.state = VmState::Transitioning;
+                            vm.updated_at = Some(now_ts());
+                            self.store.put(id, &vm).await?;
+                            return Ok(VmPowerResponse {
+                                vm,
+                                guest_ips: vec![],
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                vm_id = %id,
+                                error = %e.message(),
+                                "guest-agent shutdown failed; falling back to ACPI shutdown"
+                            );
+                        }
+                    }
+                }
+                "shutdown"
+            }
         };
         self.virsh(&[subcommand, id]).await?;
 
         vm.state = self.live_state(id).await.unwrap_or(vm.state);
         vm.updated_at = Some(now_ts());
         self.store.put(id, &vm).await?;
-        Ok(vm)
+        let guest_ips = if vm.guest_agent {
+            self.guest_ips(id).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(VmPowerResponse { vm, guest_ips })
     }
 
     pub async fn console(&self, id: &str) -> ApiResult<ConsoleTicket> {
@@ -521,6 +625,316 @@ impl KvmService {
             }
             _ => Err(AppError::unauthorized("invalid or expired console ticket")),
         }
+    }
+
+    // --- guest agent ------------------------------------------------------
+
+    /// Query the guest agent for status, OS info, and IP addresses. Reports the
+    /// channel as not connected when the VM is stopped or the agent does not
+    /// answer (e.g. qemu-guest-agent is not installed in the guest).
+    pub async fn guest_agent_info(&self, id: &str) -> ApiResult<GuestAgentInfo> {
+        let vm = self.get_stored(id).await?;
+        let mut info = GuestAgentInfo {
+            enabled: vm.guest_agent,
+            connected: false,
+            guest_os: None,
+            guest_ips: Vec::new(),
+        };
+        if !vm.guest_agent {
+            return Ok(info);
+        }
+        if self.live_state(id).await != Some(VmState::Running) {
+            return Ok(info);
+        }
+
+        // guest-info answers with one `key: value` pair per line. A missing or
+        // not-connected agent makes `qemu-agent-command` fail; that is the
+        // "enabled but not connected" case, not an API error.
+        if let Ok(out) = self
+            .virsh(&["qemu-agent-command", id, "{\"execute\":\"guest-info\"}"])
+            .await
+        {
+            info.connected = true;
+            info.guest_os = parse_guest_info_field(&out, "pretty_name")
+                .or_else(|| parse_guest_info_field(&out, "version"));
+        }
+        info.guest_ips = self.guest_ips(id).await.unwrap_or_default();
+        Ok(info)
+    }
+
+    /// IP addresses reported by the guest agent for every NIC.
+    async fn guest_ips(&self, id: &str) -> ApiResult<Vec<String>> {
+        let out = self
+            .virsh(&["domifaddr", "--source", "agent", id])
+            .await
+            .map_err(|_| {
+                AppError::hypervisor("could not query guest addresses via the guest agent")
+            })?;
+        Ok(parse_domifaddr_ips(&out))
+    }
+
+    /// Ask the guest to freeze its filesystems (via the guest agent) so an
+    /// on-disk snapshot is application-consistent, not just crash-consistent.
+    /// Best-effort at the call sites that must proceed regardless.
+    async fn fs_freeze(&self, id: &str) -> ApiResult<()> {
+        self.virsh(&["domfsfreeze", id]).await.map(|_| ())
+    }
+
+    /// Counterpart to [`Self::fs_freeze`]; resumes guest filesystem writes.
+    async fn fs_thaw(&self, id: &str) -> ApiResult<()> {
+        self.virsh(&["domfsthaw", id]).await.map(|_| ())
+    }
+
+    // --- firewall --------------------------------------------------------
+
+    /// Apply (or remove) the VM's host-side nftables firewall. Traffic is
+    /// matched on the VM's NIC MAC addresses inside libvirt's per-bridge
+    /// forward chains, so rules follow the VM across its bridges without ever
+    /// touching the host's own input/output path.
+    ///
+    /// The ruleset is written as a batch file under the state dir and applied
+    /// with `nft -f`; removal replaces the chain with an empty one rather than
+    /// deleting it, which is idempotent and needs no table/chain probing.
+    pub async fn apply_firewall(&self, id: &str, vm: &Vm, enabled: bool) -> ApiResult<()> {
+        // vm.id feeds file paths and nft identifiers: sanitize before use.
+        let safe_id = ensure_safe_id(id)?;
+        let table = format!("daygleve_vm_{}", safe_id.replace('-', "_"));
+
+        let batch = if enabled {
+            nft_firewall_batch(&table, &vm.firewall, &vm.nics)?
+        } else {
+            // Removal: flush the chain (cheap, no dependency probing), then the
+            // table is left empty and harmless until the next apply.
+            format!(
+                "add table {table}\nadd chain {table} forward {{ type filter hook forward priority -100; }}\nflush chain {table} forward\n"
+            )
+        };
+        self.run_nft_batch(safe_id, &batch).await
+    }
+
+    /// Write an nft batch file under the state dir and apply it. The path is
+    /// built from the sanitized id so the broker-side path check accepts it.
+    async fn run_nft_batch(&self, safe_id: &str, batch: &str) -> ApiResult<()> {
+        let dir = self.config.state_dir.join("firewall");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AppError::internal(format!("create {}: {e}", dir.display())))?;
+        let path = dir.join(format!("{safe_id}.nft"));
+        tokio::fs::write(&path, batch)
+            .await
+            .map_err(|e| AppError::internal(format!("write {}: {e}", path.display())))?;
+        let path_str = path.to_string_lossy().into_owned();
+        let result = command::run_ok("nft", &["-f", &path_str]).await;
+        // Keep the file for auditability; the state dir is backend-private.
+        result
+    }
+
+    // --- cloud-init -------------------------------------------------------
+
+    /// Generate a cloud-init NoCloud seed ISO from the request and return its
+    /// host path. The ISO carries `meta-data` (instance id + hostname) and
+    /// `user-data` (default user, SSH keys, static network, optional password)
+    /// and is attached to the VM as a second CD-ROM (`sdab`).
+    ///
+    /// Generation shells out to `genisoimage` (or `xorriso` as a fallback), the
+    /// same tools the appliance uses to build its own installer ISO. The output
+    /// path is derived from the sanitized VM name under the state dir, so it
+    /// cannot escape the state dir and the broker path check accepts it.
+    async fn create_cloud_init_iso(
+        &self,
+        vm_name: &str,
+        req: &CloudInitRequest,
+    ) -> ApiResult<String> {
+        let safe_name = ensure_safe_id(vm_name)?;
+        validate_cloud_init(req)?;
+
+        let dir = self.config.state_dir.join("cloud-init");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AppError::internal(format!("create {}: {e}", dir.display())))?;
+        let seed_dir = dir.join(safe_name);
+        tokio::fs::create_dir_all(&seed_dir)
+            .await
+            .map_err(|e| AppError::internal(format!("create {}: {e}", seed_dir.display())))?;
+
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let meta_data = cloud_init_meta_data(req, &instance_id);
+        let user_data = cloud_init_user_data(req);
+
+        let meta_path = seed_dir.join("meta-data");
+        let user_path = seed_dir.join("user-data");
+        tokio::fs::write(&meta_path, meta_data)
+            .await
+            .map_err(|e| AppError::internal(format!("write {}: {e}", meta_path.display())))?;
+        tokio::fs::write(&user_path, user_data)
+            .await
+            .map_err(|e| AppError::internal(format!("write {}: {e}", user_path.display())))?;
+
+        let iso_path = dir.join(format!("{safe_name}-seed.iso"));
+        let iso_str = iso_path.to_string_lossy().into_owned();
+        let seed_dir_str = seed_dir.to_string_lossy().into_owned();
+
+        // Prefer genisoimage; fall back to xorriso's mkisofs emulation.
+        let made = command::run_optional(
+            "genisoimage",
+            &[
+                "-quiet",
+                "-output",
+                &iso_str,
+                "-volid",
+                "cidata",
+                "-joliet",
+                "-rock",
+                &seed_dir_str,
+            ],
+        )
+        .await;
+        let made = match made {
+            Ok(Some(_)) => true,
+            Ok(None) => command::run_ok(
+                "xorriso",
+                &[
+                    "-as",
+                    "mkisofs",
+                    "-quiet",
+                    "-output",
+                    &iso_str,
+                    "-volid",
+                    "cidata",
+                    "-joliet",
+                    "-rock",
+                    &seed_dir_str,
+                ],
+            )
+            .await
+            .is_ok(),
+            Err(e) => return Err(e),
+        };
+        if !made {
+            return Err(AppError::hypervisor(
+                "could not generate the cloud-init seed ISO (install genisoimage or xorriso)",
+            ));
+        }
+        Ok(iso_str)
+    }
+
+    // --- disk resize / hotplug --------------------------------------------
+
+    /// Grow a disk's backing zvol and, when the VM is running, tell QEMU about
+    /// the new size (`virsh blockresize`) so the guest sees it without a
+    /// restart. Shrinking is rejected: it truncates data beyond the boundary.
+    pub async fn resize_disk(
+        &self,
+        id: &str,
+        index: usize,
+        req: ResizeVmDiskRequest,
+    ) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        let disk = vm
+            .disks
+            .get(index)
+            .ok_or_else(|| AppError::not_found(format!("vm {id} has no disk at index {index}")))?;
+        let dataset = ensure_safe_zfs_dataset(disk.dataset.trim())?;
+        if req.size_gib == 0 {
+            return Err(AppError::validation("size_gib must be >= 1"));
+        }
+        if req.size_gib < disk.size_gib {
+            return Err(AppError::validation(
+                "shrinking a disk is not supported; specify a larger size_gib",
+            ));
+        }
+        if req.size_gib == disk.size_gib {
+            return Ok(vm);
+        }
+
+        let new_size = format!("{}G", req.size_gib);
+        command::run_ok("zfs", &["set", &format!("volsize={new_size}"), dataset]).await?;
+
+        // The zvol is grown; if telling the live guest fails (agent/qemu busy,
+        // VM powering off), the size is still persisted — the guest picks the
+        // new size up on its next start.
+        let target = disk_target_name(index, disk.bus);
+        if self.live_state(id).await == Some(VmState::Running) {
+            if let Err(e) = self
+                .virsh(&["blockresize", id, &target, &format!("{}G", req.size_gib)])
+                .await
+            {
+                tracing::warn!(
+                    vm_id = %id,
+                    disk = %target,
+                    error = %e.message(),
+                    "guest block resize notification failed; the guest sees the new size on next start"
+                );
+            }
+        }
+
+        vm.disks[index].size_gib = req.size_gib;
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        Ok(vm)
+    }
+
+    /// Hot-attach an additional disk to a running (or stopped) VM: provision
+    /// the zvol, then `virsh attach-disk`. The disk is appended to the VM's
+    /// record so the next `define` renders it into the persistent XML too.
+    pub async fn attach_disk(&self, id: &str, disk: VmDisk) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        validate_disks(std::slice::from_ref(&disk))?;
+        if vm.disks.len() >= 26 {
+            return Err(AppError::validation(
+                "the VM already has the maximum of 26 data disks",
+            ));
+        }
+        let index = vm.disks.len();
+        self.ensure_zvol(&disk).await?;
+
+        let running = self.live_state(id).await == Some(VmState::Running);
+        if running {
+            let target = disk_target_name(index, disk.bus);
+            let source = format!("/dev/zvol/{}", disk.dataset.trim());
+            self.virsh(&["attach-disk", id, &target, &source, "--persistent"])
+                .await?;
+        }
+
+        vm.disks.push(disk);
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        // Re-define so the persistent XML matches the record even when the VM
+        // was stopped (attach-disk only runs live).
+        if !running {
+            self.define(&vm).await?;
+        }
+        Ok(vm)
+    }
+
+    /// Detach a disk by index: `virsh detach-disk` when running, then remove it
+    /// from the record. The zvol and its data are intentionally left intact.
+    pub async fn detach_disk(&self, id: &str, index: usize) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        if index >= vm.disks.len() {
+            return Err(AppError::not_found(format!(
+                "vm {id} has no disk at index {index}"
+            )));
+        }
+        let running = self.live_state(id).await == Some(VmState::Running);
+        if running {
+            let disk = vm.disks[index].clone();
+            let target = disk_target_name(index, disk.bus);
+            if let Err(e) = self
+                .virsh(&["detach-disk", id, &target, "--persistent"])
+                .await
+            {
+                tracing::warn!(vm_id = %id, disk = %target, error = %e.message(), "live disk detach failed");
+                return Err(e);
+            }
+        }
+        vm.disks.remove(index);
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        if !running {
+            self.define(&vm).await?;
+        }
+        Ok(vm)
     }
 
     // --- snapshots -------------------------------------------------------
@@ -593,6 +1007,7 @@ impl KvmService {
                             used_bytes: 0,
                             description: None,
                             created_at: ts_from_unix(creation),
+                            snapshot_type: VmSnapshotType::Disk,
                         },
                         0,
                     )
@@ -606,17 +1021,75 @@ impl KvmService {
                 }
             }
         }
-        Ok(by_name
+        let mut snaps: Vec<VmSnapshot> = by_name
             .into_values()
             .filter(|(_, count)| disk_count > 0 && *count == disk_count)
             .map(|(snap, _)| snap)
-            .collect())
+            .collect();
+        // RAM-state snapshots live as `virsh save` images in the backend's own
+        // state dir, not as ZFS snapshots; list them alongside by name.
+        if let Ok(mut entries) =
+            tokio::fs::read_dir(self.config.state_dir.join("ram-snapshots")).await
+        {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("save") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if ensure_safe_snapshot(stem).is_err() {
+                    continue;
+                }
+                let meta = entry.metadata().await.ok();
+                let created = meta
+                    .as_ref()
+                    .and_then(|m| m.created().ok())
+                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+                    .unwrap_or_else(now_ts);
+                let description = tokio::fs::read_to_string(path.with_extension("json"))
+                    .await
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|v| {
+                        v.get("description")
+                            .and_then(|d| d.as_str().map(str::to_string))
+                    });
+                snaps.push(VmSnapshot {
+                    name: stem.to_string(),
+                    used_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                    description,
+                    created_at: created,
+                    snapshot_type: VmSnapshotType::Ram,
+                });
+            }
+        }
+        snaps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(snaps)
     }
 
-    /// Snapshot every one of the VM's disks under a single name. Works while the
-    /// VM is running (ZFS snapshots are crash-consistent); rollback is the guarded
-    /// operation, not capture.
+    /// Snapshot the VM under a single name.
+    ///
+    /// `disk` (the default) captures every backing ZFS dataset — works while the
+    /// VM is running (crash-consistent), and when the guest agent is connected
+    /// the guest's filesystems are frozen around the capture so the result is
+    /// application-consistent. `ram` additionally saves the guest's memory via
+    /// `virsh save` (running VMs only); restoring it resumes the VM from exactly
+    /// the captured point. Rollback is the guarded operation, not capture.
     pub async fn create_snapshot(
+        &self,
+        id: &str,
+        req: CreateVmSnapshotRequest,
+    ) -> ApiResult<VmSnapshot> {
+        match req.snapshot_type {
+            VmSnapshotType::Ram => self.create_ram_snapshot(id, req).await,
+            VmSnapshotType::Disk => self.create_disk_snapshot(id, req).await,
+        }
+    }
+
+    /// The `disk` capture path: a ZFS snapshot of every backing dataset.
+    async fn create_disk_snapshot(
         &self,
         id: &str,
         req: CreateVmSnapshotRequest,
@@ -634,6 +1107,19 @@ impl KvmService {
                 "a snapshot named {tag:?} already exists"
             )));
         }
+
+        // With the guest agent enabled and the VM running, freeze the guest's
+        // filesystems around the capture. Freeze is best-effort: an agent that
+        // isn't installed (yet) must not block a crash-consistent snapshot, and
+        // a failed thaw must be retried rather than fail the already-taken
+        // snapshot, so it is logged and surfaced via tracing only.
+        let frozen = vm.guest_agent && self.live_state(id).await == Some(VmState::Running);
+        if frozen {
+            if let Err(e) = self.fs_freeze(id).await {
+                tracing::warn!(vm_id = %id, error = %e.message(), "guest fs-freeze failed; continuing crash-consistent");
+            }
+        }
+
         // One `zfs snapshot` call over all disks captures them together, and is
         // atomic when the disks share a pool (the common single-node case). Across
         // pools ZFS still creates the whole set but not atomically, so on any
@@ -642,7 +1128,15 @@ impl KvmService {
         let targets: Vec<String> = datasets.iter().map(|d| format!("{d}@{tag}")).collect();
         let mut args: Vec<&str> = vec!["snapshot"];
         args.extend(targets.iter().map(String::as_str));
-        if let Err(e) = command::run_ok("zfs", &args).await {
+        let capture = command::run_ok("zfs", &args).await;
+
+        if frozen {
+            if let Err(e) = self.fs_thaw(id).await {
+                tracing::error!(vm_id = %id, error = %e.message(), "guest fs-thaw failed; guest filesystems may remain frozen");
+            }
+        }
+
+        if let Err(e) = capture {
             for target in &targets {
                 let _ = command::run_ok("zfs", &["destroy", target]).await;
             }
@@ -677,6 +1171,100 @@ impl KvmService {
             .ok_or_else(|| AppError::internal("snapshot created but could not be read back"))
     }
 
+    /// The `ram` capture path: `virsh save` writes the guest's memory and device
+    /// state to a host file, leaving the domain undefined-but-restartable from
+    /// that file. The capture is application-consistent by construction (the
+    /// guest CPUs are paused mid-flight, disk writes in flight are settled).
+    async fn create_ram_snapshot(
+        &self,
+        id: &str,
+        req: CreateVmSnapshotRequest,
+    ) -> ApiResult<VmSnapshot> {
+        let vm = self.get_stored(id).await?;
+        let tag = ensure_safe_snapshot(&req.name)?;
+        if self.live_state(id).await != Some(VmState::Running) {
+            return Err(AppError::conflict(
+                "a RAM-state snapshot requires the VM to be running",
+            ));
+        }
+        if self.list_snapshots(id).await?.iter().any(|s| s.name == tag) {
+            return Err(AppError::conflict(format!(
+                "a snapshot named {tag:?} already exists"
+            )));
+        }
+
+        let path = self.ram_snapshot_path(tag)?;
+        let path_str = path.to_string_lossy().into_owned();
+        if let Err(e) = self.virsh(&["save", id, &path_str]).await {
+            // A partially written save image is useless; drop it.
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(e);
+        }
+
+        if let Some(desc) = req.description.as_deref().filter(|d| !d.trim().is_empty()) {
+            // Best-effort sidecar metadata; a failed write must not fail the
+            // already-captured snapshot.
+            let _ = tokio::fs::write(
+                path.with_extension("json"),
+                serde_json::json!({
+                    "description": desc.trim(),
+                    "created_at": now_ts(),
+                    "vm_id": vm.id,
+                })
+                .to_string(),
+            )
+            .await;
+        }
+
+        // Save leaves the domain "shut off" from libvirt's perspective; report
+        // that so the UI shows the VM as stopped-with-saved-state.
+        let mut stored = self.get_stored(id).await?;
+        stored.state = self.live_state(id).await.unwrap_or(VmState::Stopped);
+        stored.updated_at = Some(now_ts());
+        self.store.put(id, &stored).await?;
+
+        let meta = tokio::fs::metadata(&path).await.ok();
+        Ok(VmSnapshot {
+            name: tag.to_string(),
+            used_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            description: req.description,
+            created_at: now_ts(),
+            snapshot_type: VmSnapshotType::Ram,
+        })
+    }
+
+    /// Restore a RAM-state snapshot: resume the VM from a `virsh save` image.
+    /// Restoring is destructive of the VM's current running state by design.
+    pub async fn restore_ram_snapshot(&self, id: &str, name: &str) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        let tag = ensure_safe_snapshot(name)?;
+        let path = self.ram_snapshot_path(tag)?;
+        if !path.exists() {
+            return Err(AppError::not_found(format!(
+                "no RAM-state snapshot named {tag:?}"
+            )));
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        self.virsh(&["restore", &path_str]).await?;
+
+        vm.state = self.live_state(id).await.unwrap_or(VmState::Running);
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        Ok(vm)
+    }
+
+    /// Host path of a RAM-state snapshot's save image. Names are validated
+    /// through [`ensure_safe_snapshot`] before reaching here, and the parent
+    /// directory is the backend's own state dir, so the path cannot escape.
+    fn ram_snapshot_path(&self, tag: &str) -> ApiResult<std::path::PathBuf> {
+        ensure_safe_id(tag)?;
+        Ok(self
+            .config
+            .state_dir
+            .join("ram-snapshots")
+            .join(format!("{tag}.save")))
+    }
+
     /// Roll every disk back to the named snapshot. Destructive of any newer
     /// snapshots (`zfs rollback -r`) and only allowed while the VM is stopped.
     pub async fn rollback_snapshot(&self, id: &str, name: &str) -> ApiResult<()> {
@@ -696,10 +1284,22 @@ impl KvmService {
         Ok(())
     }
 
-    /// Delete the named snapshot from every disk it covers.
+    /// Delete the named snapshot. For a `disk` snapshot this destroys the
+    /// `dataset@tag` ZFS snapshot on every disk; for a `ram` snapshot it removes
+    /// the `virsh save` image (and sidecar metadata) from the host.
     pub async fn delete_snapshot(&self, id: &str, name: &str) -> ApiResult<()> {
         let vm = self.get_stored(id).await?;
         let tag = ensure_safe_snapshot(name)?;
+
+        let ram_path = self.ram_snapshot_path(tag)?;
+        if ram_path.exists() {
+            tokio::fs::remove_file(&ram_path)
+                .await
+                .map_err(|e| AppError::internal(format!("remove {}: {e}", ram_path.display())))?;
+            let _ = tokio::fs::remove_file(ram_path.with_extension("json")).await;
+            return Ok(());
+        }
+
         // As with rollback, verify the snapshot on every disk up front so a
         // partial snapshot is a 404 rather than a half-completed destroy.
         let datasets = snapshot_datasets(&vm)?;
@@ -1140,6 +1740,263 @@ fn parse_vnc_display(display: &str) -> Option<String> {
     Some(format!("{host}:{}", 5900 + n))
 }
 
+/// Guest-visible target name for disk `index` on `bus`, matching what
+/// [`domain_xml`] renders for the same position (single-letter scheme) plus
+/// the two-letter CD-ROMs at the end of the SATA alphabet.
+fn disk_target_name(index: usize, bus: DiskBus) -> String {
+    disk_target(bus, index).0
+}
+
+/// Extract one `key: value` field from `virsh qemu-agent-command` guest-info
+/// output. Values may carry a trailing comma; both are trimmed.
+fn parse_guest_info_field(output: &str, key: &str) -> Option<String> {
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim() == key {
+                let value = v.trim().trim_end_matches(',').trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Pull the IPv4/IPv6 addresses out of `virsh domifaddr --source agent` output.
+/// A row looks like: `lo    00:00:00:00:00:00    ipv4    127.0.0.1/8`.
+fn parse_domifaddr_ips(output: &str) -> Vec<String> {
+    let mut ips = Vec::new();
+    for line in output.lines().skip(2) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 || cols[2] != "ipv4" && cols[2] != "ipv6" {
+            continue;
+        }
+        let addr = cols[3].split('/').next().unwrap_or_default();
+        if !addr.is_empty() && !ips.contains(&addr.to_string()) {
+            ips.push(addr.to_string());
+        }
+    }
+    ips
+}
+
+/// Validate a firewall config before its values reach nftables: MACs already
+/// come from validated NICs, but CIDRs and the enabled/rule invariants must be
+/// checked here.
+fn validate_firewall(fw: &VmFirewall) -> ApiResult<()> {
+    for rule in &fw.rules {
+        match rule.action {
+            VmFirewallAction::AcceptAll | VmFirewallAction::DropAll => {
+                if rule.cidr.is_some() {
+                    return Err(AppError::validation(
+                        "accept_all/drop_all rules must not carry a cidr",
+                    ));
+                }
+            }
+            VmFirewallAction::Accept | VmFirewallAction::Drop => {
+                let cidr = rule
+                    .cidr
+                    .as_deref()
+                    .ok_or_else(|| AppError::validation("accept/drop rules require a cidr"))?;
+                ensure_safe_cidr(cidr, "firewall rule cidr")?;
+            }
+        }
+        if let Some(cidr) = rule.cidr.as_deref() {
+            ensure_safe_cidr(cidr, "firewall rule cidr")?;
+        }
+    }
+    Ok(())
+}
+
+/// Render the nftables batch for one VM. The chain hooks `forward` at a lower
+/// priority than the base chain, matching on the guest's NIC MAC addresses via
+/// `ether saddr`/`ether daddr`, so host-local traffic is never filtered and the
+/// rules survive bridge renames. Return traffic for established connections is
+/// accepted first; then rules apply in order; unmatched traffic is dropped.
+/// `table` is the table *name* (no family); the `inet` family is used so the
+/// same rules cover IPv4 and IPv6.
+fn nft_firewall_batch(table: &str, fw: &VmFirewall, nics: &[VmNic]) -> ApiResult<String> {
+    let macs: Vec<&str> = nics
+        .iter()
+        .filter_map(|n| n.mac.as_deref())
+        .filter(|m| ensure_safe_mac(m).is_ok())
+        .collect();
+    if macs.is_empty() {
+        return Err(AppError::validation(
+            "firewall requires at least one NIC with a valid MAC address",
+        ));
+    }
+    // The chain name derives from the table name, which must already be a
+    // single token (built from the sanitized VM id upstream).
+    if table.chars().any(|c| c.is_whitespace()) {
+        return Err(AppError::internal(
+            "firewall table name must be a single token",
+        ));
+    }
+    let chain = format!("vm_{table}_rules");
+
+    let mut b = String::new();
+    b.push_str(&format!("add table inet {table}\n"));
+    b.push_str(&format!(
+        "add chain inet {table} forward {{ type filter hook forward priority -100; }}\n"
+    ));
+    b.push_str(&format!("flush chain inet {table} forward\n"));
+
+    let mut mac_match = String::new();
+    for (i, mac) in macs.iter().enumerate() {
+        if i > 0 {
+            mac_match.push_str(" || ");
+        }
+        mac_match.push_str(&format!("ether saddr {mac} || ether daddr {mac}"));
+    }
+    // Established/related return traffic first, then everything this VM's MACs
+    // own falls through to the user rules; anything else in this chain is left
+    // to later hooks (the chain only ever judges the VM's own traffic).
+    b.push_str(&format!(
+        "add rule inet {table} forward ct state established,related accept\n"
+    ));
+    b.push_str(&format!(
+        "add rule inet {table} forward {mac_match} jump {chain}\n"
+    ));
+    b.push_str(&format!("add rule inet {table} forward {mac_match} drop\n"));
+
+    b.push_str(&format!("add chain inet {table} {chain}\n"));
+    for rule in &fw.rules {
+        let verdict = match rule.action {
+            VmFirewallAction::Accept | VmFirewallAction::AcceptAll => "accept",
+            VmFirewallAction::Drop | VmFirewallAction::DropAll => "drop",
+        };
+        let dir = match rule.direction {
+            // Outbound from the guest: our MAC is the source.
+            VmFirewallDirection::Out => "ether saddr",
+            // Inbound to the guest: our MAC is the destination.
+            VmFirewallDirection::In => "ether daddr",
+        };
+        // Inbound rules match on the packet's source address; outbound rules
+        // match on its destination. `*_all` rules carry no CIDR at all.
+        let cidr_part = rule
+            .cidr
+            .as_deref()
+            .map(|c| match rule.direction {
+                VmFirewallDirection::In => format!("ip saddr {c}"),
+                VmFirewallDirection::Out => format!("ip daddr {c}"),
+            })
+            .unwrap_or_default();
+        let mut parts: Vec<&str> = vec![dir];
+        if !cidr_part.is_empty() {
+            parts.push(cidr_part.trim());
+        }
+        parts.push(verdict);
+        b.push_str(&format!(
+            "add rule inet {table} {chain} {}\n",
+            parts.join(" ")
+        ));
+    }
+    Ok(b)
+}
+
+/// Validate cloud-init inputs before they are rendered into the seed files:
+/// the values end up in YAML read by the guest, so no control characters, and
+/// every CIDR/address is checked host-side.
+fn validate_cloud_init(req: &CloudInitRequest) -> ApiResult<()> {
+    if let Some(hostname) = req.hostname.as_deref() {
+        ensure_safe_id(hostname)?;
+    }
+    if let Some(user) = req.default_user.as_deref() {
+        ensure_safe_id(user)?;
+    }
+    for key in &req.ssh_keys {
+        if key.is_empty() || key.len() > 4096 || key.chars().any(|c| c.is_control()) {
+            return Err(AppError::validation(
+                "ssh key must be a single-line OpenSSH public key",
+            ));
+        }
+    }
+    if let Some(net) = req.network.as_ref() {
+        ensure_safe_cidr(&net.address, "cloud-init network address")?;
+        if let Some(gw) = net.gateway.as_deref() {
+            // The gateway is a bare address, not CIDR notation.
+            if gw.parse::<std::net::IpAddr>().is_err() {
+                return Err(AppError::validation(
+                    "cloud-init gateway contains an invalid address",
+                ));
+            }
+        }
+        ensure_safe_id(&net.interface)?;
+        for dns in &net.dns {
+            if dns.chars().any(|c| c.is_control() || c == ':') || dns.trim().is_empty() {
+                return Err(AppError::validation(
+                    "cloud-init DNS servers must be plain IPv4 addresses",
+                ));
+            }
+        }
+    }
+    if let Some(pw) = req.root_password.as_deref() {
+        if base64::Engine::decode(&base64::engine::general_purpose::STANDARD, pw).is_err() {
+            return Err(AppError::validation("root_password must be base64-encoded"));
+        }
+    }
+    Ok(())
+}
+
+/// Render the NoCloud `meta-data` file (instance id + local hostname).
+fn cloud_init_meta_data(req: &CloudInitRequest, instance_id: &str) -> String {
+    let hostname = req.hostname.as_deref().unwrap_or("daygleve-vm");
+    format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n")
+}
+
+/// Render the NoCloud `user-data` file. Values were validated by
+/// [`validate_cloud_init`] before this is called.
+fn cloud_init_user_data(req: &CloudInitRequest) -> String {
+    let user = req
+        .default_user
+        .clone()
+        .unwrap_or_else(|| "daygleve".to_string());
+    let mut b = String::from("#cloud-config\n");
+    b.push_str(&format!(
+        "hostname: {}\n",
+        req.hostname.as_deref().unwrap_or("daygleve-vm")
+    ));
+    b.push_str("manage_etc_hosts: true\n");
+    b.push_str("users:\n");
+    b.push_str(&format!(
+        "  - name: {user}\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    groups: sudo\n    shell: /bin/bash\n    lock_passwd: true\n"
+    ));
+    if !req.ssh_keys.is_empty() {
+        b.push_str("ssh_authorized_keys:\n");
+        for key in &req.ssh_keys {
+            b.push_str(&format!("    - {key}\n"));
+        }
+    }
+    if let Some(net) = req.network.as_ref() {
+        b.push_str("write_files:\n");
+        b.push_str("  - path: /etc/network/interfaces.d/50-cloud-init\n");
+        b.push_str("    permissions: '0644'\n    content: |\n");
+        b.push_str(&format!("      auto {}\n", net.interface));
+        b.push_str(&format!("      iface {} inet static\n", net.interface));
+        b.push_str(&format!("      address {}\n", net.address));
+        if let Some(gw) = net.gateway.as_deref() {
+            b.push_str(&format!("      gateway {gw}\n"));
+        }
+        if !net.dns.is_empty() {
+            b.push_str(&format!("      dns-nameservers {}\n", net.dns.join(" ")));
+        }
+    }
+    if let Some(pw) = req.root_password.as_deref() {
+        // Already validated as base64; chpasswd expects `user:plaintext`,
+        // so decode here and embed via the plain chpasswd list format.
+        if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, pw)
+        {
+            let plain = String::from_utf8_lossy(&decoded);
+            b.push_str("chpasswd:\n  expire: false\n  users:\n");
+            b.push_str(&format!("    - name: {user}\n      password: {plain}\n"));
+            b.push_str(&format!("    - name: root\n      password: {plain}\n"));
+        }
+    }
+    b
+}
+
 /// Render libvirt domain XML for a VM.
 fn domain_xml(vm: &Vm) -> String {
     // When an install ISO is attached, boot order is expressed per-device
@@ -1173,13 +2030,22 @@ fn domain_xml(vm: &Vm) -> String {
         })
         .collect();
     let cdrom: String = vm.cdrom.as_deref().map(cdrom_xml).unwrap_or_default();
+    let cloud_init_cdrom: String = vm
+        .cloud_init_iso
+        .as_deref()
+        .map(cloud_init_cdrom_xml)
+        .unwrap_or_default();
     let nics: String = vm.nics.iter().map(nic_xml).collect();
     let hostdevs: String = vm
         .gpus
         .iter()
         .filter_map(|g| pci_hostdev_xml(&g.pci_address))
         .collect();
-
+    let guest_agent_channel: String = if vm.guest_agent {
+        guest_agent_channel_xml()
+    } else {
+        String::new()
+    };
     let description = vm
         .description
         .as_deref()
@@ -1203,7 +2069,8 @@ fn domain_xml(vm: &Vm) -> String {
         <on_crash>destroy</on_crash>\n  \
         <devices>\n    \
         <emulator>/usr/bin/qemu-system-x86_64</emulator>\n\
-        {disks}{cdrom}{nics}{hostdevs}    \
+        {disks}{cdrom}{cloud_init_cdrom}{nics}{hostdevs}    \
+        {guest_agent_channel}    \
         <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>\n    \
         <video><model type='virtio' heads='1'/></video>\n    \
         <memballoon model='virtio'/>\n    \
@@ -1218,8 +2085,10 @@ fn domain_xml(vm: &Vm) -> String {
         os = os,
         disks = disks,
         cdrom = cdrom,
+        cloud_init_cdrom = cloud_init_cdrom,
         nics = nics,
         hostdevs = hostdevs,
+        guest_agent_channel = guest_agent_channel,
     )
 }
 
@@ -1254,6 +2123,34 @@ fn cdrom_xml(iso_path: &str) -> String {
         </disk>\n",
         iso = xml_escape(iso_path),
     )
+}
+
+/// A cloud-init NoCloud seed ISO attached as a second CD-ROM. Uses target `sdab` so
+/// it never collides with the install-media CD-ROM at `sdaa` or data disks.
+fn cloud_init_cdrom_xml(iso_path: &str) -> String {
+    format!(
+        "    <disk type='file' device='cdrom'>\n      \
+        <driver name='qemu' type='raw'/>\n      \
+        <source file='{iso}'/>\n        <target dev='sdab' bus='sata'/>\n      \
+        <readonly/>\n    \
+        </disk>\n",
+        iso = xml_escape(iso_path),
+    )
+}
+
+/// The virtio-serial QEMU guest agent channel. This gives the guest a named serial
+/// channel the qemu-guest-agent daemon connects to. The unix socket source is
+/// deliberately omitted: libvirt then auto-allocates
+/// `/var/lib/libvirt/qemu/channel/target/<domain>-org.qemu.guest_agent.0` with the
+/// correct ownership and SELinux/AppArmor labels, which a hand-built path would
+/// not get. Without this element the guest agent cannot communicate with the
+/// hypervisor; with it the guest can report IPs, accept shutdown requests, and
+/// participate in fs-freeze/thaw for consistent snapshots.
+fn guest_agent_channel_xml() -> String {
+    "    <channel type='unix'>\n      \
+        <target type='virtio' name='org.qemu.guest_agent.0'/>\n    \
+        </channel>\n"
+        .to_string()
 }
 
 fn disk_target(bus: DiskBus, index: usize) -> (String, &'static str) {
@@ -1315,6 +2212,8 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use daygleve_schema::vm::VmFirewallRule;
 
     fn sample_vm() -> Vm {
         Vm {
@@ -1332,7 +2231,10 @@ mod tests {
             nics: vec![],
             gpus: vec![],
             cdrom: None,
+            cloud_init_iso: None,
             description: None,
+            guest_agent: false,
+            firewall: VmFirewall::default(),
             created_at: now_ts(),
             updated_at: None,
         }
@@ -1441,5 +2343,192 @@ mod tests {
             ts.starts_with("2026-09-04T00:00:00"),
             "unexpected timestamp: {ts}"
         );
+    }
+
+    #[test]
+    fn domain_xml_renders_guest_agent_and_cloud_init_channels() {
+        let mut vm = sample_vm();
+        vm.guest_agent = true;
+        vm.cloud_init_iso = Some("/var/lib/daygleve/cloud-init/web01-seed.iso".to_string());
+        let xml = domain_xml(&vm);
+        // The agent channel targets the well-known virtio name and lets libvirt
+        // allocate the unix socket itself.
+        assert!(xml.contains("<channel type='unix'>"));
+        assert!(xml.contains("<target type='virtio' name='org.qemu.guest_agent.0'/>"));
+        // The NoCloud seed rides a second SATA CD-ROM outside the data-disk
+        // target scheme, and carries no boot order (never a boot device).
+        assert!(xml.contains("<target dev='sdab' bus='sata'/>"));
+        assert!(xml.contains("<source file='/var/lib/daygleve/cloud-init/web01-seed.iso'/>"));
+        // Disabled agent renders no channel at all.
+        let mut off = sample_vm();
+        off.guest_agent = false;
+        assert!(!domain_xml(&off).contains("<channel"));
+    }
+
+    #[test]
+    fn nft_firewall_batch_filters_only_vm_traffic() {
+        let mut vm = sample_vm();
+        vm.nics.push(VmNic {
+            bridge: "vmbr0".to_string(),
+            vlan: None,
+            mac: Some("52:54:00:12:34:56".to_string()),
+            model: NicModel::Virtio,
+        });
+        vm.firewall = VmFirewall {
+            enabled: true,
+            rules: vec![
+                VmFirewallRule {
+                    direction: VmFirewallDirection::In,
+                    action: VmFirewallAction::Accept,
+                    cidr: Some("192.168.1.0/24".to_string()),
+                    description: None,
+                },
+                VmFirewallRule {
+                    direction: VmFirewallDirection::Out,
+                    action: VmFirewallAction::AcceptAll,
+                    cidr: None,
+                    description: None,
+                },
+            ],
+        };
+        let batch = nft_firewall_batch("daygleve_vm_x", &vm.firewall, &vm.nics).unwrap();
+        assert!(batch.contains("add table inet daygleve_vm_x"));
+        assert!(batch.contains("hook forward priority -100"));
+        assert!(batch.contains("ct state established,related accept"));
+        assert!(batch.contains("ether saddr 52:54:00:12:34:56"));
+        assert!(batch.contains("ip saddr 192.168.1.0/24"));
+        // The outbound accept-all rule has no CIDR match, just the verdict;
+        // MACs are matched once in the jump rule, not repeated per rule.
+        assert!(batch.contains("vm_daygleve_vm_x_rules ether saddr accept"));
+        assert!(batch.contains("jump vm_daygleve_vm_x_rules"));
+    }
+
+    #[test]
+    fn nft_firewall_batch_requires_a_valid_mac() {
+        let fw = VmFirewall {
+            enabled: true,
+            rules: vec![],
+        };
+        assert!(nft_firewall_batch("t", &fw, &[]).is_err());
+        let bad = VmNic {
+            bridge: "vmbr0".to_string(),
+            vlan: None,
+            mac: Some("not-a-mac".to_string()),
+            model: NicModel::Virtio,
+        };
+        assert!(nft_firewall_batch("t", &fw, &[bad]).is_err());
+    }
+
+    #[test]
+    fn firewall_validation_enforces_cidr_rules() {
+        // accept/drop require a CIDR; *_all forbid one.
+        assert!(validate_firewall(&VmFirewall {
+            enabled: true,
+            rules: vec![VmFirewallRule {
+                direction: VmFirewallDirection::In,
+                action: VmFirewallAction::Accept,
+                cidr: None,
+                description: None,
+            }],
+        })
+        .is_err());
+        assert!(validate_firewall(&VmFirewall {
+            enabled: true,
+            rules: vec![VmFirewallRule {
+                direction: VmFirewallDirection::In,
+                action: VmFirewallAction::Accept,
+                cidr: Some("10.0.0.0/8".to_string()),
+                description: None,
+            }],
+        })
+        .is_ok());
+        assert!(validate_firewall(&VmFirewall {
+            enabled: true,
+            rules: vec![VmFirewallRule {
+                direction: VmFirewallDirection::Out,
+                action: VmFirewallAction::AcceptAll,
+                cidr: Some("10.0.0.0/8".to_string()),
+                description: None,
+            }],
+        })
+        .is_err());
+        assert!(validate_firewall(&VmFirewall {
+            enabled: true,
+            rules: vec![VmFirewallRule {
+                direction: VmFirewallDirection::Out,
+                action: VmFirewallAction::Drop,
+                cidr: Some("10.0.0.0/33".to_string()),
+                description: None,
+            }],
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn cloud_init_files_render_yaml_and_metadata() {
+        let req = CloudInitRequest {
+            hostname: Some("web01".to_string()),
+            network: Some(daygleve_schema::vm::CloudInitNetwork {
+                interface: "eth0".to_string(),
+                address: "192.168.1.10/24".to_string(),
+                gateway: Some("192.168.1.1".to_string()),
+                dns: vec!["192.168.1.1".to_string()],
+            }),
+            ssh_keys: vec!["ssh-ed25519 AAAA test@host".to_string()],
+            default_user: Some("deploy".to_string()),
+            root_password: None,
+        };
+        assert!(validate_cloud_init(&req).is_ok());
+        let meta = cloud_init_meta_data(&req, "iid-123");
+        assert!(meta.contains("instance-id: iid-123"));
+        assert!(meta.contains("local-hostname: web01"));
+        let user = cloud_init_user_data(&req);
+        assert!(user.starts_with("#cloud-config\n"));
+        assert!(user.contains("name: deploy"));
+        assert!(user.contains("- ssh-ed25519 AAAA test@host"));
+        assert!(user.contains("address 192.168.1.10/24"));
+        assert!(user.contains("gateway 192.168.1.1"));
+    }
+
+    #[test]
+    fn cloud_init_rejects_unsafe_values() {
+        let mut req = CloudInitRequest {
+            hostname: Some("../escape".to_string()),
+            network: None,
+            ssh_keys: vec![],
+            default_user: None,
+            root_password: None,
+        };
+        assert!(validate_cloud_init(&req).is_err());
+        req.hostname = Some("ok".to_string());
+        req.root_password = Some("not base64!".to_string());
+        assert!(validate_cloud_init(&req).is_err());
+        req.root_password = Some(base64::engine::general_purpose::STANDARD.encode("secret"));
+        assert!(validate_cloud_init(&req).is_ok());
+    }
+
+    #[test]
+    fn domifaddr_and_guest_info_parsers() {
+        let ips = parse_domifaddr_ips(
+            "Name       MAC address        Protocol     Address\n\nvirtio0  52:54:00:ab:cd:ef  ipv4   10.0.0.5/24\nvirtio0  52:54:00:ab:cd:ef  ipv6   fe80::1/64\n",
+        );
+        assert_eq!(ips, vec!["10.0.0.5", "fe80::1"]);
+        let info = "return: 0\npretty_name: Debian GNU/Linux 13\nversion: 1.2";
+        assert_eq!(
+            parse_guest_info_field(info, "pretty_name").as_deref(),
+            Some("Debian GNU/Linux 13")
+        );
+        assert_eq!(parse_guest_info_field(info, "missing"), None);
+    }
+
+    #[test]
+    fn ram_snapshot_paths_stay_in_state_dir() {
+        let config = Arc::new(crate::config::Config::from_env());
+        let service = KvmService::new(
+            config.clone(),
+            Arc::new(crate::services::shares::ShareService::new(config)),
+        );
+        assert!(service.ram_snapshot_path("pre-upgrade").is_ok());
+        assert!(service.ram_snapshot_path("../escape").is_err());
     }
 }

@@ -348,6 +348,12 @@ pub fn program_path(program: &str) -> Option<&'static str> {
         "lxc-stop" => "/usr/bin/lxc-stop",
         "lxc-unfreeze" => "/usr/bin/lxc-unfreeze",
         "mount" => "/usr/bin/mount",
+        // Per-VM firewall. Only `nft -f <file>` with a DaygleVE-generated batch
+        // file is accepted; the batch content is independently validated.
+        "nft" => "/usr/sbin/nft",
+        // Cloud-init NoCloud seed ISO generation.
+        "genisoimage" => "/usr/bin/genisoimage",
+        "xorriso" => "/usr/bin/xorriso",
         "umount" => "/usr/bin/umount",
         "virsh" => "/usr/bin/virsh",
         "zfs" => "/usr/sbin/zfs",
@@ -422,10 +428,20 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
                     | "reset"
                     | "pause"
                     | "resume"
-                    | "define"
+                    |                "define"
                     | "undefine"
                     | "domrename"
                     | "vncdisplay"
+                    // Guest agent + RAM-state snapshot + disk hotplug/resize.
+                    | "qemu-agent-command"
+                    | "domifaddr"
+                    | "domfsfreeze"
+                    | "domfsthaw"
+                    | "save"
+                    | "restore"
+                    | "blockresize"
+                    | "attach-disk"
+                    | "detach-disk"
             )
         ),
         "zfs" => matches!(
@@ -457,6 +473,10 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
         "bridge" => matches!(subcommand, Some("vlan")),
         "mount" => args.iter().any(|arg| arg == "-t"),
         "umount" => !args.is_empty(),
+        // Firewall: exactly `nft -f <batch file>` (optionally one `-y`). The
+        // batch file path is path-validated in validate_exec_args below.
+        "nft" => args.contains(&"-f".to_string()),
+        "genisoimage" | "xorriso" => true,
         _ => false,
     };
     if !allowed {
@@ -727,6 +747,31 @@ fn validate_exec_args(program: &str, args: &[String]) -> Result<(), String> {
             [target] if safe_abs_path(target, "/var/lib/daygleve/", None) => {}
             _ => return Err("umount target is outside DaygleVE state".to_string()),
         },
+        "nft" => {
+            // Only batch-file execution: `nft -f <path>`. Paths are constrained
+            // to DaygleVE's state dir so the backend can never flush/replace
+            // arbitrary rulesets through the broker.
+            let file = arg_after(args, "-f")
+                .ok_or_else(|| "nft requires -f with a batch file".to_string())?;
+            if !safe_abs_path(file, "/var/lib/daygleve/", None) {
+                return Err("nft batch file is outside DaygleVE state".to_string());
+            }
+            if args
+                .iter()
+                .any(|a| a.as_str() == "flush" || a.as_str() == "delete")
+            {
+                return Err("nft flush/delete is not permitted".to_string());
+            }
+        }
+        "genisoimage" | "xorriso" => {
+            // Seed-ISO generation: arguments are host paths under DaygleVE's
+            // state dir (input seed dir or output ISO) plus non-path options.
+            for arg in args {
+                if arg.starts_with('/') && !safe_abs_path(arg, "/var/lib/daygleve/", None) {
+                    return Err("ISO tool path is outside DaygleVE state".to_string());
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
