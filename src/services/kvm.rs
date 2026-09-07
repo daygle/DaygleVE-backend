@@ -87,6 +87,11 @@ impl KvmService {
 
     pub async fn create(&self, req: CreateVmRequest) -> ApiResult<Vm> {
         validate_vm_request(&req)?;
+        // A template is a clone-only golden image; it is never powered on, so
+        // reject the contradictory "create as template and start it" request.
+        if req.template && req.start {
+            return Err(AppError::validation("a template cannot be started"));
+        }
         let nics = normalize_nics(req.nics)?;
         validate_gpu_assignments(&req.gpus)?;
 
@@ -135,6 +140,11 @@ impl KvmService {
             description: req.description,
             guest_agent: req.guest_agent,
             firewall: req.firewall,
+            // A template never runs, so it is never autostarted regardless of the
+            // requested flag.
+            template: req.template,
+            autostart: req.autostart && !req.template,
+            startup_order: req.startup_order,
             created_at: now_ts(),
             updated_at: None,
         };
@@ -277,6 +287,26 @@ impl KvmService {
             let old_iso = vm.cloud_init_iso.replace(new_iso);
             if let Some(old) = old_iso {
                 let _ = tokio::fs::remove_file(&old).await;
+            }
+        }
+
+        if let Some(startup_order) = req.startup_order {
+            vm.startup_order = Some(startup_order);
+        }
+        if let Some(autostart) = req.autostart {
+            vm.autostart = autostart;
+        }
+        if let Some(template) = req.template {
+            // Converting a running VM into a template makes no sense (a template
+            // is never running), so require it stopped first. A template is also
+            // never autostarted.
+            if template && !vm.template {
+                self.require_stopped(&vm, "converting it to a template")
+                    .await?;
+            }
+            vm.template = template;
+            if template {
+                vm.autostart = false;
             }
         }
 
@@ -432,6 +462,11 @@ impl KvmService {
             description: req.description.or(src.description.clone()),
             guest_agent: false,
             firewall: VmFirewall::default(),
+            // A clone is a fresh, runnable VM — never a template — and does not
+            // inherit the source's autostart intent.
+            template: false,
+            autostart: false,
+            startup_order: None,
             created_at: now_ts(),
             updated_at: None,
         };
@@ -521,6 +556,9 @@ impl KvmService {
                 state: VmState::Stopped,
                 vcpus: 0,
                 memory_mib: 0,
+                // Host-only domains carry no DaygleVE template/autostart intent.
+                template: false,
+                autostart: false,
                 created_at: now_ts(),
             });
         }
@@ -529,6 +567,18 @@ impl KvmService {
 
     pub async fn power(&self, id: &str, action: VmPowerAction) -> ApiResult<VmPowerResponse> {
         let mut vm = self.get_stored(id).await?;
+        // A template is a clone-only golden image and must never run. Block any
+        // power action that would start or resume it; clone it instead.
+        if vm.template
+            && matches!(
+                action,
+                VmPowerAction::Start | VmPowerAction::Resume | VmPowerAction::Reboot
+            )
+        {
+            return Err(AppError::conflict(
+                "this VM is a template and cannot be powered on; clone it first",
+            ));
+        }
         let subcommand = match action {
             VmPowerAction::Start => "start",
             VmPowerAction::Stop => "destroy",
@@ -575,6 +625,47 @@ impl KvmService {
             Vec::new()
         };
         Ok(VmPowerResponse { vm, guest_ips })
+    }
+
+    /// Start every autostart-enabled VM in order, once, at host boot. VMs are
+    /// started lowest `startup_order` first (unordered VMs last, then by
+    /// creation time), skipping templates and any VM already running. Failures
+    /// are logged and never abort the sequence — one guest that won't start must
+    /// not block the rest. Intended to be spawned from startup, not awaited on
+    /// the request path.
+    pub async fn start_autostart_vms(&self) {
+        /// Pause between starts so a burst of boots doesn't hammer the host all
+        /// at once (a lightweight stand-in for per-VM start delays).
+        const BETWEEN_STARTS: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let vms: Vec<Vm> = match self.store.list().await {
+            Ok(vms) => vms,
+            Err(e) => {
+                tracing::error!(error = %e.message(), "autostart: could not read VM records");
+                return;
+            }
+        };
+        let queue = autostart_queue(vms);
+        if queue.is_empty() {
+            return;
+        }
+        tracing::info!(count = queue.len(), "autostart: starting VMs on boot");
+        let mut first = true;
+        for vm in queue {
+            if self.live_state(&vm.id).await == Some(VmState::Running) {
+                continue;
+            }
+            if !first {
+                tokio::time::sleep(BETWEEN_STARTS).await;
+            }
+            first = false;
+            match self.virsh(&["start", &vm.id]).await {
+                Ok(_) => tracing::info!(vm_id = %vm.id, name = %vm.name, "autostart: started"),
+                Err(e) => {
+                    tracing::error!(vm_id = %vm.id, name = %vm.name, error = %e.message(), "autostart: failed to start")
+                }
+            }
+        }
     }
 
     pub async fn console(&self, id: &str) -> ApiResult<ConsoleTicket> {
@@ -1632,6 +1723,23 @@ fn validate_gpu_assignments(gpus: &[daygleve_schema::gpu::GpuAssignment]) -> Api
     Ok(())
 }
 
+/// The ordered set of VMs to bring up at host boot: autostart-enabled,
+/// non-template VMs, lowest `startup_order` first (unordered last), stable by
+/// creation time.
+fn autostart_queue(vms: Vec<Vm>) -> Vec<Vm> {
+    let mut queue: Vec<Vm> = vms
+        .into_iter()
+        .filter(|vm| vm.autostart && !vm.template)
+        .collect();
+    queue.sort_by(|a, b| {
+        a.startup_order
+            .unwrap_or(u32::MAX)
+            .cmp(&b.startup_order.unwrap_or(u32::MAX))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    queue
+}
+
 fn summary_of(vm: &Vm) -> VmSummary {
     VmSummary {
         id: vm.id.clone(),
@@ -1639,6 +1747,8 @@ fn summary_of(vm: &Vm) -> VmSummary {
         state: vm.state,
         vcpus: vm.vcpus,
         memory_mib: vm.memory_mib,
+        template: vm.template,
+        autostart: vm.autostart,
         created_at: vm.created_at.clone(),
     }
 }
@@ -2235,9 +2345,54 @@ mod tests {
             description: None,
             guest_agent: false,
             firewall: VmFirewall::default(),
+            template: false,
+            autostart: false,
+            startup_order: None,
             created_at: now_ts(),
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn autostart_queue_orders_and_filters() {
+        let mk =
+            |name: &str, autostart: bool, template: bool, order: Option<u32>, created: &str| {
+                let mut vm = sample_vm();
+                vm.id = new_id();
+                vm.name = name.to_string();
+                vm.autostart = autostart;
+                vm.template = template;
+                vm.startup_order = order;
+                vm.created_at = created.to_string();
+                vm
+            };
+        let vms = vec![
+            mk(
+                "no-autostart",
+                false,
+                false,
+                Some(1),
+                "2020-01-01T00:00:00Z",
+            ),
+            mk("template", true, true, Some(0), "2020-01-01T00:00:00Z"),
+            mk("third-unordered", true, false, None, "2020-01-03T00:00:00Z"),
+            mk("second", true, false, Some(20), "2020-01-01T00:00:00Z"),
+            mk("first", true, false, Some(5), "2020-01-01T00:00:00Z"),
+            mk(
+                "fourth-unordered",
+                true,
+                false,
+                None,
+                "2020-01-04T00:00:00Z",
+            ),
+        ];
+        let order: Vec<String> = autostart_queue(vms).into_iter().map(|vm| vm.name).collect();
+        // Templates and non-autostart VMs are excluded; ordered VMs come first
+        // (5 then 20), then unordered VMs by creation time.
+        assert_eq!(
+            order,
+            vec!["first", "second", "third-unordered", "fourth-unordered"]
+        );
     }
 
     #[test]

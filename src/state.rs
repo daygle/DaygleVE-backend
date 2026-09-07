@@ -39,6 +39,12 @@ impl AppState {
             );
         }
         services.backup.start_scheduler(services.clone());
+        // Bring up autostart VMs in the background so a slow guest boot never
+        // blocks the API from starting to serve.
+        {
+            let services = services.clone();
+            tokio::spawn(async move { services.kvm.start_autostart_vms().await });
+        }
         let startup_job = services
             .operations
             .enqueue_reconciliation(
