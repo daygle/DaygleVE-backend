@@ -838,9 +838,10 @@ pub fn validate_lxc_name(name: &str) -> Result<(), String> {
 
 /// Validate a config block destined for `/var/lib/lxc/{name}/config`.
 ///
-/// Only the two DaygleVE-controlled key families are permitted
-/// (`lxc.cgroup2.*`, `lxc.net.*`); anything else is rejected so the backend
-/// can never write arbitrary LXC configuration keys through the broker.
+/// Only the DaygleVE-controlled key families are permitted (`lxc.cgroup2.*`,
+/// `lxc.net.*`, and strictly-shaped `lxc.mount.entry` bind mounts); anything
+/// else is rejected so the backend can never write arbitrary LXC configuration
+/// keys through the broker.
 pub fn validate_lxc_config_block(block: &str) -> Result<(), String> {
     if block.is_empty() {
         return Err("config block is empty".to_string());
@@ -857,13 +858,76 @@ pub fn validate_lxc_config_block(block: &str) -> Result<(), String> {
             continue;
         }
         let body = line.trim();
-        let valid = body.starts_with("lxc.cgroup2.") || body.starts_with("lxc.net.");
-        if !valid || !body.contains(" = ") {
+        if !body.contains(" = ") {
             return Err(format!(
                 "config line not permitted: `{}`",
                 truncate(body, 80)
             ));
         }
+        // A bind mount is the one key whose value is not a simple scalar, so it
+        // gets its own shape check rather than a prefix match.
+        if let Some(value) = body.strip_prefix("lxc.mount.entry = ") {
+            validate_lxc_mount_entry(value).map_err(|e| format!("invalid lxc.mount.entry: {e}"))?;
+            continue;
+        }
+        let valid = body.starts_with("lxc.cgroup2.") || body.starts_with("lxc.net.");
+        if !valid {
+            return Err(format!(
+                "config line not permitted: `{}`",
+                truncate(body, 80)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the value of an `lxc.mount.entry` bind mount independently of the
+/// backend, so the broker only ever writes a constrained, non-injecting entry.
+///
+/// Required shape (exactly six whitespace-separated fields):
+///   `<abs-host-src> <rel-container-dest> none <options> 0 0`
+/// where the source is an absolute host path, the destination is *relative*
+/// (LXC resolves it under the container rootfs), neither contains a `..`
+/// traversal component, the filesystem type is `none`, and the options are a
+/// bind mount drawn from a small allowlist. This keeps a container from being
+/// pointed at an arbitrary fstab-style entry (e.g. a non-bind mount, a device,
+/// or a `..`-escaping destination).
+fn validate_lxc_mount_entry(value: &str) -> Result<(), String> {
+    let fields: Vec<&str> = value.split_whitespace().collect();
+    if fields.len() != 6 {
+        return Err("expected 6 fields".to_string());
+    }
+    let (source, dest, fstype, options, dump, pass) = (
+        fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
+    );
+
+    let no_traversal = |p: &str| {
+        !p.split('/').any(|c| c == "..") && !p.contains('\0') && p.chars().all(|c| !c.is_control())
+    };
+    if !source.starts_with('/') || !no_traversal(source) {
+        return Err("source must be an absolute host path with no `..`".to_string());
+    }
+    // The destination is relative to the container rootfs; a leading `/` or a
+    // `..` component could escape it.
+    if dest.starts_with('/') || dest.is_empty() || !no_traversal(dest) {
+        return Err("destination must be a relative path with no `..`".to_string());
+    }
+    if fstype != "none" {
+        return Err("filesystem type must be `none` (bind mount)".to_string());
+    }
+    let mut saw_bind = false;
+    for opt in options.split(',') {
+        match opt {
+            "bind" => saw_bind = true,
+            "ro" | "rw" | "create=dir" | "create=file" => {}
+            other => return Err(format!("mount option `{other}` not permitted")),
+        }
+    }
+    if !saw_bind {
+        return Err("options must include `bind`".to_string());
+    }
+    if dump != "0" || pass != "0" {
+        return Err("dump/pass fields must be `0 0`".to_string());
     }
     Ok(())
 }
@@ -1064,6 +1128,37 @@ mod tests {
         ] {
             assert!(
                 validate_lxc_config_block(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn lxc_config_allows_only_safe_bind_mounts() {
+        // A well-formed, read-only bind mount is accepted.
+        let good = "lxc.mount.entry = /srv/data srv/data none bind,ro,create=dir 0 0\n";
+        assert!(validate_lxc_config_block(good).is_ok(), "{good:?}");
+        assert!(validate_lxc_mount_entry("/srv/data srv/data none bind,rw,create=dir 0 0").is_ok());
+
+        for bad in [
+            // Absolute destination could escape the rootfs.
+            "/srv/data /srv/data none bind,ro,create=dir 0 0",
+            // `..` traversal in source or destination.
+            "/srv/../etc data none bind 0 0",
+            "/srv sub/../.. none bind 0 0",
+            // Not a bind mount / wrong fstype.
+            "/dev/sda mnt ext4 rw 0 0",
+            "/srv data none rw,create=dir 0 0",
+            // A disallowed option (device nodes, suid, exec toggles, …).
+            "/srv data none bind,dev 0 0",
+            // Wrong field count / non-zero dump/pass.
+            "/srv data none bind",
+            "/srv data none bind,ro,create=dir 1 0",
+            // Whitespace/relative source.
+            "relative dest none bind 0 0",
+        ] {
+            assert!(
+                validate_lxc_mount_entry(bad).is_err(),
                 "{bad:?} must be rejected"
             );
         }

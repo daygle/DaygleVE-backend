@@ -316,7 +316,7 @@ dependencies = [
 [[package]]
 name = "daygleve-schema"
 version = "1.0.0"
-source = "git+https://github.com/daygle/DaygleVE-schema?branch=main#b2c74d4f9425da36fc0381020914e857eccd5f39"
+source = "git+https://github.com/daygle/DaygleVE-schema?branch=main#a50e8b322d76326224733ff706a9ec66ecbcf9fa"
 dependencies = [
  "serde",
  "serde_json",
