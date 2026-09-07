@@ -7,6 +7,7 @@
 mod containers;
 mod gpus;
 mod health;
+mod library;
 mod metrics;
 mod network;
 mod operations;
@@ -36,6 +37,8 @@ use crate::state::AppState;
 
 /// Build the full application router.
 pub fn router(state: AppState) -> Router {
+    // The JSON API: every request carries a small body, so the whole group is
+    // wrapped by a tight request-body limit as defense-in-depth.
     let api = Router::new()
         .merge(health::routes())
         .merge(auth::routes())
@@ -44,17 +47,25 @@ pub fn router(state: AppState) -> Router {
         .merge(vms::routes())
         .merge(containers::routes())
         .merge(storage::routes())
+        .merge(library::routes())
         .merge(network::routes())
         .merge(operations::routes())
         .merge(security::routes())
         .merge(gpus::routes())
         .merge(pci::routes())
         .merge(usb::routes())
-        .merge(metrics::routes());
+        .merge(metrics::routes())
+        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));
+
+    // Media-library uploads stream multi-gigabyte files straight to disk, so
+    // they are mounted outside the JSON body limit; their size is bounded
+    // instead by `Config::max_upload_bytes`, enforced while streaming.
+    let uploads = library::upload_routes();
 
     let cors = cors_layer(&state.config.cors_origins);
 
-    let mut app = Router::new().nest(&format!("/api/{API_VERSION}"), api);
+    let versioned = Router::new().merge(api).merge(uploads);
+    let mut app = Router::new().nest(&format!("/api/{API_VERSION}"), versioned);
 
     // On the appliance, serve the prebuilt frontend SPA for every non-API path,
     // falling back to index.html so client-side routing works. In dev
@@ -78,7 +89,6 @@ pub fn router(state: AppState) -> Router {
 
     app.layer(trace)
         .layer(cors)
-        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
         .layer(middleware::from_fn(request_id))
         .with_state(state)
 }

@@ -47,6 +47,7 @@ pub mod backup;
 pub mod command;
 pub mod gpu;
 pub mod kvm;
+pub mod library;
 pub mod login_throttle;
 pub mod lxc;
 pub mod metrics;
@@ -127,6 +128,8 @@ pub struct Services {
     pub backup: Arc<backup::BackupService>,
     pub kvm: kvm::KvmService,
     pub lxc: lxc::LxcService,
+    /// Node-local media library (uploaded ISOs and CT templates).
+    pub library: library::LibraryService,
     pub zfs: zfs::ZfsService,
     pub network: network::NetworkService,
     pub operations: Arc<operations::OperationService>,
@@ -147,6 +150,7 @@ impl Services {
             backup: Arc::new(backup::BackupService::new(config.clone())),
             kvm: kvm::KvmService::new(config.clone(), shares.clone()),
             lxc: lxc::LxcService::new(config.clone()),
+            library: library::LibraryService::new(config.clone()),
             zfs: zfs::ZfsService::new(config.clone()),
             network: network::NetworkService::new(config.clone()),
             operations: Arc::new(operations::OperationService::new(config.clone())),
