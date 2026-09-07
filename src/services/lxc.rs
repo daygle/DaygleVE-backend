@@ -6,9 +6,11 @@
 //! `lxc-info` at read time. CPU/memory limits and veth networking are written
 //! into the container config at create time.
 //!
-//! This is the least host-portable of the services: it depends on the
-//! `download` template server and a ZFS-capable `lxc`. Templates are given as
-//! `<dist>-<release>` (e.g. `debian-bookworm`).
+//! This is the least host-portable of the services: it needs a ZFS-capable
+//! `lxc`. A container's rootfs comes either from the `download` template server
+//! (`<dist>-<release>`, e.g. `debian-bookworm`) or from an uploaded CT-template
+//! tarball in the node's local library, built via the `local` template's
+//! `--fstree`.
 
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ use daygleve_schema::lxc_snapshot::LxcSnapshotRecord;
 
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
+use crate::services::library::LibraryService;
 use crate::services::store::JsonStore;
 use crate::services::{
     command, ensure_safe_cidr, ensure_safe_id, ensure_safe_zfs_dataset, new_id, now_ts,
@@ -29,12 +32,15 @@ use crate::services::{
 pub struct LxcService {
     store: JsonStore,
     config: Arc<Config>,
+    /// Resolves uploaded CT-template file names to on-disk paths.
+    library: LibraryService,
 }
 
 impl LxcService {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             store: JsonStore::new(&config.state_dir, "containers"),
+            library: LibraryService::new(config.clone()),
             config,
         }
     }
@@ -85,45 +91,85 @@ impl LxcService {
         for mount in &req.mounts {
             validate_mount(mount)?;
         }
-        let (dist, release) = req.template.split_once('-').ok_or_else(|| {
-            AppError::validation("template must be <dist>-<release>, e.g. debian-bookworm")
-        })?;
-        if dist.is_empty()
-            || release.is_empty()
-            || !dist.bytes().all(|b| b.is_ascii_alphanumeric())
-            || !release
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
-        {
-            return Err(AppError::validation("template contains invalid characters"));
-        }
+
+        // Two rootfs sources: an uploaded CT-template tarball (built with the
+        // `local` template's `--fstree`), or a `<dist>-<release>` image pulled
+        // from the LXC download server. When a template file is given the
+        // `template` field is only a descriptive label; otherwise it must parse
+        // as `<dist>-<release>`.
+        let template_file = match req.template_file.as_deref() {
+            Some(name) => Some(self.library.resolve_ct_template(name).await?),
+            None => None,
+        };
+        let dist_release = if template_file.is_none() {
+            let (dist, release) = req.template.split_once('-').ok_or_else(|| {
+                AppError::validation("template must be <dist>-<release>, e.g. debian-bookworm")
+            })?;
+            if dist.is_empty()
+                || release.is_empty()
+                || !dist.bytes().all(|b| b.is_ascii_alphanumeric())
+                || !release
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+            {
+                return Err(AppError::validation("template contains invalid characters"));
+            }
+            Some((dist.to_string(), release.to_string()))
+        } else {
+            None
+        };
 
         ensure_safe_zfs_dataset(&self.config.default_pool)?;
         let zfsroot = format!("{}/lxc", self.config.default_pool);
         let rootfs_dataset = format!("{zfsroot}/{}", req.name);
 
-        // Create the container with a ZFS-backed rootfs from a download image.
-        command::run_ok(
-            "lxc-create",
-            &[
-                "-n",
-                &req.name,
-                "-B",
-                "zfs",
-                "--zfsroot",
-                &zfsroot,
-                "-t",
-                "download",
-                "--",
-                "--dist",
-                dist,
-                "--release",
-                release,
-                "--arch",
-                "amd64",
-            ],
-        )
-        .await?;
+        // Create the container with a ZFS-backed rootfs, either from the
+        // uploaded tarball (local template) or a download image.
+        if let Some(fstree) = template_file.as_deref() {
+            let fstree = fstree.to_string_lossy();
+            command::run_ok(
+                "lxc-create",
+                &[
+                    "-n",
+                    &req.name,
+                    "-B",
+                    "zfs",
+                    "--zfsroot",
+                    &zfsroot,
+                    "-t",
+                    "local",
+                    "--",
+                    "--fstree",
+                    &fstree,
+                ],
+            )
+            .await?;
+        } else {
+            let (dist, release) = dist_release
+                .as_ref()
+                .expect("dist/release when no template file");
+            command::run_ok(
+                "lxc-create",
+                &[
+                    "-n",
+                    &req.name,
+                    "-B",
+                    "zfs",
+                    "--zfsroot",
+                    &zfsroot,
+                    "-t",
+                    "download",
+                    "--",
+                    "--dist",
+                    dist,
+                    "--release",
+                    release,
+                    "--arch",
+                    "amd64",
+                ],
+            )
+            .await?;
+        }
 
         // Apply a rootfs quota (best-effort) and write limits + networking. If
         // writing the config fails, the container/rootfs already exist on the
