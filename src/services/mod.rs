@@ -52,6 +52,7 @@ pub mod lxc;
 pub mod metrics;
 pub mod network;
 pub mod operations;
+pub mod pci;
 pub mod shares;
 pub mod store;
 pub mod usb;
@@ -130,6 +131,7 @@ pub struct Services {
     pub network: network::NetworkService,
     pub operations: Arc<operations::OperationService>,
     pub gpu: gpu::GpuService,
+    pub pci: pci::PciService,
     pub usb: usb::UsbService,
     pub metrics: metrics::MetricsService,
     /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
@@ -149,6 +151,7 @@ impl Services {
             network: network::NetworkService::new(config.clone()),
             operations: Arc::new(operations::OperationService::new(config.clone())),
             gpu: gpu::GpuService::new(),
+            pci: pci::PciService::new(),
             usb: usb::UsbService::new(),
             metrics: metrics::MetricsService::new(),
             shares,
