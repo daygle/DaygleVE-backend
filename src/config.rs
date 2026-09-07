@@ -36,6 +36,11 @@ pub struct Config {
     /// template). `DAYGLEVE_MAX_UPLOAD_BYTES`, default 16 GiB. Guards the upload
     /// endpoints, which bypass the small global request-body limit.
     pub max_upload_bytes: u64,
+    /// Address SPICE displays listen on. `DAYGLEVE_SPICE_LISTEN`, default
+    /// `127.0.0.1` (localhost only — reach it via an SSH tunnel). Set to a
+    /// management-interface address to let `remote-viewer` connect directly;
+    /// this is also the host written into the downloaded `.vv` connection file.
+    pub spice_listen: String,
     /// Root directory for local ZFS send-stream backups. `DAYGLEVE_BACKUP_DIR`,
     /// default `<state_dir>/backups`.
     pub backup_dir: PathBuf,
@@ -115,6 +120,11 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(16 * 1024 * 1024 * 1024);
 
+        let spice_listen = std::env::var("DAYGLEVE_SPICE_LISTEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+
         let backup_dir = std::env::var("DAYGLEVE_BACKUP_DIR")
             .ok()
             .filter(|s| !s.is_empty())
@@ -154,6 +164,7 @@ impl Config {
             template_dir,
             mounts_dir,
             max_upload_bytes,
+            spice_listen,
             backup_dir,
             token_ttl_secs,
             admin_password,

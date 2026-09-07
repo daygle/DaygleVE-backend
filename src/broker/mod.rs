@@ -449,6 +449,7 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
                     | "domrename"
                     | "vncdisplay"
                     | "ttyconsole"
+                    | "domdisplay"
                     // Guest agent + RAM-state snapshot + disk hotplug/resize.
                     | "qemu-agent-command"
                     | "domifaddr"

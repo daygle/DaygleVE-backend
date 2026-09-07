@@ -6,7 +6,7 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -60,6 +60,7 @@ pub fn routes() -> Router<AppState> {
         .route("/vms/{id}/console/ws", get(console_ws))
         .route("/vms/{id}/serial-console", post(serial_console))
         .route("/vms/{id}/serial-console/ws", get(serial_console_ws))
+        .route("/vms/{id}/spice", post(spice_connection))
 }
 
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<VmSummary>>> {
@@ -432,6 +433,28 @@ async fn serial_console(
 ) -> ApiResult<Json<ConsoleTicket>> {
     user.require(Permission::VmPower)?;
     Ok(Json(state.services.kvm.serial_console(&id).await?))
+}
+
+/// Download a `remote-viewer` connection file (`.vv`) for the VM's SPICE
+/// display. The client opens the returned file with `remote-viewer`.
+async fn spice_connection(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    user.require(Permission::VmPower)?;
+    let body = state.services.kvm.spice_connection(&id).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-virt-viewer"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"console.vv\"",
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 /// Query string for a console websocket: the one-time ticket.
