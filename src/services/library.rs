@@ -10,10 +10,10 @@
 //!
 //! Every path is built from a validated bare file name (see
 //! [`validate_library_filename`]): no separators, no `.`/`..`, no control bytes,
-//! and an extension appropriate to the kind. Uploads stream to a temporary
-//! `.<name>.partial` sibling and are renamed into place only after the whole
-//! body is written and within the size cap, so a failed or oversized upload
-//! never leaves a half-written file masquerading as a usable image.
+//! and an extension appropriate to the kind. Uploads stream to a
+//! generated-name temporary file and are renamed into place only after the
+//! whole body is written and within the size cap, so a failed or oversized
+//! upload never leaves a half-written file masquerading as a usable image.
 
 use std::path::{Path, PathBuf};
 
@@ -50,12 +50,51 @@ impl LibraryService {
         }
     }
 
+    /// Resolve a library directory to a filesystem-derived path.
+    ///
+    /// The configured directory can originate from an environment variable, so
+    /// it is normalized before it reaches any filesystem sink: the parent is
+    /// canonicalized (yielding a path derived from the filesystem, not the
+    /// configuration) and the final component is re-validated through
+    /// [`join_component`]. With `create` set the directory is created if missing;
+    /// otherwise a missing directory (or parent) yields `Ok(None)` so listings
+    /// on a fresh node are simply empty.
+    async fn resolve_dir(&self, kind: StorageFileKind, create: bool) -> ApiResult<Option<PathBuf>> {
+        let raw = self.dir_for(kind);
+        let leaf = raw
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| AppError::internal("invalid library directory configuration"))?;
+        let parent = raw.parent().unwrap_or_else(|| Path::new("/"));
+        let canonical_parent = match tokio::fs::canonicalize(parent).await {
+            Ok(p) => p,
+            Err(_) if !create => return Ok(None),
+            Err(e) => {
+                return Err(AppError::internal(format!(
+                    "library directory parent is unavailable: {e}"
+                )))
+            }
+        };
+        let dir = join_component(&canonical_parent, leaf)?;
+        if create {
+            tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                AppError::internal(format!("could not create library directory: {e}"))
+            })?;
+        } else if tokio::fs::metadata(&dir).await.is_err() {
+            return Ok(None);
+        }
+        Ok(Some(dir))
+    }
+
     /// Enumerate the files in one local library. A missing directory yields an
     /// empty list rather than an error (a fresh node simply has nothing yet).
     pub async fn list(&self, kind: StorageFileKind) -> ApiResult<Vec<StorageFile>> {
-        let dir = self.dir_for(kind);
         let mut out = Vec::new();
-        let mut entries = match tokio::fs::read_dir(dir).await {
+        let dir = match self.resolve_dir(kind, false).await? {
+            Some(d) => d,
+            None => return Ok(out),
+        };
+        let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(e) => e,
             Err(_) => return Ok(out),
         };
@@ -109,21 +148,18 @@ impl LibraryService {
         E: std::fmt::Display,
     {
         let name = validate_library_filename(name, kind)?;
-        let dir = self.dir_for(kind).to_path_buf();
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| AppError::internal(format!("could not create library directory: {e}")))?;
 
-        // Resolve both the destination and the temporary file against the
-        // canonicalized library directory. The destination's file name is
-        // re-derived as a single path component and confirmed equal to the
-        // request value (see `join_component`), so no request-controlled string
-        // reaches a filesystem sink except as a verified leaf name inside the
-        // known-safe root. The temp file's name is generated, never derived from
-        // the request.
-        let base = tokio::fs::canonicalize(&dir)
-            .await
-            .map_err(|e| AppError::internal(format!("could not resolve library directory: {e}")))?;
+        // Resolve (and create) the library directory as a filesystem-derived
+        // path, then place both the destination and the temporary file inside
+        // it. The destination's file name is re-derived as a single path
+        // component and confirmed equal to the request value (see
+        // `join_component`), so no request-controlled string reaches a
+        // filesystem sink except as a verified leaf inside the known-safe root.
+        // The temp file's name is generated, never derived from the request.
+        let base = self
+            .resolve_dir(kind, true)
+            .await?
+            .expect("resolve_dir(create=true) yields Some");
         let final_path = join_component(&base, name)?;
         let partial_path: PathBuf = base.join(format!(".upload-{}.partial", new_id()));
 
