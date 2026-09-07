@@ -23,6 +23,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
+use crate::services::new_id;
 use std::sync::Arc;
 
 /// Allowed extensions for uploaded CT-template rootfs tarballs.
@@ -93,8 +94,8 @@ impl LibraryService {
     }
 
     /// Stream an upload to `<dir>/<name>`, creating the directory if needed.
-    /// The body is written to a temporary sibling first and renamed into place
-    /// only on success; exceeding [`Config::max_upload_bytes`] aborts and
+    /// The body is written to a generated temporary file first and renamed into
+    /// place only on success; exceeding [`Config::max_upload_bytes`] aborts and
     /// removes the partial file.
     pub async fn upload<S, B, E>(
         &self,
@@ -113,8 +114,18 @@ impl LibraryService {
             .await
             .map_err(|e| AppError::internal(format!("could not create library directory: {e}")))?;
 
-        let final_path = dir.join(name);
-        let partial_path: PathBuf = dir.join(format!(".{name}.partial"));
+        // Resolve both the destination and the temporary file against the
+        // canonicalized library directory. The destination's file name is
+        // re-derived as a single path component and confirmed equal to the
+        // request value (see `join_component`), so no request-controlled string
+        // reaches a filesystem sink except as a verified leaf name inside the
+        // known-safe root. The temp file's name is generated, never derived from
+        // the request.
+        let base = tokio::fs::canonicalize(&dir)
+            .await
+            .map_err(|e| AppError::internal(format!("could not resolve library directory: {e}")))?;
+        let final_path = join_component(&base, name)?;
+        let partial_path: PathBuf = base.join(format!(".upload-{}.partial", new_id()));
 
         let max = self.config.max_upload_bytes;
         let mut file = tokio::fs::File::create(&partial_path)
@@ -170,30 +181,57 @@ impl LibraryService {
     }
 
     /// Delete a file from a library. A missing file is a 404.
+    ///
+    /// The target is located by enumerating the library and matching the
+    /// requested name, then removed by the path the directory listing produced —
+    /// the request value is only ever compared, never joined into a filesystem
+    /// path.
     pub async fn delete(&self, kind: StorageFileKind, name: &str) -> ApiResult<()> {
         let name = validate_library_filename(name, kind)?;
-        let path = self.dir_for(kind).join(name);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(AppError::not_found("no such library file"))
-            }
-            Err(e) => Err(AppError::internal(format!("could not delete file: {e}"))),
-        }
+        let target = self
+            .list(kind)
+            .await?
+            .into_iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| AppError::not_found("no such library file"))?;
+        tokio::fs::remove_file(&target.path)
+            .await
+            .map_err(|e| AppError::internal(format!("could not delete file: {e}")))
     }
 
-    /// Resolve an uploaded CT template file name to its absolute host path,
-    /// verifying it actually exists. Used by the LXC service when building a
-    /// container rootfs from an uploaded template.
+    /// Resolve an uploaded CT template file name to its absolute host path.
+    ///
+    /// Like [`Self::delete`], the path is taken from the directory listing (so
+    /// the request value is only compared, never joined), which also confirms
+    /// the file exists. Used by the LXC service when building a container rootfs
+    /// from an uploaded template.
     pub async fn resolve_ct_template(&self, name: &str) -> ApiResult<PathBuf> {
         let name = validate_library_filename(name, StorageFileKind::CtTemplate)?;
-        let path = self.dir_for(StorageFileKind::CtTemplate).join(name);
-        match tokio::fs::metadata(&path).await {
-            Ok(m) if m.is_file() => Ok(path),
-            _ => Err(AppError::validation(
-                "template_file is not an uploaded CT template (see GET /storage/ct-templates)",
-            )),
-        }
+        self.list(StorageFileKind::CtTemplate)
+            .await?
+            .into_iter()
+            .find(|f| f.name == name)
+            .map(|f| PathBuf::from(f.path))
+            .ok_or_else(|| {
+                AppError::validation(
+                    "template_file is not an uploaded CT template (see GET /storage/ct-templates)",
+                )
+            })
+    }
+}
+
+/// Join a request-supplied `name` into `dir` as a single, verified path
+/// component.
+///
+/// `Path::file_name` strips any directory portion; requiring it to equal the
+/// input rejects separators, `.`/`..` and any traversal, so only a normalized
+/// leaf name is joined onto the (already canonicalized) directory. This is the
+/// barrier that keeps request-controlled data from reaching a filesystem path
+/// sink as anything but a checked leaf inside the known-safe root.
+fn join_component(dir: &Path, name: &str) -> ApiResult<PathBuf> {
+    match Path::new(name).file_name() {
+        Some(component) if component == std::ffi::OsStr::new(name) => Ok(dir.join(component)),
+        _ => Err(AppError::validation(format!("invalid file name: {name:?}"))),
     }
 }
 
@@ -262,5 +300,21 @@ mod tests {
         assert!(validate_library_filename("bad\nname.iso", StorageFileKind::Iso).is_err());
         assert!(validate_library_filename("", StorageFileKind::Iso).is_err());
         assert!(validate_library_filename("..", StorageFileKind::CtTemplate).is_err());
+    }
+
+    #[test]
+    fn join_component_only_accepts_plain_leaf_names() {
+        let dir = Path::new("/var/lib/daygleve/isos");
+        assert_eq!(
+            join_component(dir, "debian.iso").unwrap(),
+            dir.join("debian.iso")
+        );
+        // Anything with a directory portion or traversal is rejected rather
+        // than joined.
+        assert!(join_component(dir, "../escape.iso").is_err());
+        assert!(join_component(dir, "sub/child.iso").is_err());
+        assert!(join_component(dir, "/etc/passwd").is_err());
+        assert!(join_component(dir, "..").is_err());
+        assert!(join_component(dir, "").is_err());
     }
 }
