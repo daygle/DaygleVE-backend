@@ -151,14 +151,14 @@ async fn read_gpu(dir: &Path) -> Option<GpuDevice> {
 }
 
 /// Basename of the device's bound driver, if any.
-async fn current_driver(dir: &Path) -> Option<String> {
+pub(crate) async fn current_driver(dir: &Path) -> Option<String> {
     fs::read_link(dir.join("driver"))
         .await
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
-async fn read_iommu_group(dir: &Path) -> u32 {
+pub(crate) async fn read_iommu_group(dir: &Path) -> u32 {
     fs::read_link(dir.join("iommu_group"))
         .await
         .ok()
@@ -167,7 +167,7 @@ async fn read_iommu_group(dir: &Path) -> u32 {
         .unwrap_or(0)
 }
 
-fn vendor_name(vendor_id: &str) -> String {
+pub(crate) fn vendor_name(vendor_id: &str) -> String {
     match vendor_id.trim().to_ascii_lowercase().as_str() {
         "0x10de" => "NVIDIA".to_string(),
         "0x1002" => "AMD".to_string(),
@@ -176,7 +176,7 @@ fn vendor_name(vendor_id: &str) -> String {
     }
 }
 
-async fn read_trimmed(path: &Path) -> Option<String> {
+pub(crate) async fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .await
         .ok()

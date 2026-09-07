@@ -95,6 +95,7 @@ impl KvmService {
         let nics = normalize_nics(req.nics)?;
         validate_gpu_assignments(&req.gpus)?;
         validate_usb_assignments(&req.usb_devices)?;
+        validate_pci_assignments(&req.pci_devices)?;
 
         // Validate any requested install ISO against the node's library before
         // it reaches libvirt (prevents pointing a VM at an arbitrary host file).
@@ -137,6 +138,7 @@ impl KvmService {
             nics,
             gpus: req.gpus,
             usb_devices: req.usb_devices,
+            pci_devices: req.pci_devices,
             cdrom,
             cloud_init_iso,
             description: req.description,
@@ -460,6 +462,7 @@ impl KvmService {
                 .collect(),
             gpus: Vec::new(),        // passthrough can't be shared
             usb_devices: Vec::new(), // nor can USB passthrough
+            pci_devices: Vec::new(), // nor can PCI passthrough
             cdrom: None,             // install media isn't carried over
             cloud_init_iso: None,
             description: req.description.or(src.description.clone()),
@@ -2154,6 +2157,11 @@ fn domain_xml(vm: &Vm) -> String {
         .iter()
         .filter_map(|g| pci_hostdev_xml(&g.pci_address))
         .chain(
+            vm.pci_devices
+                .iter()
+                .filter_map(|p| pci_hostdev_xml(&p.pci_address)),
+        )
+        .chain(
             vm.usb_devices
                 .iter()
                 .filter_map(|u| usb_hostdev_xml(&u.vendor_id, &u.product_id)),
@@ -2332,6 +2340,15 @@ fn usb_hostdev_xml(vendor_id: &str, product_id: &str) -> Option<String> {
     ))
 }
 
+/// Validate general PCI passthrough assignments: each address must pass the
+/// PCI-address sanitizer (it becomes a `<hostdev>` source and a sysfs path).
+fn validate_pci_assignments(devices: &[daygleve_schema::pci::PciAssignment]) -> ApiResult<()> {
+    for dev in devices {
+        ensure_safe_pci_address(&dev.pci_address)?;
+    }
+    Ok(())
+}
+
 /// Validate USB passthrough assignments: each id must be four hex digits (the
 /// USB `vendor`/`product` shape), or the resulting `<hostdev>` would be
 /// malformed.
@@ -2377,6 +2394,7 @@ mod tests {
             nics: vec![],
             gpus: vec![],
             usb_devices: vec![],
+            pci_devices: vec![],
             cdrom: None,
             cloud_init_iso: None,
             description: None,
@@ -2451,6 +2469,32 @@ mod tests {
         assert!(xml.contains("<hostdev mode='subsystem' type='usb'>"));
         assert!(xml.contains("<vendor id='0x1d6b'/><product id='0x0003'/>"));
         assert!(!xml.contains("0xzzzz"), "malformed id must be dropped");
+    }
+
+    #[test]
+    fn domain_xml_renders_pci_hostdevs() {
+        use daygleve_schema::pci::PciAssignment;
+        let mut vm = sample_vm();
+        vm.pci_devices = vec![PciAssignment {
+            pci_address: "0000:03:00.0".into(),
+        }];
+        let xml = domain_xml(&vm);
+        assert!(xml.contains("<hostdev mode='subsystem' type='pci' managed='yes'>"));
+        assert!(xml.contains("domain='0x0000' bus='0x03' slot='0x00' function='0x0'"));
+    }
+
+    #[test]
+    fn pci_assignments_are_validated() {
+        use daygleve_schema::pci::PciAssignment;
+        assert!(validate_pci_assignments(&[PciAssignment {
+            pci_address: "0000:03:00.0".into(),
+        }])
+        .is_ok());
+        // A traversal/flag-shaped address is rejected by the sanitizer.
+        assert!(validate_pci_assignments(&[PciAssignment {
+            pci_address: "../etc".into(),
+        }])
+        .is_err());
     }
 
     #[test]
