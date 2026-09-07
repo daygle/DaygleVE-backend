@@ -274,6 +274,96 @@ pub async fn stream_from_file(program: &str, args: &[&str], path: &Path) -> ApiR
     Ok(())
 }
 
+/// Idle timeout (seconds) for a console session, bounded by the broker's cap.
+/// The broker resets it on console activity, so this bounds only idle sessions.
+const CONSOLE_IDLE_TIMEOUT_SECS: u64 = 900;
+
+/// Read half of a live console bridge (broker-mediated, or a direct pty on dev
+/// hosts). `recv` yields the next chunk of console output, or `None` at end.
+pub enum ConsoleReadHalf {
+    #[cfg(unix)]
+    Broker(crate::broker::client::ConsoleReader),
+    Direct(tokio::fs::File),
+}
+
+/// Write half of a live console bridge: `send` writes keystrokes to the guest.
+pub enum ConsoleWriteHalf {
+    #[cfg(unix)]
+    Broker(crate::broker::client::ConsoleWriter),
+    Direct(tokio::fs::File),
+}
+
+impl ConsoleReadHalf {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        match self {
+            #[cfg(unix)]
+            Self::Broker(reader) => reader.recv().await,
+            Self::Direct(file) => {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 16384];
+                match file.read(&mut buf).await {
+                    Ok(0) | Err(_) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some(buf)
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ConsoleWriteHalf {
+    pub async fn send(&mut self, bytes: &[u8]) -> ApiResult<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Broker(writer) => writer.send(bytes).await.map_err(broker_error),
+            Self::Direct(file) => {
+                use tokio::io::AsyncWriteExt;
+                file.write_all(bytes)
+                    .await
+                    .map_err(|e| AppError::hypervisor(format!("console write: {e}")))?;
+                file.flush()
+                    .await
+                    .map_err(|e| AppError::hypervisor(format!("console flush: {e}")))
+            }
+        }
+    }
+}
+
+/// Open a bridge to a guest console pty. Through the broker when configured
+/// (the non-root backend never opens the device itself); otherwise directly,
+/// for development hosts where the backend runs privileged.
+pub async fn console_attach(pty: &str) -> ApiResult<(ConsoleReadHalf, ConsoleWriteHalf)> {
+    crate::broker::validate_console_pty(pty).map_err(AppError::validation)?;
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        let (reader, writer) = client
+            .console_attach(pty, CONSOLE_IDLE_TIMEOUT_SECS)
+            .await
+            .map_err(broker_error)?;
+        return Ok((
+            ConsoleReadHalf::Broker(reader),
+            ConsoleWriteHalf::Broker(writer),
+        ));
+    }
+    let read = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pty)
+        .await
+        .map_err(|e| AppError::hypervisor(format!("open console {pty}: {e}")))?;
+    let write = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(pty)
+        .await
+        .map_err(|e| AppError::hypervisor(format!("open console {pty}: {e}")))?;
+    Ok((
+        ConsoleReadHalf::Direct(read),
+        ConsoleWriteHalf::Direct(write),
+    ))
+}
+
 /// Delegate a constrained vfio sysfs write when the broker is enabled.
 pub async fn pci_write(kind: crate::broker::PciWriteKind, address: &str) -> ApiResult<()> {
     crate::broker::validate_pci_address(address).map_err(AppError::validation)?;

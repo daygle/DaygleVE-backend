@@ -22,7 +22,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::auth::AuthUser;
-use crate::error::ApiResult;
+use crate::error::{ApiResult, AppError};
+use crate::services::kvm::ConsoleTarget;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -57,6 +58,8 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/vms/{id}/console", post(console))
         .route("/vms/{id}/console/ws", get(console_ws))
+        .route("/vms/{id}/serial-console", post(serial_console))
+        .route("/vms/{id}/serial-console/ws", get(serial_console_ws))
 }
 
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<VmSummary>>> {
@@ -421,7 +424,17 @@ async fn console(
     Ok(Json(state.services.kvm.console(&id).await?))
 }
 
-/// Query string for the console websocket: the one-time ticket.
+/// Mint a one-time ticket for the VM's serial (text) console.
+async fn serial_console(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ConsoleTicket>> {
+    user.require(Permission::VmPower)?;
+    Ok(Json(state.services.kvm.serial_console(&id).await?))
+}
+
+/// Query string for a console websocket: the one-time ticket.
 #[derive(Deserialize)]
 struct ConsoleQuery {
     ticket: String,
@@ -437,8 +450,81 @@ async fn console_ws(
     ws: WebSocketUpgrade,
 ) -> Response {
     match state.services.kvm.redeem_ticket(&id, &q.ticket) {
-        Ok(addr) => ws.on_upgrade(move |socket| proxy_vnc(socket, addr)),
+        Ok(ConsoleTarget::Vnc(addr)) => ws.on_upgrade(move |socket| proxy_vnc(socket, addr)),
+        Ok(ConsoleTarget::Serial(_)) => {
+            AppError::validation("this ticket is for the serial console").into_response()
+        }
         Err(e) => e.into_response(),
+    }
+}
+
+/// Websocket endpoint the browser xterm.js client connects to for the serial
+/// console. Authorized by the one-time `ticket`; on success it bridges the
+/// domain's console pty (opened through the broker) to the socket.
+async fn serial_console_ws(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConsoleQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let pty = match state.services.kvm.redeem_ticket(&id, &q.ticket) {
+        Ok(ConsoleTarget::Serial(pty)) => pty,
+        Ok(ConsoleTarget::Vnc(_)) => {
+            return AppError::validation("this ticket is for the graphical console").into_response()
+        }
+        Err(e) => return e.into_response(),
+    };
+    ws.on_upgrade(move |socket| async move {
+        match state.services.kvm.attach_serial_console(&pty).await {
+            Ok((reader, writer)) => proxy_serial(socket, reader, writer).await,
+            Err(_) => {
+                let mut socket = socket;
+                let _ = socket.send(Message::Close(None)).await;
+            }
+        }
+    })
+}
+
+/// Bidirectionally bridge a websocket and a console byte-stream: browser
+/// keystrokes -> console, console output -> browser binary frames.
+async fn proxy_serial(
+    socket: WebSocket,
+    mut reader: crate::services::command::ConsoleReadHalf,
+    mut writer: crate::services::command::ConsoleWriteHalf,
+) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let ws_to_console = async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            match msg {
+                Message::Binary(data) => {
+                    if writer.send(data.as_ref()).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Text(text) => {
+                    if writer.send(text.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    };
+
+    let console_to_ws = async {
+        while let Some(chunk) = reader.recv().await {
+            if ws_tx.send(Message::Binary(chunk.into())).await.is_err() {
+                break;
+            }
+        }
+        let _ = ws_tx.close().await;
+    };
+
+    tokio::select! {
+        _ = ws_to_console => {},
+        _ = console_to_ws => {},
     }
 }
 

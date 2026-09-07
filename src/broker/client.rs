@@ -244,6 +244,27 @@ impl BrokerClient {
         result
     }
 
+    /// Attach to a guest console pty. Returns the two halves of a live bridge:
+    /// [`ConsoleReader::recv`] yields console output and [`ConsoleWriter::send`]
+    /// writes keystrokes. The connection stays open for the session; dropping
+    /// both halves closes it.
+    pub async fn console_attach(
+        &self,
+        pty: &str,
+        timeout_secs: u64,
+    ) -> Result<(ConsoleReader, ConsoleWriter), BrokerError> {
+        let stream = self.connect().await?;
+        let (reader, mut writer) = stream.into_split();
+        let request = self.request(Op::ConsoleAttach {
+            pty: pty.to_string(),
+            timeout_secs,
+        });
+        framing::write_json(&mut writer, &request)
+            .await
+            .map_err(|e| BrokerError::Protocol(e.0))?;
+        Ok((ConsoleReader { reader }, ConsoleWriter { writer }))
+    }
+
     /// Perform a constrained PCI sysfs write (vfio-pci passthrough).
     pub async fn pci_write(&self, kind: PciWriteKind, address: &str) -> Result<(), BrokerError> {
         let mut stream = self.connect().await?;
@@ -308,6 +329,50 @@ impl BrokerClient {
 enum UnaryOutcome {
     Response(Response),
     Stream(StreamFrame),
+}
+
+/// Read half of a broker console bridge: yields console output chunks.
+pub struct ConsoleReader {
+    reader: tokio::net::unix::OwnedReadHalf,
+}
+
+impl ConsoleReader {
+    /// The next chunk of console output, or `None` when the session ends (the
+    /// broker's `Exit` frame, an unexpected frame, or a transport error).
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        match framing::read_json::<_, StreamFrame>(&mut self.reader).await {
+            Ok(StreamFrame::Stdout { d }) => {
+                base64::engine::general_purpose::STANDARD.decode(d).ok()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Write half of a broker console bridge: sends keystrokes to the guest.
+pub struct ConsoleWriter {
+    writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl ConsoleWriter {
+    /// Send a chunk of keystrokes to the console. Oversized chunks are split to
+    /// respect the broker's per-frame payload cap.
+    pub async fn send(&mut self, bytes: &[u8]) -> Result<(), BrokerError> {
+        for part in bytes.chunks(CHUNK_PAYLOAD_MAX) {
+            let frame = StreamFrame::Stdin {
+                d: base64::engine::general_purpose::STANDARD.encode(part),
+            };
+            framing::write_json(&mut self.writer, &frame)
+                .await
+                .map_err(|e| BrokerError::Protocol(e.0))?;
+        }
+        Ok(())
+    }
+
+    /// Signal that no more keystrokes will be sent.
+    pub async fn close(&mut self) {
+        let _ = framing::write_json(&mut self.writer, &StreamFrame::StdinEof).await;
+    }
 }
 
 fn response_to_output(resp: Response) -> Result<String, BrokerError> {
