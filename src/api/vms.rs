@@ -499,7 +499,7 @@ async fn serial_console_ws(
     };
     ws.on_upgrade(move |socket| async move {
         match state.services.kvm.attach_serial_console(&pty).await {
-            Ok((reader, writer)) => proxy_serial(socket, reader, writer).await,
+            Ok((reader, writer)) => proxy_console(socket, reader, writer).await,
             Err(_) => {
                 let mut socket = socket;
                 let _ = socket.send(Message::Close(None)).await;
@@ -509,8 +509,9 @@ async fn serial_console_ws(
 }
 
 /// Bidirectionally bridge a websocket and a console byte-stream: browser
-/// keystrokes -> console, console output -> browser binary frames.
-async fn proxy_serial(
+/// keystrokes -> console, console output -> browser binary frames. Shared by the
+/// VM serial console and the LXC container console.
+pub(crate) async fn proxy_console(
     socket: WebSocket,
     mut reader: crate::services::command::ConsoleReadHalf,
     mut writer: crate::services::command::ConsoleWriteHalf,

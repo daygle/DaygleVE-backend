@@ -191,6 +191,10 @@ async fn handle_connection(
             let (reader, writer) = stream.into_split();
             stream_console(reader, writer, &pty, timeout_secs).await
         }
+        Op::LxcConsoleAttach { name, timeout_secs } => {
+            let (reader, writer) = stream.into_split();
+            stream_lxc_console(reader, writer, &name, timeout_secs).await
+        }
     }
 }
 
@@ -486,9 +490,13 @@ async fn stream_console(
     Ok(())
 }
 
-/// Pump client `Stdin` frames (keystrokes) into the console pty until the client
-/// signals EOF, disconnects, or sends a malformed frame.
-async fn feed_console(mut reader: tokio::net::unix::OwnedReadHalf, mut pty: tokio::fs::File) {
+/// Pump client `Stdin` frames (keystrokes) into a console sink (a pty file or a
+/// pty master) until the client signals EOF, disconnects, or sends a malformed
+/// frame.
+async fn feed_console<W>(mut reader: tokio::net::unix::OwnedReadHalf, mut sink: W)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
         match framing::read_json::<_, StreamFrame>(&mut reader).await {
             Ok(StreamFrame::Stdin { d }) => {
@@ -496,15 +504,111 @@ async fn feed_console(mut reader: tokio::net::unix::OwnedReadHalf, mut pty: toki
                     Ok(bytes) if bytes.len() <= CHUNK_PAYLOAD_MAX => bytes,
                     _ => break,
                 };
-                if pty.write_all(&bytes).await.is_err() {
+                if sink.write_all(&bytes).await.is_err() {
                     break;
                 }
-                let _ = pty.flush().await;
+                let _ = sink.flush().await;
             }
             Ok(StreamFrame::StdinEof) | Err(_) => break,
             Ok(_) => break,
         }
     }
+}
+
+/// Bridge an LXC container console to the client. LXC has no `ttyconsole` pty
+/// path, so the broker allocates a pty and runs `lxc-console` on it (giving the
+/// container a real terminal), then bridges the pty master with the same
+/// `Stdin`/`Stdout` frames as a VM console. The session ends when `lxc-console`
+/// exits, the pty closes, the client disconnects, or the idle deadline elapses.
+async fn stream_lxc_console(
+    reader: tokio::net::unix::OwnedReadHalf,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    name: &str,
+    timeout_secs: u64,
+) -> Result<(), ServeError> {
+    if let Err(reason) = super::validate_lxc_name(name) {
+        return send_exit(&mut writer, -1, reason, false).await;
+    }
+    let exe = match super::program_path("lxc-console") {
+        Some(path) => path,
+        None => {
+            return send_exit(
+                &mut writer,
+                -1,
+                "lxc-console is not permitted".into(),
+                false,
+            )
+            .await
+        }
+    };
+
+    let pty = match pty_process::Pty::new() {
+        Ok(pty) => pty,
+        Err(e) => return send_exit(&mut writer, -1, format!("allocate pty: {e}"), false).await,
+    };
+    let pts = match pty.pts() {
+        Ok(pts) => pts,
+        Err(e) => return send_exit(&mut writer, -1, format!("open pts: {e}"), false).await,
+    };
+    // `-t 0` selects the first tty; the default Ctrl-a escape is left in place so
+    // the operator can still detach a stuck session locally.
+    let mut command = pty_process::Command::new(exe);
+    command
+        .args(["-n", name, "-t", "0"])
+        .env_clear()
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        )
+        .env("LC_ALL", "C")
+        .env("TERM", "xterm-256color");
+    let mut child = match command.spawn(&pts) {
+        Ok(child) => child,
+        Err(e) => {
+            return send_exit(&mut writer, -1, format!("start lxc-console: {e}"), false).await
+        }
+    };
+    drop(pts);
+
+    let (mut pty_read, pty_write) = tokio::io::split(pty);
+    let stdin_task = tokio::spawn(feed_console(reader, pty_write));
+
+    let timeout = Duration::from_secs(timeout_secs.min(EXEC_TIMEOUT_CAP.as_secs()));
+    let mut chunk = vec![0u8; CHUNK_PAYLOAD_MAX];
+    loop {
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, pty_read.read(&mut chunk)).await {
+            Err(_) => {
+                let _ = child.start_kill();
+                send_exit(&mut writer, 0, String::new(), true).await?;
+                break;
+            }
+            Ok(Ok(0)) => {
+                let _ = child.wait().await;
+                send_exit(&mut writer, 0, String::new(), false).await?;
+                break;
+            }
+            Ok(Err(error)) => {
+                let _ = child.start_kill();
+                send_exit(&mut writer, -1, format!("read console: {error}"), false).await?;
+                break;
+            }
+            Ok(Ok(size)) => {
+                let frame = StreamFrame::Stdout {
+                    d: base64::engine::general_purpose::STANDARD.encode(&chunk[..size]),
+                };
+                if framing::write_json(&mut writer, &frame).await.is_err() {
+                    let _ = child.start_kill();
+                    break;
+                }
+            }
+        }
+    }
+
+    stdin_task.abort();
+    let _ = stdin_task.await;
+    let _ = child.start_kill();
+    Ok(())
 }
 
 async fn handle_pci_write(kind: PciWriteKind, address: &str) -> Result<(), String> {

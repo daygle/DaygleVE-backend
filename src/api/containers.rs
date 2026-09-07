@@ -1,13 +1,17 @@
 //! LXC container endpoints.
 
-use axum::extract::{Path, State};
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::lxc::{CreateLxcRequest, Lxc, LxcPowerRequest, LxcSummary, UpdateLxcRequest};
 use daygleve_schema::lxc_snapshot::{CreateLxcSnapshotRequest, LxcSnapshot};
 use daygleve_schema::operations::OperationRecord;
+use daygleve_schema::vm::ConsoleTicket;
+use serde::Deserialize;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
@@ -33,6 +37,49 @@ pub fn routes() -> Router<AppState> {
             "/containers/{id}/snapshots/{name}/rollback",
             post(rollback_snapshot),
         )
+        .route("/containers/{id}/console", post(console))
+        .route("/containers/{id}/console/ws", get(console_ws))
+}
+
+/// Mint a one-time ticket for the container's console.
+async fn console(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ConsoleTicket>> {
+    user.require(Permission::LxcPower)?;
+    Ok(Json(state.services.lxc.console(&id).await?))
+}
+
+/// Query string for the console websocket: the one-time ticket.
+#[derive(Deserialize)]
+struct ConsoleQuery {
+    ticket: String,
+}
+
+/// Websocket endpoint the browser xterm.js client connects to for the container
+/// console. Authorized by the one-time `ticket`; on success it bridges the
+/// container's console (opened through the broker) to the socket.
+async fn console_ws(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConsoleQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let name = match state.services.lxc.redeem_console_ticket(&id, &q.ticket) {
+        Ok(name) => name,
+        Err(e) => return e.into_response(),
+    };
+    ws.on_upgrade(move |socket| async move {
+        match state.services.lxc.attach_console(&name).await {
+            Ok((reader, writer)) => super::vms::proxy_console(socket, reader, writer).await,
+            Err(_) => {
+                use axum::extract::ws::Message;
+                let mut socket = socket;
+                let _ = socket.send(Message::Close(None)).await;
+            }
+        }
+    })
 }
 
 async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<LxcSummary>>> {

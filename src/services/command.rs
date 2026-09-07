@@ -19,6 +19,7 @@ fn program_path(program: &str) -> Option<&'static str> {
         "bridge" => "/usr/sbin/bridge",
         "ip" => "/usr/sbin/ip",
         "lxc-cgroup" => "/usr/bin/lxc-cgroup",
+        "lxc-console" => "/usr/bin/lxc-console",
         "lxc-create" => "/usr/bin/lxc-create",
         "lxc-destroy" => "/usr/bin/lxc-destroy",
         "lxc-freeze" => "/usr/bin/lxc-freeze",
@@ -284,6 +285,8 @@ pub enum ConsoleReadHalf {
     #[cfg(unix)]
     Broker(crate::broker::client::ConsoleReader),
     Direct(tokio::fs::File),
+    /// A child process's stdout (dev-only container console fallback).
+    Child(tokio::process::ChildStdout),
 }
 
 /// Write half of a live console bridge: `send` writes keystrokes to the guest.
@@ -291,17 +294,32 @@ pub enum ConsoleWriteHalf {
     #[cfg(unix)]
     Broker(crate::broker::client::ConsoleWriter),
     Direct(tokio::fs::File),
+    /// A child process's stdin, holding the child so dropping this half kills it.
+    Child {
+        stdin: tokio::process::ChildStdin,
+        _child: tokio::process::Child,
+    },
 }
 
 impl ConsoleReadHalf {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
         match self {
             #[cfg(unix)]
             Self::Broker(reader) => reader.recv().await,
             Self::Direct(file) => {
-                use tokio::io::AsyncReadExt;
                 let mut buf = vec![0u8; 16384];
                 match file.read(&mut buf).await {
+                    Ok(0) | Err(_) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some(buf)
+                    }
+                }
+            }
+            Self::Child(stdout) => {
+                let mut buf = vec![0u8; 16384];
+                match stdout.read(&mut buf).await {
                     Ok(0) | Err(_) => None,
                     Ok(n) => {
                         buf.truncate(n);
@@ -315,15 +333,25 @@ impl ConsoleReadHalf {
 
 impl ConsoleWriteHalf {
     pub async fn send(&mut self, bytes: &[u8]) -> ApiResult<()> {
+        use tokio::io::AsyncWriteExt;
         match self {
             #[cfg(unix)]
             Self::Broker(writer) => writer.send(bytes).await.map_err(broker_error),
             Self::Direct(file) => {
-                use tokio::io::AsyncWriteExt;
                 file.write_all(bytes)
                     .await
                     .map_err(|e| AppError::hypervisor(format!("console write: {e}")))?;
                 file.flush()
+                    .await
+                    .map_err(|e| AppError::hypervisor(format!("console flush: {e}")))
+            }
+            Self::Child { stdin, .. } => {
+                stdin
+                    .write_all(bytes)
+                    .await
+                    .map_err(|e| AppError::hypervisor(format!("console write: {e}")))?;
+                stdin
+                    .flush()
                     .await
                     .map_err(|e| AppError::hypervisor(format!("console flush: {e}")))
             }
@@ -361,6 +389,47 @@ pub async fn console_attach(pty: &str) -> ApiResult<(ConsoleReadHalf, ConsoleWri
     Ok((
         ConsoleReadHalf::Direct(read),
         ConsoleWriteHalf::Direct(write),
+    ))
+}
+
+/// Open a bridge to an LXC container console. Through the broker when configured
+/// (the broker allocates a pty and runs `lxc-console`); otherwise a dev-only
+/// fallback that pipes `lxc-console` directly (no pty — basic line I/O).
+pub async fn lxc_console_attach(name: &str) -> ApiResult<(ConsoleReadHalf, ConsoleWriteHalf)> {
+    crate::broker::validate_lxc_name(name).map_err(AppError::validation)?;
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        let (reader, writer) = client
+            .lxc_console_attach(name, CONSOLE_IDLE_TIMEOUT_SECS)
+            .await
+            .map_err(broker_error)?;
+        return Ok((
+            ConsoleReadHalf::Broker(reader),
+            ConsoleWriteHalf::Broker(writer),
+        ));
+    }
+    let mut child = new("lxc-console")?
+        .args(["-n", name, "-t", "0"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| AppError::hypervisor(format!("start lxc-console: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::internal("console stdout was not captured"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::internal("console stdin was not captured"))?;
+    Ok((
+        ConsoleReadHalf::Child(stdout),
+        ConsoleWriteHalf::Child {
+            stdin,
+            _child: child,
+        },
     ))
 }
 
