@@ -40,6 +40,10 @@ sha2 = "0.10"
 base64 = "0.22"
 # Unix broker peer-credential and no-follow file operations.
 libc = "0.2"
+# Allocate a pty in the root broker to give an LXC container console a real
+# terminal (lxc has no libvirt-style ttyconsole pty path). The crate's `unsafe`
+# is internal; this crate stays `unsafe_code = "forbid"`.
+pty-process = { version = "0.4", features = ["async"] }
 
 [lints.rust]
 unsafe_code = "forbid"

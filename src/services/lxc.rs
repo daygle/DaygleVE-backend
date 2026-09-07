@@ -12,12 +12,15 @@
 //! tarball in the node's local library, built via the `local` template's
 //! `--fstree`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use daygleve_schema::lxc::{
     CreateLxcRequest, Lxc, LxcMount, LxcNetwork, LxcPowerAction, LxcState, LxcSummary,
     UpdateLxcRequest,
 };
+use daygleve_schema::vm::ConsoleTicket;
 
 use daygleve_schema::lxc_snapshot::LxcSnapshotRecord;
 
@@ -29,11 +32,23 @@ use crate::services::{
     command, ensure_safe_cidr, ensure_safe_id, ensure_safe_zfs_dataset, new_id, now_ts,
 };
 
+/// How long a console ticket is valid before the client must re-request one.
+const TICKET_TTL: Duration = Duration::from_secs(60);
+
+/// A pending console ticket bound to a container.
+struct ConsoleTicketEntry {
+    container_id: String,
+    name: String,
+    expires_at: Instant,
+}
+
 pub struct LxcService {
     store: JsonStore,
     config: Arc<Config>,
     /// Resolves uploaded CT-template file names to on-disk paths.
     library: LibraryService,
+    /// Pending one-time console tickets, keyed by the opaque ticket.
+    tickets: RwLock<HashMap<String, ConsoleTicketEntry>>,
 }
 
 impl LxcService {
@@ -42,6 +57,7 @@ impl LxcService {
             store: JsonStore::new(&config.state_dir, "containers"),
             library: LibraryService::new(config.clone()),
             config,
+            tickets: RwLock::new(HashMap::new()),
         }
     }
 
@@ -53,6 +69,57 @@ impl LxcService {
             out.push(summary_of(&ct));
         }
         Ok(out)
+    }
+
+    /// Mint a one-time ticket for the container's console. Requires the
+    /// container to be running; the console is opened later, through the broker,
+    /// when the websocket redeems the ticket.
+    pub async fn console(&self, id: &str) -> ApiResult<ConsoleTicket> {
+        let ct = self.get_stored(id).await?;
+        if !matches!(self.live_state(&ct.name).await, Some(LxcState::Running)) {
+            return Err(AppError::conflict("start the container to open a console"));
+        }
+        let ticket = new_id();
+        {
+            let mut tickets = self.tickets.write().expect("ticket lock");
+            let now = Instant::now();
+            tickets.retain(|_, t| t.expires_at > now);
+            tickets.insert(
+                ticket.clone(),
+                ConsoleTicketEntry {
+                    container_id: id.to_string(),
+                    name: ct.name.clone(),
+                    expires_at: now + TICKET_TTL,
+                },
+            );
+        }
+        Ok(ConsoleTicket {
+            websocket_path: format!("/api/v1/containers/{id}/console/ws?ticket={ticket}"),
+            ticket,
+            expires_at: (chrono::Utc::now() + chrono::Duration::from_std(TICKET_TTL).unwrap())
+                .to_rfc3339(),
+        })
+    }
+
+    /// Validate and consume a console ticket, returning the container name to
+    /// attach to. One-time: the ticket is removed on a valid match.
+    pub fn redeem_console_ticket(&self, container_id: &str, ticket: &str) -> ApiResult<String> {
+        let mut tickets = self.tickets.write().expect("ticket lock");
+        match tickets.get(ticket) {
+            Some(t) if t.container_id == container_id && t.expires_at > Instant::now() => {
+                Ok(tickets.remove(ticket).expect("ticket present").name)
+            }
+            _ => Err(AppError::unauthorized("invalid or expired console ticket")),
+        }
+    }
+
+    /// Open a live bridge to a container console (through the broker on the
+    /// appliance). The name comes from a previously-redeemed console ticket.
+    pub async fn attach_console(
+        &self,
+        name: &str,
+    ) -> ApiResult<(command::ConsoleReadHalf, command::ConsoleWriteHalf)> {
+        command::lxc_console_attach(name).await
     }
 
     pub async fn get(&self, id: &str) -> ApiResult<Lxc> {

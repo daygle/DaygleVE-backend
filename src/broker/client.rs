@@ -265,6 +265,26 @@ impl BrokerClient {
         Ok((ConsoleReader { reader }, ConsoleWriter { writer }))
     }
 
+    /// Attach to an LXC container console. The broker allocates a pty and runs
+    /// `lxc-console`; the returned halves speak the same stream frames as
+    /// [`Self::console_attach`].
+    pub async fn lxc_console_attach(
+        &self,
+        name: &str,
+        timeout_secs: u64,
+    ) -> Result<(ConsoleReader, ConsoleWriter), BrokerError> {
+        let stream = self.connect().await?;
+        let (reader, mut writer) = stream.into_split();
+        let request = self.request(Op::LxcConsoleAttach {
+            name: name.to_string(),
+            timeout_secs,
+        });
+        framing::write_json(&mut writer, &request)
+            .await
+            .map_err(|e| BrokerError::Protocol(e.0))?;
+        Ok((ConsoleReader { reader }, ConsoleWriter { writer }))
+    }
+
     /// Perform a constrained PCI sysfs write (vfio-pci passthrough).
     pub async fn pci_write(&self, kind: PciWriteKind, address: &str) -> Result<(), BrokerError> {
         let mut stream = self.connect().await?;

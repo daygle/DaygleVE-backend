@@ -112,6 +112,19 @@ pub enum Op {
         #[serde(default = "default_timeout_secs")]
         timeout_secs: u64,
     },
+    /// Attach to an LXC container's console and bridge it to the client.
+    ///
+    /// LXC has no libvirt-style `ttyconsole` pty path, so the broker allocates a
+    /// pty itself and runs `lxc-console` on it, bridging the pty with the same
+    /// `Stdin`/`Stdout` stream frames as a console. The container name is
+    /// path-validated independently.
+    LxcConsoleAttach {
+        /// Container name (path-safe, validated).
+        name: String,
+        /// Session timeout in seconds, capped by [`EXEC_TIMEOUT_CAP`].
+        #[serde(default = "default_timeout_secs")]
+        timeout_secs: u64,
+    },
 }
 
 fn default_timeout_secs() -> u64 {
@@ -355,6 +368,7 @@ pub fn program_path(program: &str) -> Option<&'static str> {
         "bridge" => "/usr/sbin/bridge",
         "ip" => "/usr/sbin/ip",
         "lxc-cgroup" => "/usr/bin/lxc-cgroup",
+        "lxc-console" => "/usr/bin/lxc-console",
         "lxc-create" => "/usr/bin/lxc-create",
         "lxc-destroy" => "/usr/bin/lxc-destroy",
         "lxc-freeze" => "/usr/bin/lxc-freeze",
@@ -989,6 +1003,12 @@ pub fn validate_request(req: &Request) -> Result<(), String> {
                 return Err("timeout_secs out of range".to_string());
             }
         }
+        Op::LxcConsoleAttach { name, timeout_secs } => {
+            validate_lxc_name(name)?;
+            if *timeout_secs == 0 || *timeout_secs > EXEC_TIMEOUT_CAP.as_secs() {
+                return Err("timeout_secs out of range".to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -1213,6 +1233,27 @@ mod tests {
         assert!(validate_lxc_name("/abs").is_err());
         assert!(validate_lxc_name(".hidden").is_err());
         assert!(validate_lxc_name("").is_err());
+    }
+
+    #[test]
+    fn lxc_console_attach_validates_the_container_name() {
+        let ok = Request {
+            v: PROTOCOL_VERSION,
+            id: "t".to_string(),
+            op: Op::LxcConsoleAttach {
+                name: "web-01".to_string(),
+                timeout_secs: 300,
+            },
+        };
+        assert!(validate_request(&ok).is_ok());
+        let bad = Request {
+            op: Op::LxcConsoleAttach {
+                name: "../escape".to_string(),
+                timeout_secs: 300,
+            },
+            ..ok
+        };
+        assert!(validate_request(&bad).is_err());
     }
 
     #[test]
