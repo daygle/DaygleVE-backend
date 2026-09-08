@@ -15,6 +15,7 @@ mod pci;
 mod pools;
 mod schedules;
 mod security;
+mod snapshot_schedules;
 mod storage;
 mod usb;
 mod users;
@@ -57,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .merge(pci::routes())
         .merge(pools::routes())
         .merge(schedules::routes())
+        .merge(snapshot_schedules::routes())
         .merge(usb::routes())
         .merge(metrics::routes())
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));

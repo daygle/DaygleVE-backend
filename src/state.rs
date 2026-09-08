@@ -40,6 +40,9 @@ impl AppState {
         }
         services.backup.start_scheduler(services.clone());
         services.schedules.start_scheduler(services.clone());
+        services
+            .snapshot_schedules
+            .start_scheduler(services.clone());
         // Bring up autostart VMs in the background so a slow guest boot never
         // blocks the API from starting to serve.
         {
