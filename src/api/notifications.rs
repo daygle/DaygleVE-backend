@@ -1,7 +1,7 @@
 //! Notification-channel endpoints: CRUD plus a "send test" action.
 //!
 //! Reading channels needs `NotificationRead`; creating, modifying, deleting, or
-//! testing needs `NotificationWrite`. Secrets are never returned — the channel
+//! testing needs `NotificationWrite`. Secrets are never returned - the channel
 //! view only reports whether one is stored.
 
 use axum::extract::{Path, State};

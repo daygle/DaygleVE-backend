@@ -5,7 +5,7 @@
 //! the API returns, including fields the host tools don't round-trip cleanly).
 //! Those records live as one JSON file per id under `<state_dir>/<kind>/`, so
 //! they survive a backend restart. Live state (running/stopped, link up/down)
-//! is always overlaid from the host at read time — this store holds intent and
+//! is always overlaid from the host at read time - this store holds intent and
 //! metadata, not liveness.
 //!
 //! The store directory ultimately derives from a configured environment
@@ -46,13 +46,13 @@ impl JsonStore {
     /// ancestor that already exists (yielding a path derived from the
     /// filesystem, not the configuration) and re-append each still-missing
     /// component through [`join_component`], which admits only a single plain
-    /// name. Returns `None` — not an error — when the directory is absent and
+    /// name. Returns `None` - not an error - when the directory is absent and
     /// `create` is false, so reads on a fresh node are simply empty.
     async fn resolve_dir(&self, create: bool) -> ApiResult<Option<PathBuf>> {
         // Walk up to the nearest ancestor that already exists, recording the
         // components we skip over so they can be re-validated and re-appended.
         // We probe existence with `canonicalize` itself (the sanitizer for this
-        // query) rather than `metadata`, so the configured — hence tainted —
+        // query) rather than `metadata`, so the configured - hence tainted -
         // path never reaches a filesystem sink before it is canonicalized.
         let mut ancestor = self.dir.as_path();
         let mut tail: Vec<&OsStr> = Vec::new();
@@ -112,7 +112,7 @@ impl JsonStore {
             .map_err(|e| AppError::internal(format!("serialize record: {e}")))?;
         // Atomic write: write a temp file then rename over the target, so a
         // crash or full disk mid-write never leaves a truncated record that
-        // would break get/list — readers see either the old or new file.
+        // would break get/list - readers see either the old or new file.
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, bytes)
             .await
@@ -179,7 +179,7 @@ impl JsonStore {
         {
             // `entry.path()` is the canonical `dir` joined with a name the
             // filesystem itself supplied, so it carries no configuration or
-            // request taint — read it directly.
+            // request taint - read it directly.
             let entry_path = entry.path();
             if entry_path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
@@ -198,7 +198,7 @@ impl JsonStore {
                 .map_err(|e| AppError::internal(format!("read {}: {e}", entry_path.display())))?;
             // Skip (don't fail the whole listing on) a single unparseable record:
             // one corrupt or schema-incompatible file must not take down every
-            // record of this kind — which for the operations store would also
+            // record of this kind - which for the operations store would also
             // break startup recovery. The bad file is logged and left in place.
             match serde_json::from_slice(&bytes) {
                 Ok(value) => out.push(value),
@@ -213,7 +213,7 @@ impl JsonStore {
 
 /// Join `name` onto `dir`, accepting only a single plain filename component
 /// (no separators, no traversal). Building the path from the `file_name()`
-/// output — after canonicalizing `dir` — is the traversal barrier static
+/// output - after canonicalizing `dir` - is the traversal barrier static
 /// analysis recognises.
 fn join_component(dir: &Path, name: &str) -> ApiResult<PathBuf> {
     match Path::new(name).file_name() {

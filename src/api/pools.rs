@@ -2,7 +2,7 @@
 //!
 //! Pools are metadata (see [`crate::services::pool`]); membership lives on the
 //! guests, so member listing and the "pool not empty" delete guard are computed
-//! here by scanning VMs and containers — the API layer is where both guest
+//! here by scanning VMs and containers - the API layer is where both guest
 //! services are reachable.
 
 use axum::extract::{Path, State};

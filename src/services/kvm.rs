@@ -48,9 +48,9 @@ const CLONE_SNAPSHOT_PREFIX: &str = "daygleve-clone-";
 
 /// What a redeemed console ticket connects the browser to.
 pub enum ConsoleTarget {
-    /// A VNC TCP socket address (`host:port`) — the graphical console.
+    /// A VNC TCP socket address (`host:port`) - the graphical console.
     Vnc(String),
-    /// A serial console pty device path (`/dev/pts/<n>`) — the text console.
+    /// A serial console pty device path (`/dev/pts/<n>`) - the text console.
     Serial(String),
 }
 
@@ -493,7 +493,7 @@ impl KvmService {
             description: req.description.or(src.description.clone()),
             guest_agent: false,
             firewall: VmFirewall::default(),
-            // A clone is a fresh, runnable VM — never a template — and does not
+            // A clone is a fresh, runnable VM - never a template - and does not
             // inherit the source's autostart intent.
             template: false,
             autostart: false,
@@ -623,7 +623,7 @@ impl KvmService {
             VmPowerAction::Resume => "resume",
             VmPowerAction::Shutdown => {
                 // Prefer guest-agent shutdown when the agent is enabled and the VM is
-                // running — the guest can then quiesce (flush writes, stop services)
+                // running - the guest can then quiesce (flush writes, stop services)
                 // before power-off. Fall back to the ACPI button press when the agent
                 // is not connected (it may not be installed in the guest yet).
                 if vm.guest_agent && self.live_state(&vm.id).await == Some(VmState::Running) {
@@ -665,7 +665,7 @@ impl KvmService {
     /// Start every autostart-enabled VM in order, once, at host boot. VMs are
     /// started lowest `startup_order` first (unordered VMs last, then by
     /// creation time), skipping templates and any VM already running. Failures
-    /// are logged and never abort the sequence — one guest that won't start must
+    /// are logged and never abort the sequence - one guest that won't start must
     /// not block the rest. Intended to be spawned from startup, not awaited on
     /// the request path.
     pub async fn start_autostart_vms(&self) {
@@ -1032,7 +1032,7 @@ impl KvmService {
         command::run_ok("zfs", &["set", &format!("volsize={new_size}"), dataset]).await?;
 
         // The zvol is grown; if telling the live guest fails (agent/qemu busy,
-        // VM powering off), the size is still persisted — the guest picks the
+        // VM powering off), the size is still persisted - the guest picks the
         // new size up on its next start.
         let target = disk_target_name(index, disk.bus);
         if self.live_state(id).await == Some(VmState::Running) {
@@ -1310,8 +1310,8 @@ impl KvmService {
     /// List the VM's snapshots, one entry per snapshot name present on *every*
     /// one of the VM's disks. `used_bytes` is summed over those per-disk
     /// snapshots. Names that cover only some disks (e.g. a partial cross-pool
-    /// create) are omitted, so the list stays consistent with rollback/delete —
-    /// which operate on all disks — and with the summed-bytes semantics.
+    /// create) are omitted, so the list stays consistent with rollback/delete -
+    /// which operate on all disks - and with the summed-bytes semantics.
     pub async fn list_snapshots(&self, id: &str) -> ApiResult<Vec<VmSnapshot>> {
         let vm = self.get_stored(id).await?;
         let datasets = snapshot_datasets(&vm)?;
@@ -1322,7 +1322,7 @@ impl KvmService {
             // `-d 1` limits to the dataset's own snapshots; `-p` gives raw bytes
             // and a unix `creation`. A dataset that exists but has no snapshots
             // lists cleanly (empty output), so a *non-zero* exit is either a
-            // not-yet-provisioned dataset (skip) or a genuine failure — a missing
+            // not-yet-provisioned dataset (skip) or a genuine failure - a missing
             // `zfs` binary (dev host) yields `Ok(None)`, also nothing to list.
             let out = match command::run_optional(
                 "zfs",
@@ -1439,7 +1439,7 @@ impl KvmService {
 
     /// Snapshot the VM under a single name.
     ///
-    /// `disk` (the default) captures every backing ZFS dataset — works while the
+    /// `disk` (the default) captures every backing ZFS dataset - works while the
     /// VM is running (crash-consistent), and when the guest agent is connected
     /// the guest's filesystems are frozen around the capture so the result is
     /// application-consistent. `ram` additionally saves the guest's memory via
@@ -1735,7 +1735,7 @@ impl KvmService {
         }
     }
 
-    /// True only when virsh is installed but the libvirt connection is unusable —
+    /// True only when virsh is installed but the libvirt connection is unusable -
     /// the one case where an unreadable domain state might be hiding a running VM.
     /// A missing virsh binary (`Ok(None)`) means there is no hypervisor at all, and
     /// a healthy connection (`Ok(Some)`) means an unreadable domain is simply not
@@ -1827,7 +1827,7 @@ impl KvmService {
             return Err(AppError::validation("disk size_gib must be >= 1"));
         }
         // Reuse an existing dataset; otherwise create it. Distinguish "zfs not
-        // installed" (fail fast — we must never define a domain pointing at a
+        // installed" (fail fast - we must never define a domain pointing at a
         // zvol that was never provisioned) from "dataset does not exist yet".
         match command::run_optional("zfs", &["list", "-H", "-o", "name", dataset]).await {
             Ok(Some(_)) => return Ok(false),
@@ -1978,8 +1978,8 @@ const CONNECT: &str = "qemu:///system";
 
 /// Collect `*.iso` regular files under `root` (up to `max_depth` levels deep;
 /// 0 means the root only), appending an [`IsoImage`] tagged with `storage` for
-/// each. Symlinks are never followed — a plain directory entry that is a
-/// symlink is skipped — so an ISO can never resolve outside the scanned root.
+/// each. Symlinks are never followed - a plain directory entry that is a
+/// symlink is skipped - so an ISO can never resolve outside the scanned root.
 /// Unreadable directories are silently skipped so one bad share can't fail the
 /// whole listing.
 async fn scan_iso_dir(
@@ -2169,8 +2169,8 @@ fn snapshot_datasets(vm: &Vm) -> ApiResult<Vec<&str>> {
 
 /// Validate a ZFS dataset path and return it, so callers build `zfs` arguments
 /// from the sanitizer's output (path/flag-injection barrier). Allows the ZFS
-/// dataset charset — letters, digits, and the punctuation `_`, `-`, `.`, `:`,
-/// `/` — while rejecting an empty path, a leading `-` (which a host CLI could
+/// dataset charset - letters, digits, and the punctuation `_`, `-`, `.`, `:`,
+/// `/` - while rejecting an empty path, a leading `-` (which a host CLI could
 /// read as a flag) and any `..` traversal component.
 fn ensure_safe_dataset(dataset: &str) -> ApiResult<&str> {
     ensure_safe_zfs_dataset(dataset)
@@ -2178,8 +2178,8 @@ fn ensure_safe_dataset(dataset: &str) -> ApiResult<&str> {
 
 /// Validate a *user-supplied* ZFS snapshot tag and return it, so callers build
 /// the `dataset@tag` from the sanitizer's output (path/flag-injection barrier).
-/// Accepts the ZFS-safe set — letters, digits, and the punctuation `_`, `-`,
-/// `.`, `:` (no spaces) — rejects a leading `-` that a host CLI could read as a
+/// Accepts the ZFS-safe set - letters, digits, and the punctuation `_`, `-`,
+/// `.`, `:` (no spaces) - rejects a leading `-` that a host CLI could read as a
 /// flag, and rejects the reserved clone-base prefix so no user snapshot
 /// entrypoint (create/rollback/delete) can target an internal clone base.
 /// Internal clone bases build their tag directly and never pass through here.

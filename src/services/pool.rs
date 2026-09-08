@@ -1,6 +1,6 @@
 //! Resource pools: named, lightweight groupings of guests.
 //!
-//! A pool is pure metadata — a name and an optional comment — persisted as a
+//! A pool is pure metadata - a name and an optional comment - persisted as a
 //! JSON record. Membership is not stored here; each guest carries an optional
 //! `pool` naming the pool it belongs to, so this service never mutates guests.
 //! The pool name is the stable identifier and is immutable once created;

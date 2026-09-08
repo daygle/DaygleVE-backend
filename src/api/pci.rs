@@ -27,7 +27,7 @@ async fn list(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<V
 
 /// Bind a PCI function to `vfio-pci` so it can be passed through. Reuses the GPU
 /// service's bind (same operation for any device class); returns the bound
-/// device as a `GpuDevice` shell — only its `available`/driver state matters
+/// device as a `GpuDevice` shell - only its `available`/driver state matters
 /// here.
 async fn bind(
     user: AuthUser,

@@ -4,7 +4,7 @@
 //! and prunes older automatic snapshots so at most `keep` are retained. Records
 //! persist (JSON store) so schedules survive a restart, and a background tick
 //! fires due schedules. Automatic snapshots are named `auto-<timestamp>` so
-//! retention only ever removes snapshots this feature created — manual
+//! retention only ever removes snapshots this feature created - manual
 //! snapshots are never touched. Cron is standard 5-field, evaluated in UTC.
 
 use std::sync::Arc;

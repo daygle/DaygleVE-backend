@@ -7,7 +7,7 @@ description = "DaygleVE hypervisor engine: KVM/QEMU + LXC + ZFS + networking + G
 repository = "https://github.com/daygle/DaygleVE-backend"
 
 [dependencies]
-# Shared API contract. Types are imported from DaygleVE-schema — never
+# Shared API contract. Types are imported from DaygleVE-schema - never
 # redefined here. Tracks the schema's `main`; move to a tagged release once the
 # schema publishes one (see docs/VERSIONING.md there).
 daygleve-schema = { git = "https://github.com/daygle/DaygleVE-schema", branch = "main" }

@@ -1,7 +1,7 @@
 //! ZFS storage service: pools, datasets, snapshots and clones.
 //!
 //! Drives the `zpool`/`zfs` CLIs and parses their `-Hp` (script-friendly,
-//! parseable) output. ZFS itself is the source of truth — nothing is cached.
+//! parseable) output. ZFS itself is the source of truth - nothing is cached.
 //! On a host without ZFS installed, the list endpoints degrade to empty rather
 //! than erroring (see [`command::run_optional`]).
 

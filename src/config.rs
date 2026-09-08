@@ -41,7 +41,7 @@ pub struct Config {
     /// endpoints, which bypass the small global request-body limit.
     pub max_upload_bytes: u64,
     /// Address SPICE displays listen on. `DAYGLEVE_SPICE_LISTEN`, default
-    /// `127.0.0.1` (localhost only — reach it via an SSH tunnel). Set to a
+    /// `127.0.0.1` (localhost only - reach it via an SSH tunnel). Set to a
     /// management-interface address to let `remote-viewer` connect directly;
     /// this is also the host written into the downloaded `.vv` connection file.
     pub spice_listen: String,
@@ -64,7 +64,7 @@ pub struct Config {
     /// Unix socket of the root-owned host broker. `DAYGLEVE_BROKER_SOCKET`.
     /// When set, every allowlisted host command, PCI sysfs write, and LXC
     /// config write is delegated to the broker process instead of being
-    /// performed directly — the privilege split from the security plan.
+    /// performed directly - the privilege split from the security plan.
     /// When unset (dev hosts), the backend executes host tools directly.
     pub broker_socket: Option<PathBuf>,
 }

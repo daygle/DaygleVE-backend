@@ -57,7 +57,7 @@ impl GpuService {
             )));
         }
 
-        // Rebind every function in the IOMMU group — a group is the smallest
+        // Rebind every function in the IOMMU group - a group is the smallest
         // unit that can be isolated and passed through.
         for addr in iommu_group_members(&dir).await? {
             ensure_safe_pci_address(&addr)?;
@@ -91,7 +91,7 @@ async fn bind_one(addr: &str, force: bool) -> ApiResult<()> {
 
     // driver_override pins the device to vfio-pci for the subsequent bind.
     crate::services::command::pci_write(crate::broker::PciWriteKind::Override, addr).await?;
-    // Ignore an "already bound"/EBUSY here — the override + a fresh bind is
+    // Ignore an "already bound"/EBUSY here - the override + a fresh bind is
     // best-effort and the device may already be attached.
     let _ = crate::services::command::pci_write(crate::broker::PciWriteKind::Bind, addr).await;
     Ok(())

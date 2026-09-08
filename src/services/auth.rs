@@ -7,7 +7,7 @@
 //! Users are **persisted** to the JSON record store (`<state_dir>/users`) so
 //! accounts, roles and password hashes survive a restart; an in-memory cache
 //! fronts them for fast, lock-only reads on the hot authentication path. Bearer
-//! tokens remain in-memory by design — sessions are ephemeral, so they simply
+//! tokens remain in-memory by design - sessions are ephemeral, so they simply
 //! reset on restart and clients re-authenticate. On first start (empty store) a
 //! single `admin` account is seeded: from `DAYGLEVE_ADMIN_PASSWORD` when set,
 //! otherwise from a generated random password (written to a root-only file)
@@ -106,7 +106,7 @@ impl AuthService {
                 let path = self.config.state_dir.join("initial-admin-password");
                 write_secret_file(&path, &generated).await?;
                 tracing::warn!(
-                    "no DAYGLEVE_ADMIN_PASSWORD set; wrote a generated initial admin password to {} — log in as 'admin' and change it immediately",
+                    "no DAYGLEVE_ADMIN_PASSWORD set; wrote a generated initial admin password to {} - log in as 'admin' and change it immediately",
                     path.display()
                 );
                 (generated, true)
@@ -142,7 +142,7 @@ impl AuthService {
             users
                 .values()
                 // Usernames are unique case-insensitively (see create_user) and
-                // stored trimmed, so match the same way here — otherwise an
+                // stored trimmed, so match the same way here - otherwise an
                 // account created as "Admin" could never log in as "admin".
                 .find(|u| u.user.username.eq_ignore_ascii_case(req.username.trim()))
                 .map(|stored| (stored.user.id.clone(), stored.password_hash.clone()))
@@ -689,7 +689,7 @@ mod tests {
         let svc = AuthService::new(config);
         svc.load_or_seed().await.unwrap();
 
-        // An unknown username is rejected — and still runs through the dummy-hash
+        // An unknown username is rejected - and still runs through the dummy-hash
         // verification so it can't be told apart from a wrong password by timing.
         assert!(svc
             .login(LoginRequest {
@@ -704,7 +704,7 @@ mod tests {
                 password: rand_password(),
             })
             .is_err());
-        // Correct credentials succeed — and the username match is
+        // Correct credentials succeed - and the username match is
         // case-insensitive and trim-tolerant, consistent with how usernames are
         // stored and uniqueness is enforced.
         let ok = svc

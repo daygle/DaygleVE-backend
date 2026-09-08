@@ -1,6 +1,6 @@
 //! The service layer: one module per hypervisor/host subsystem.
 //!
-//! Handlers in [`crate::api`] stay thin — they parse/authorize requests and
+//! Handlers in [`crate::api`] stay thin - they parse/authorize requests and
 //! delegate all host interaction to these services. Each service drives the
 //! host by shelling out to the real tools (`virsh`/`qemu-img`, `lxc-*`,
 //! `zfs`/`zpool`, `ip`/`bridge`, `vfio` via sysfs, `/proc`), with DaygleVE's
@@ -189,7 +189,7 @@ impl Services {
 /// record store, LXC config paths).
 ///
 /// On success it **returns the validated id**, so callers build paths from the
-/// sanitizer's output rather than the raw input — making the barrier explicit
+/// sanitizer's output rather than the raw input - making the barrier explicit
 /// to both readers and static analysis (breaks path-injection taint).
 pub(crate) fn ensure_safe_id(id: &str) -> crate::error::ApiResult<&str> {
     let safe = !id.is_empty()
@@ -401,7 +401,7 @@ pub(crate) fn new_id() -> daygleve_schema::common::ResourceId {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Whether `s` is exactly four ASCII hex digits — the shape of a USB
+/// Whether `s` is exactly four ASCII hex digits - the shape of a USB
 /// `vendor`/`product` id. Used to vet ids before they reach a domain XML
 /// `<hostdev>` source or a sysfs comparison.
 pub(crate) fn is_hex4(s: &str) -> bool {

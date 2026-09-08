@@ -1,4 +1,4 @@
-//! DaygleVE backend — the hypervisor engine and REST API server.
+//! DaygleVE backend - the hypervisor engine and REST API server.
 //!
 //! This binary wires configuration, the shared application state, the service
 //! layer (KVM/QEMU, LXC, ZFS, networking, GPU, metrics, auth) and the
@@ -48,7 +48,7 @@ async fn main() -> anyhow_lite::Result<()> {
     // almost always a mistake that would otherwise silently serve plaintext.
     if config.tls_cert.is_some() != config.tls_key.is_some() {
         tracing::error!(
-            "only one of DAYGLEVE_TLS_CERT/DAYGLEVE_TLS_KEY is set — TLS is DISABLED and the server will serve plaintext HTTP; set BOTH (or neither)"
+            "only one of DAYGLEVE_TLS_CERT/DAYGLEVE_TLS_KEY is set - TLS is DISABLED and the server will serve plaintext HTTP; set BOTH (or neither)"
         );
     }
 

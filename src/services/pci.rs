@@ -1,8 +1,8 @@
 //! General PCI passthrough service: non-GPU host PCI inventory from sysfs.
 //!
 //! Enumerates PCI functions under `/sys/bus/pci/devices`, excluding display
-//! controllers (base class 0x03 — those belong to the GPU flow) and PCI bridges
-//! (base class 0x06 — not meaningfully attachable). The vfio bind step reuses
+//! controllers (base class 0x03 - those belong to the GPU flow) and PCI bridges
+//! (base class 0x06 - not meaningfully attachable). The vfio bind step reuses
 //! the GPU service's `bind`, since binding a function to `vfio-pci` is the same
 //! operation regardless of device class.
 

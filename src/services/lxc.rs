@@ -247,7 +247,7 @@ impl LxcService {
 
         // Apply a rootfs quota (best-effort) and write limits + networking. If
         // writing the config fails, the container/rootfs already exist on the
-        // host — tear them down so we don't leave an orphan the record never
+        // host - tear them down so we don't leave an orphan the record never
         // tracks.
         let quota = format!("quota={}G", req.rootfs_size_gib);
         if let Err(e) = command::run_ok("zfs", &["set", &quota, &rootfs_dataset]).await {
@@ -634,7 +634,7 @@ impl LxcService {
     }
 
     /// Whether the container is stopped, so a destructive rollback can be
-    /// rejected while it is running/frozen. `None` (state indeterminate — e.g. a
+    /// rejected while it is running/frozen. `None` (state indeterminate - e.g. a
     /// dev host without `lxc`) is treated as permissible, matching the VM path.
     async fn require_stopped(&self, ct: &Lxc, action: &str) -> ApiResult<()> {
         match self.live_state(&ct.name).await {

@@ -4,7 +4,7 @@
 //! Files live under `config.iso_dir` (kind `iso`) and `config.template_dir`
 //! (kind `ct_template`). These directories sit inside the backend's state area,
 //! which the `daygleve` account already owns and writes (VM/container records,
-//! backups), so uploads are performed directly rather than through the broker —
+//! backups), so uploads are performed directly rather than through the broker -
 //! the broker mediates *host* mutation (libvirt/ZFS/PCI), not state-local file
 //! writes.
 //!
@@ -224,7 +224,7 @@ impl LibraryService {
     /// Delete a file from a library. A missing file is a 404.
     ///
     /// The target is located by enumerating the library and matching the
-    /// requested name, then removed by the path the directory listing produced —
+    /// requested name, then removed by the path the directory listing produced -
     /// the request value is only ever compared, never joined into a filesystem
     /// path.
     pub async fn delete(&self, kind: StorageFileKind, name: &str) -> ApiResult<()> {
@@ -299,7 +299,7 @@ fn join_component(dir: &Path, name: &str) -> ApiResult<PathBuf> {
 /// Validate a bare upload file name and return it unchanged on success.
 ///
 /// Rejects empty names, `.`/`..`, anything containing a path separator or a
-/// control byte, absurdly long names, and — per kind — a wrong extension. The
+/// control byte, absurdly long names, and - per kind - a wrong extension. The
 /// returned `&str` is the value callers build the on-disk path from, keeping
 /// the barrier explicit to readers and taint analysis.
 pub fn validate_library_filename(name: &str, kind: StorageFileKind) -> ApiResult<&str> {

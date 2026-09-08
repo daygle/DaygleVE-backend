@@ -8,7 +8,7 @@
 <h1 align="center">DaygleVE-backend</h1>
 
 <p align="center">
-The <strong>hypervisor engine</strong> for <a href="https://github.com/daygle">DaygleVE</a> —
+The <strong>hypervisor engine</strong> for <a href="https://github.com/daygle">DaygleVE</a> -
 a modern, single-node virtualization platform (a faster, safer, cleaner
 alternative to Proxmox). Written in Rust with
 <a href="https://github.com/tokio-rs/axum">Axum</a> + <a href="https://tokio.rs">Tokio</a>.

@@ -821,8 +821,8 @@ fn validate_exec_args(program: &str, args: &[String]) -> Result<(), String> {
                 .and_then(|i| args.get(i + 2))
                 .map(String::as_str)
                 .ok_or_else(|| "virsh command is missing".to_string())?;
-            // Device hot(mun)plug has a fixed shape — `<domain> <device.xml>`
-            // — and the XML file must live under DaygleVE's state dir.
+            // Device hot(mun)plug has a fixed shape - `<domain> <device.xml>`
+            // - and the XML file must live under DaygleVE's state dir.
             if matches!(command, "attach-device" | "detach-device") {
                 let rest: Vec<&str> = args
                     .iter()
@@ -1142,7 +1142,7 @@ pub fn validate_request(req: &Request) -> Result<(), String> {
 /// Validate a console pty device path: exactly `/dev/pts/<digits>`.
 ///
 /// The broker opens this device read-write, so it must be constrained to the
-/// kernel's pty namespace and nothing else — no traversal, no arbitrary device
+/// kernel's pty namespace and nothing else - no traversal, no arbitrary device
 /// or file path.
 pub fn validate_console_pty(pty: &str) -> Result<(), String> {
     let index = pty

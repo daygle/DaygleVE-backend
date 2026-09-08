@@ -396,7 +396,7 @@ pub async fn console_attach(pty: &str) -> ApiResult<(ConsoleReadHalf, ConsoleWri
 
 /// Open a bridge to an LXC container console. Through the broker when configured
 /// (the broker allocates a pty and runs `lxc-console`); otherwise a dev-only
-/// fallback that pipes `lxc-console` directly (no pty — basic line I/O).
+/// fallback that pipes `lxc-console` directly (no pty - basic line I/O).
 pub async fn lxc_console_attach(name: &str) -> ApiResult<(ConsoleReadHalf, ConsoleWriteHalf)> {
     crate::broker::validate_lxc_name(name).map_err(AppError::validation)?;
     #[cfg(unix)]

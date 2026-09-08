@@ -43,7 +43,7 @@ struct MetricsStreamTicket {
 
 /// Mint a stream ticket for an authenticated `MetricsRead` caller. The browser
 /// exchanges its bearer token (sent here as a normal `Authorization` header) for
-/// this ticket, then opens `EventSource` with `?ticket=…` — so the long-lived
+/// this ticket, then opens `EventSource` with `?ticket=…` - so the long-lived
 /// token never travels in a URL (where it would land in history and proxy logs).
 async fn stream_ticket(
     user: AuthUser,

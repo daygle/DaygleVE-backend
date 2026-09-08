@@ -29,7 +29,7 @@ use crate::error::{ApiResult, AppError};
 use crate::services::store::JsonStore;
 use crate::services::{new_id, now_ts};
 
-/// Persisted channel record — the schema view plus the write-only secret.
+/// Persisted channel record - the schema view plus the write-only secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredChannel {
     id: ResourceId,

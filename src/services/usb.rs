@@ -2,8 +2,8 @@
 //!
 //! Enumerates real USB devices under `/sys/bus/usb/devices` (each carries
 //! `idVendor`/`idProduct`), skipping USB interfaces (named `X-Y:Z.W`, no
-//! `idVendor`) and hubs. Devices are keyed by USB `vendor:product` — the same
-//! stable identity a VM passes through — and de-duplicated so identical devices
+//! `idVendor`) and hubs. Devices are keyed by USB `vendor:product` - the same
+//! stable identity a VM passes through - and de-duplicated so identical devices
 //! appear once. Attachment itself is handled by the KVM service via a
 //! `<hostdev type='usb'>` element; this service only inventories.
 
@@ -56,7 +56,7 @@ impl UsbService {
             if !is_hex4(&vendor_id) || !is_hex4(&product_id) {
                 continue;
             }
-            // Skip hubs (USB device class 0x09) — they aren't meaningfully
+            // Skip hubs (USB device class 0x09) - they aren't meaningfully
             // attachable and only add noise.
             if read_trimmed(&dir.join("bDeviceClass")).await.as_deref() == Some("09") {
                 continue;
