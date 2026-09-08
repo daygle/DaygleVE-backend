@@ -55,6 +55,7 @@ pub mod network;
 pub mod operations;
 pub mod pci;
 pub mod pool;
+pub mod schedule;
 pub mod shares;
 pub mod store;
 pub mod usb;
@@ -141,6 +142,8 @@ pub struct Services {
     /// Resource pools (guest groupings). Independent metadata store; guests
     /// carry their own pool membership.
     pub pools: pool::PoolService,
+    /// Cron-scheduled guest power actions. Evaluated by a background tick.
+    pub schedules: Arc<schedule::ScheduleService>,
     /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
     /// enumerate ISOs living on mounted shares.
     pub shares: Arc<shares::ShareService>,
@@ -163,6 +166,7 @@ impl Services {
             usb: usb::UsbService::new(),
             metrics: metrics::MetricsService::new(),
             pools: pool::PoolService::new(config.clone()),
+            schedules: Arc::new(schedule::ScheduleService::new(config.clone())),
             shares,
         }
     }

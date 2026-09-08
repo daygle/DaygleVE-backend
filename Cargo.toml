@@ -44,6 +44,7 @@ libc = "0.2"
 # terminal (lxc has no libvirt-style ttyconsole pty path). The crate's `unsafe`
 # is internal; this crate stays `unsafe_code = "forbid"`.
 pty-process = { version = "0.4", features = ["async"] }
+croner = "2"
 
 [lints.rust]
 unsafe_code = "forbid"

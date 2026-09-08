@@ -270,6 +270,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "croner"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c344b0690c1ad1c7176fe18eb173e0c927008fdaaa256e40dfd43ddd149c0843"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,6 +303,7 @@ dependencies = [
  "axum-server",
  "base64",
  "chrono",
+ "croner",
  "daygleve-schema",
  "futures",
  "http-body-util",
@@ -317,7 +327,7 @@ dependencies = [
 [[package]]
 name = "daygleve-schema"
 version = "1.0.0"
-source = "git+https://github.com/daygle/DaygleVE-schema?branch=main#08ced6e8485ad5540e254e8f2729fe5f1d7c4d39"
+source = "git+https://github.com/daygle/DaygleVE-schema?branch=main#beb58cafcc186265041a72fd7391ff421f93e31a"
 dependencies = [
  "serde",
  "serde_json",
