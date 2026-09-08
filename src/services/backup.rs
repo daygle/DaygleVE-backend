@@ -25,7 +25,9 @@ use crate::error::{ApiResult, AppError};
 use crate::services::command;
 use crate::services::operations::OperationService;
 use crate::services::store::JsonStore;
-use crate::services::{ensure_safe_id, ensure_safe_zfs_dataset, new_id, now_ts, Services};
+use crate::services::{
+    ensure_safe_id, ensure_safe_zfs_dataset, ensure_safe_zfs_snapshot, new_id, now_ts, Services,
+};
 
 const MIN_INTERVAL_SECS: u64 = 60;
 const MAX_RETENTION: u32 = 3650;
@@ -83,6 +85,12 @@ impl BackupService {
             destination: req.destination.trim().to_string(),
             interval_secs: req.interval_secs,
             retention_count: req.retention_count,
+            from_snapshot: req
+                .from_snapshot
+                .as_deref()
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_string),
             verify: req.verify,
             enabled: req.enabled,
             created_at: now,
@@ -108,6 +116,9 @@ impl BackupService {
         if let Some(retention) = req.retention_count {
             validate_retention(retention)?;
             plan.retention_count = retention;
+        }
+        if let Some(tag) = &req.from_snapshot {
+            plan.from_snapshot = validate_from_snapshot(tag)?;
         }
         if let Some(verify) = req.verify {
             plan.verify = verify;
@@ -258,6 +269,49 @@ impl BackupService {
                 "restore currently supports one-dataset artifacts only",
             ));
         }
+        // An incremental stream can only be received on top of its base
+        // snapshot. The operator points at the earlier artifact that contains
+        // the full stream; we verify it belongs to the same plan/dataset and
+        // is actually the recorded base before chaining the two receives.
+        let base_file = match req.base_artifact_id.as_deref() {
+            Some(base_id) => {
+                let base_artifact = self.get_artifact(base_id).await?;
+                if base_artifact.plan_id != artifact.plan_id {
+                    return Err(AppError::validation(
+                        "base artifact belongs to a different backup plan",
+                    ));
+                }
+                let file = &artifact.files[0];
+                let Some(base_snapshot) = &file.incremental_from else {
+                    return Err(AppError::validation(
+                        "this artifact is a full stream and needs no base",
+                    ));
+                };
+                let base_file = base_artifact
+                    .files
+                    .iter()
+                    .find(|f| f.snapshot == *base_snapshot)
+                    .ok_or_else(|| {
+                        AppError::validation(
+                            "base artifact does not contain the incremental base snapshot",
+                        )
+                    })?;
+                if !base_artifact.verified {
+                    return Err(AppError::conflict(
+                        "base artifact is not verified; verify it before restoring",
+                    ));
+                }
+                Some(base_file.clone())
+            }
+            None => {
+                if artifact.files[0].incremental_from.is_some() {
+                    return Err(AppError::validation(
+                        "this artifact is an incremental stream; pass base_artifact_id of the full backup it builds on",
+                    ));
+                }
+                None
+            }
+        };
         let target = match (artifact.source_type, req.target_id.as_deref()) {
             (BackupSourceType::Dataset, Some(target)) => target.trim().to_string(),
             (BackupSourceType::Dataset, None) => artifact.source_id.clone(),
@@ -287,10 +341,22 @@ impl BackupService {
                 move |ops, handle| async move {
                     ops.update_progress(&handle.id, 10, Some("verifying backup file"))
                         .await?;
+                    if let Some(base) = &base_file {
+                        worker.verify_file(base).await?;
+                    }
                     worker.verify_file(&file).await?;
                     ops.update_progress(&handle.id, 35, Some("restoring ZFS stream"))
                         .await?;
-                    worker.restore_file(&file, &target, force).await?;
+                    if file.incremental_from.is_some() {
+                        // Chained restore: full base stream first (creating the
+                        // target and its base snapshot), then the delta on top.
+                        if let Some(base) = &base_file {
+                            worker.restore_file(base, &target, force).await?;
+                        }
+                        worker.restore_incremental_file(&file, &target).await?;
+                    } else {
+                        worker.restore_file(&file, &target, force).await?;
+                    }
                     Ok(Some(format!("restored {} to {}", file.snapshot, target)))
                 },
             )
@@ -381,6 +447,32 @@ impl BackupService {
         let mut files = Vec::new();
         let mut created_snapshots = Vec::new();
         let result = async {
+            // Resolve the incremental base before touching anything: every
+            // source dataset must already carry the plan's base snapshot, and
+            // `zfs send -i` refuses a base that is not an ancestor of the new
+            // snapshot. Failing here surfaces a misconfigured plan as a clean
+            // validation error instead of a half-written artifact. This runs
+            // inside the result block so a failed pre-flight still advances
+            // the plan's schedule instead of hot-retrying every tick.
+            let bases = match &plan.from_snapshot {
+                Some(tag) => {
+                    let mut bases = Vec::with_capacity(datasets.len());
+                    for dataset in &datasets {
+                        let base = format!("{dataset}@{tag}");
+                        let exists =
+                            command::run_optional("zfs", &["list", "-H", "-o", "name", &base])
+                                .await?;
+                        if exists.is_none() {
+                            return Err(AppError::validation(format!(
+                                "incremental base snapshot {base} does not exist on the source"
+                            )));
+                        }
+                        bases.push(base);
+                    }
+                    Some(bases)
+                }
+                None => None,
+            };
             for (index, dataset) in datasets.iter().enumerate() {
                 operations
                     .update_progress(
@@ -397,7 +489,14 @@ impl BackupService {
                 command::run_ok("zfs", &["snapshot", &snapshot]).await?;
                 created_snapshots.push(snapshot.clone());
                 let path = destination.join(format!("{}-{}.zfs", artifact_id, index));
-                let size = self.send_to_file(&snapshot, &path).await?;
+                let incremental_from = bases.as_ref().map(|bases| bases[index].clone());
+                let size = match &incremental_from {
+                    Some(base) => {
+                        self.send_incremental_to_file(base, &snapshot, &path)
+                            .await?
+                    }
+                    None => self.send_to_file(&snapshot, &path).await?,
+                };
                 let sha = sha256_file(&path).await?;
                 if plan.verify {
                     operations
@@ -408,6 +507,7 @@ impl BackupService {
                 files.push(BackupFile {
                     dataset: (*dataset).to_string(),
                     snapshot: snapshot.clone(),
+                    incremental_from: incremental_from.clone(),
                     path: path.to_string_lossy().into_owned(),
                     size_bytes: size,
                     sha256: sha,
@@ -472,6 +572,20 @@ impl BackupService {
         command::stream_to_file("zfs", &args, path).await
     }
 
+    /// Incremental stream between an existing base snapshot and a fresh one.
+    /// Both arguments are `dataset@tag` references built from sanitized
+    /// components; `zfs send` rejects a base that is not an ancestor of the
+    /// target, which is the last line of defense after the pre-flight check.
+    async fn send_incremental_to_file(
+        &self,
+        base: &str,
+        snapshot: &str,
+        path: &Path,
+    ) -> ApiResult<u64> {
+        let args = zfs_incremental_send_args(base, snapshot);
+        command::stream_to_file("zfs", &args, path).await
+    }
+
     async fn restore_file(&self, file: &BackupFile, target: &str, force: bool) -> ApiResult<()> {
         ensure_safe_zfs_dataset(target)?;
         let exists = command::run_optional("zfs", &["list", "-H", "-o", "name", target]).await?;
@@ -482,6 +596,22 @@ impl BackupService {
         }
         if exists.is_some() && force {
             command::run_ok("zfs", &["destroy", "-r", target]).await?;
+        }
+        let args = ["receive", "-F", target];
+        command::stream_from_file("zfs", &args, Path::new(&file.path)).await
+    }
+
+    /// Receive an incremental stream into an existing target that already
+    /// carries the base snapshot. `zfs receive -F` rolls back the target to the
+    /// base before applying the delta; the base snapshot must exist on the
+    /// target or `zfs receive` fails with a clear error.
+    async fn restore_incremental_file(&self, file: &BackupFile, target: &str) -> ApiResult<()> {
+        ensure_safe_zfs_dataset(target)?;
+        let exists = command::run_optional("zfs", &["list", "-H", "-o", "name", target]).await?;
+        if exists.is_none() {
+            return Err(AppError::validation(
+                "incremental restore requires the target dataset to already exist with the base snapshot; restore the base artifact first",
+            ));
         }
         let args = ["receive", "-F", target];
         command::stream_from_file("zfs", &args, Path::new(&file.path)).await
@@ -556,6 +686,25 @@ fn validate_plan_request(req: &CreateBackupPlanRequest) -> ApiResult<()> {
         }
     }
     Ok(())
+}
+
+/// Validate the plan's incremental base tag. Empty means "no base" (full
+/// sends); otherwise the tag must pass the shared ZFS snapshot sanitizer so it
+/// can never smuggle a `dataset@` reference, a flag, or shell metacharacters
+/// into `zfs send -i`.
+fn validate_from_snapshot(tag: &str) -> ApiResult<Option<String>> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Ok(None);
+    }
+    ensure_safe_zfs_snapshot(tag).map(|safe| Some(safe.to_string()))
+}
+
+/// Build the `zfs send -i <base> <snapshot>` argv. Kept pure for unit tests:
+/// both arguments are `dataset@tag` references that were validated upstream
+/// (dataset via `ensure_safe_zfs_dataset`, tag via `ensure_safe_zfs_snapshot`).
+fn zfs_incremental_send_args<'a>(base: &'a str, snapshot: &'a str) -> Vec<&'a str> {
+    vec!["send", "-i", base, snapshot]
 }
 
 fn validate_interval(value: Option<u64>) -> ApiResult<()> {
@@ -671,5 +820,33 @@ mod tests {
         assert!(validate_interval(Some(59)).is_err());
         assert!(validate_retention(1).is_ok());
         assert!(validate_retention(0).is_err());
+    }
+
+    #[test]
+    fn from_snapshot_validation_accepts_tags_and_blank_means_full() {
+        assert_eq!(
+            validate_from_snapshot("nightly").unwrap(),
+            Some("nightly".into())
+        );
+        assert_eq!(
+            validate_from_snapshot("  base-2024_01 ").unwrap(),
+            Some("base-2024_01".into())
+        );
+        // Blank / whitespace-only means "no incremental base".
+        assert_eq!(validate_from_snapshot("   ").unwrap(), None);
+        // Path-like or reference-shaped tags are refused: the plan stores a
+        // tag, and `dataset@tag` is assembled by the service itself.
+        assert!(validate_from_snapshot("tank/vms@base").is_err());
+        assert!(validate_from_snapshot("-flag").is_err());
+        assert!(validate_from_snapshot("bad tag").is_err());
+    }
+
+    #[test]
+    fn incremental_send_args_match_the_expected_shape() {
+        let args = zfs_incremental_send_args("tank/vms/abc@base", "tank/vms/abc@b1");
+        assert_eq!(
+            args,
+            vec!["send", "-i", "tank/vms/abc@base", "tank/vms/abc@b1"]
+        );
     }
 }

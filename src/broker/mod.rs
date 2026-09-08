@@ -552,6 +552,20 @@ fn validate_zfs_args(args: &[String]) -> Result<(), String> {
             index += 2;
             continue;
         }
+        // `zfs send -i <base-snapshot>`: the value must be a full
+        // `dataset@tag` reference, validated more strictly than a plain
+        // option value. Outside `send`, `-i` keeps the generic option
+        // handling (`zfs list -i`).
+        if command == "send" && arg == "-i" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "-i requires a base snapshot value".to_string())?;
+            if command == "send" && !safe_snapshot_ref(value) {
+                return Err("ZFS incremental base snapshot is unsafe".to_string());
+            }
+            index += 2;
+            continue;
+        }
         if arg.starts_with('-') {
             return Err(format!("ZFS option `{arg}` is not permitted"));
         }
@@ -1102,6 +1116,37 @@ mod tests {
     #[test]
     fn exec_validation_rejects_bad_programs_and_args() {
         assert!(validate_exec("sh", &["-c".to_string(), "id".to_string()]).is_err());
+        // Incremental send: `-i` consumes the following snapshot reference.
+        assert!(validate_exec(
+            "zfs",
+            &[
+                "send".to_string(),
+                "-i".to_string(),
+                "tank/vm@base".to_string(),
+                "tank/vm@new".to_string(),
+            ],
+        )
+        .is_ok());
+        assert!(validate_exec(
+            "zfs",
+            &[
+                "send".to_string(),
+                "-i".to_string(),
+                "bad ref".to_string(),
+                "tank/vm@new".to_string(),
+            ],
+        )
+        .is_err());
+        // `-i` outside `zfs send` is not a shape the broker performs.
+        assert!(validate_exec(
+            "zfs",
+            &[
+                "list".to_string(),
+                "-i".to_string(),
+                "tank/vm@base".to_string(),
+            ],
+        )
+        .is_err());
         assert!(validate_exec(
             "zfs",
             &[
