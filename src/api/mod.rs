@@ -10,6 +10,7 @@ mod health;
 mod library;
 mod metrics;
 mod network;
+mod notifications;
 mod operations;
 mod pci;
 mod pools;
@@ -52,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .merge(storage::routes())
         .merge(library::routes())
         .merge(network::routes())
+        .merge(notifications::routes())
         .merge(operations::routes())
         .merge(security::routes())
         .merge(gpus::routes())

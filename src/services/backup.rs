@@ -194,6 +194,35 @@ impl BackupService {
                         .run_backup(&plan_for_worker, &services, &ops, &handle.id)
                         .await;
                     worker.running.lock().await.remove(&cleanup_id);
+                    match &result {
+                        Ok(artifact) => {
+                            services
+                                .notifications
+                                .notify(
+                                    daygleve_schema::notification::NotificationEvent::BackupSucceeded,
+                                    format!("Backup succeeded: {}", plan_for_worker.name),
+                                    format!(
+                                        "Backup plan {:?} completed: artifact {} ({} bytes).",
+                                        plan_for_worker.name, artifact.id, artifact.total_size_bytes
+                                    ),
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            services
+                                .notifications
+                                .notify(
+                                    daygleve_schema::notification::NotificationEvent::BackupFailed,
+                                    format!("Backup failed: {}", plan_for_worker.name),
+                                    format!(
+                                        "Backup plan {:?} failed: {}",
+                                        plan_for_worker.name,
+                                        e.message()
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
                     let artifact = result?;
                     Ok(Some(format!(
                         "created backup {} ({} bytes)",

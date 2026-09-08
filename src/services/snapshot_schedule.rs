@@ -174,6 +174,19 @@ impl SnapshotScheduleService {
                 result = %result,
                 "snapshot schedule fired"
             );
+            if result.starts_with("error") {
+                services
+                    .notifications
+                    .notify(
+                        daygleve_schema::notification::NotificationEvent::SnapshotFailed,
+                        "Scheduled snapshot failed".to_string(),
+                        format!(
+                            "Scheduled snapshot of {} failed: {}",
+                            schedule.target_id, result
+                        ),
+                    )
+                    .await;
+            }
             schedule.last_run_at = Some(now_ts());
             schedule.last_result = Some(result);
             schedule.next_run_at = match Self::parse_cron(&schedule.cron) {
