@@ -167,6 +167,15 @@ pub(crate) async fn read_iommu_group(dir: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+/// Read the IOMMU group for a canonical PCI address. A zero group means that
+/// sysfs did not expose an IOMMU association, so no sharing warning is needed.
+pub(crate) async fn iommu_group_for_address(address: &str) -> u32 {
+    if ensure_safe_pci_address(address).is_err() {
+        return 0;
+    }
+    read_iommu_group(&PathBuf::from(PCI_DEVICES).join(address)).await
+}
+
 pub(crate) fn vendor_name(vendor_id: &str) -> String {
     match vendor_id.trim().to_ascii_lowercase().as_str() {
         "0x10de" => "NVIDIA".to_string(),

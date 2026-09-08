@@ -11,7 +11,7 @@
 //! domain's VNC socket; the websocket proxy in [`crate::api::vms`] validates the
 //! ticket and pipes raw RFB bytes so a browser noVNC client can attach.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -1193,6 +1193,52 @@ impl KvmService {
             self.define(&vm).await?;
         }
         Ok(vm)
+    }
+
+    /// Return a warning when a PCI device belongs to an IOMMU group that is
+    /// already assigned to another VM. The attach remains allowed: some hosts
+    /// intentionally use unsafe group sharing, but the operator must know that
+    /// attaching one function can affect every function in the group.
+    pub async fn pci_iommu_group_warning(
+        &self,
+        vm_id: &str,
+        pci_address: &str,
+    ) -> ApiResult<Option<String>> {
+        ensure_safe_pci_address(pci_address)?;
+        let group = crate::services::gpu::iommu_group_for_address(pci_address).await;
+        if group == 0 {
+            return Ok(None);
+        }
+
+        let vms: Vec<Vm> = self.store.list().await?;
+        let mut other_vm_names = BTreeSet::new();
+        for vm in vms.iter().filter(|vm| vm.id != vm_id) {
+            let addresses = vm
+                .pci_devices
+                .iter()
+                .map(|device| device.pci_address.as_str())
+                .chain(vm.gpus.iter().map(|device| device.pci_address.as_str()));
+            for address in addresses {
+                if crate::services::gpu::iommu_group_for_address(address).await == group {
+                    other_vm_names.insert(vm.name.clone());
+                    break;
+                }
+            }
+        }
+
+        if other_vm_names.is_empty() {
+            Ok(None)
+        } else {
+            let other_vm_names: Vec<String> = other_vm_names.into_iter().collect();
+            let warning = format_pci_group_warning(pci_address, group, &other_vm_names);
+            tracing::warn!(
+                pci_address,
+                iommu_group = group,
+                other_vms = %other_vm_names.join(", "),
+                "PCI hot-attach shares an IOMMU group with another VM"
+            );
+            Ok(Some(warning))
+        }
     }
 
     /// Hot-attach a host PCI function to a running (or stopped) VM via
@@ -2747,6 +2793,13 @@ fn usb_hostdev_xml(vendor_id: &str, product_id: &str) -> Option<String> {
     ))
 }
 
+fn format_pci_group_warning(pci_address: &str, group: u32, vm_names: &[String]) -> String {
+    format!(
+        "PCI device {pci_address} shares IOMMU group {group} with device(s) assigned to other VM(s): {}; hot-attaching it may disrupt those guests",
+        vm_names.join(", ")
+    )
+}
+
 /// Validate general PCI passthrough assignments: each address must pass the
 /// PCI-address sanitizer (it becomes a `<hostdev>` source and a sysfs path).
 fn validate_pci_assignments(devices: &[daygleve_schema::pci::PciAssignment]) -> ApiResult<()> {
@@ -2891,6 +2944,16 @@ mod tests {
         let xml = domain_xml(&vm, "127.0.0.1");
         assert!(xml.contains("<hostdev mode='subsystem' type='pci' managed='yes'>"));
         assert!(xml.contains("domain='0x0000' bus='0x03' slot='0x00' function='0x0'"));
+    }
+
+    #[test]
+    fn pci_group_warning_names_the_other_vms() {
+        let warning =
+            format_pci_group_warning("0000:03:00.0", 42, &["database".into(), "router".into()]);
+        assert!(warning.contains("0000:03:00.0"));
+        assert!(warning.contains("IOMMU group 42"));
+        assert!(warning.contains("database, router"));
+        assert!(warning.contains("may disrupt those guests"));
     }
 
     #[test]

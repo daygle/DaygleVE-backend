@@ -155,4 +155,5 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
         .allow_origin(parsed)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+        .expose_headers([axum::http::HeaderName::from_static("warning")])
 }

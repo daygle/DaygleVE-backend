@@ -6,7 +6,7 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -410,8 +410,16 @@ async fn attach_pci(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<AttachVmPciRequest>,
-) -> ApiResult<(StatusCode, Json<Vm>)> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<Vm>)> {
     user.require(Permission::VmWrite)?;
+    // Warn before invoking virsh when another guest already owns a function in
+    // this device's IOMMU group. The operation remains allowed, but the warning
+    // is exposed to cross-origin frontends through the standard `Warning` header.
+    let iommu_warning = state
+        .services
+        .kvm
+        .pci_iommu_group_warning(&id, &req.pci_address)
+        .await?;
     let services = state.services.clone();
     let operations = services.operations.clone();
     let operation_services = services.clone();
@@ -426,7 +434,14 @@ async fn attach_pci(
             move || async move { operation_services.kvm.attach_pci(&id, req).await },
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(vm)))
+    let mut headers = HeaderMap::new();
+    if let Some(warning) = iommu_warning {
+        let warning = format!("299 - \"{warning}\"");
+        if let Ok(value) = HeaderValue::from_str(&warning) {
+            headers.insert("warning", value);
+        }
+    }
+    Ok((StatusCode::CREATED, headers, Json(vm)))
 }
 
 /// Query parameters for PCI detach: the device address to remove.
