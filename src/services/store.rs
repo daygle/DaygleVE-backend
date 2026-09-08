@@ -50,31 +50,28 @@ impl JsonStore {
     /// `create` is false, so reads on a fresh node are simply empty.
     async fn resolve_dir(&self, create: bool) -> ApiResult<Option<PathBuf>> {
         // Walk up to the nearest ancestor that already exists, recording the
-        // components we skipped over so they can be re-validated and re-appended.
+        // components we skip over so they can be re-validated and re-appended.
+        // We probe existence with `canonicalize` itself (the sanitizer for this
+        // query) rather than `metadata`, so the configured — hence tainted —
+        // path never reaches a filesystem sink before it is canonicalized.
         let mut ancestor = self.dir.as_path();
         let mut tail: Vec<&OsStr> = Vec::new();
-        while fs::metadata(ancestor).await.is_err() {
-            match (ancestor.parent(), ancestor.file_name()) {
-                (Some(parent), Some(name)) => {
-                    tail.push(name);
-                    ancestor = parent;
-                }
-                // Reached the filesystem root without finding an existing dir.
-                _ => {
-                    if !create {
-                        return Ok(None);
+        let mut dir = loop {
+            match fs::canonicalize(ancestor).await {
+                Ok(base) => break base,
+                Err(_) => match (ancestor.parent(), ancestor.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        tail.push(name);
+                        ancestor = parent;
                     }
-                    break;
-                }
-            }
-        }
-        let mut dir = match fs::canonicalize(ancestor).await {
-            Ok(base) => base,
-            Err(_) if !create => return Ok(None),
-            Err(e) => {
-                return Err(AppError::internal(format!(
-                    "store directory unavailable: {e}"
-                )))
+                    // Reached the filesystem root without finding an existing dir.
+                    _ => {
+                        if !create {
+                            return Ok(None);
+                        }
+                        return Err(AppError::internal("store directory root is unavailable"));
+                    }
+                },
             }
         };
         for name in tail.iter().rev() {
