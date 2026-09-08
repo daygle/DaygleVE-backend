@@ -57,6 +57,7 @@ pub mod pci;
 pub mod pool;
 pub mod schedule;
 pub mod shares;
+pub mod snapshot_schedule;
 pub mod store;
 pub mod usb;
 pub mod zfs;
@@ -144,6 +145,8 @@ pub struct Services {
     pub pools: pool::PoolService,
     /// Cron-scheduled guest power actions. Evaluated by a background tick.
     pub schedules: Arc<schedule::ScheduleService>,
+    /// Cron-scheduled snapshots with retention. Evaluated by a background tick.
+    pub snapshot_schedules: Arc<snapshot_schedule::SnapshotScheduleService>,
     /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
     /// enumerate ISOs living on mounted shares.
     pub shares: Arc<shares::ShareService>,
@@ -167,6 +170,9 @@ impl Services {
             metrics: metrics::MetricsService::new(),
             pools: pool::PoolService::new(config.clone()),
             schedules: Arc::new(schedule::ScheduleService::new(config.clone())),
+            snapshot_schedules: Arc::new(snapshot_schedule::SnapshotScheduleService::new(
+                config.clone(),
+            )),
             shares,
         }
     }
