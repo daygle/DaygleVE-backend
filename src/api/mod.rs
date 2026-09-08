@@ -12,6 +12,7 @@ mod metrics;
 mod network;
 mod operations;
 mod pci;
+mod pools;
 mod security;
 mod storage;
 mod usb;
@@ -53,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .merge(security::routes())
         .merge(gpus::routes())
         .merge(pci::routes())
+        .merge(pools::routes())
         .merge(usb::routes())
         .merge(metrics::routes())
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024));

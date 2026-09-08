@@ -54,6 +54,7 @@ pub mod metrics;
 pub mod network;
 pub mod operations;
 pub mod pci;
+pub mod pool;
 pub mod shares;
 pub mod store;
 pub mod usb;
@@ -137,6 +138,9 @@ pub struct Services {
     pub pci: pci::PciService,
     pub usb: usb::UsbService,
     pub metrics: metrics::MetricsService,
+    /// Resource pools (guest groupings). Independent metadata store; guests
+    /// carry their own pool membership.
+    pub pools: pool::PoolService,
     /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
     /// enumerate ISOs living on mounted shares.
     pub shares: Arc<shares::ShareService>,
@@ -158,6 +162,7 @@ impl Services {
             pci: pci::PciService::new(),
             usb: usb::UsbService::new(),
             metrics: metrics::MetricsService::new(),
+            pools: pool::PoolService::new(config.clone()),
             shares,
         }
     }
@@ -343,6 +348,33 @@ pub(crate) fn validate_tags(tags: Vec<String>) -> crate::error::ApiResult<Vec<St
         return Err(crate::error::AppError::validation("too many tags (max 64)"));
     }
     Ok(out)
+}
+
+/// Validate and normalize a resource pool name: trimmed, non-empty, at most 64
+/// bytes of letters, digits, and `- _ . :`. Same charset as tags, so a pool
+/// name is always a clean single token.
+pub(crate) fn validate_pool_name(name: &str) -> crate::error::ApiResult<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(crate::error::AppError::validation("pool name is required"));
+    }
+    if name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(crate::error::AppError::validation(format!(
+            "invalid pool name: {name:?} (use letters, digits, and - _ . :)"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// Normalize a guest's pool reference for storage: trims and maps an empty or
+/// whitespace-only value to `None` (no pool). Existence of a non-empty pool is
+/// checked separately at the API boundary.
+pub(crate) fn normalize_pool_ref(pool: Option<String>) -> Option<String> {
+    pool.map(|p| p.trim().to_string()).filter(|p| !p.is_empty())
 }
 
 /// Current time as the schema's RFC-3339 string alias.

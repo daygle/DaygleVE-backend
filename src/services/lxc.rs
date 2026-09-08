@@ -29,8 +29,8 @@ use crate::error::{ApiResult, AppError};
 use crate::services::library::LibraryService;
 use crate::services::store::JsonStore;
 use crate::services::{
-    command, ensure_safe_cidr, ensure_safe_id, ensure_safe_zfs_dataset, new_id, now_ts,
-    validate_tags,
+    command, ensure_safe_cidr, ensure_safe_id, ensure_safe_zfs_dataset, new_id, normalize_pool_ref,
+    now_ts, validate_tags,
 };
 
 /// How long a console ticket is valid before the client must re-request one.
@@ -162,6 +162,9 @@ impl LxcService {
         // Validate tags before anything is created on the host, so a bad tag
         // can't leave an orphaned container behind.
         let tags = validate_tags(req.tags.clone())?;
+        // Pool existence is checked at the API layer; here we just normalize the
+        // stored reference (empty/whitespace → no pool).
+        let pool = normalize_pool_ref(req.pool.clone());
 
         // Two rootfs sources: an uploaded CT-template tarball (built with the
         // `local` template's `--fstree`), or a `<dist>-<release>` image pulled
@@ -280,6 +283,7 @@ impl LxcService {
             unprivileged: req.unprivileged,
             description: req.description,
             tags,
+            pool,
             created_at: now_ts(),
             updated_at: None,
         };
@@ -321,6 +325,10 @@ impl LxcService {
         }
         if let Some(tags) = req.tags {
             ct.tags = validate_tags(tags)?;
+        }
+        if let Some(pool) = req.pool {
+            // Existence of a non-empty pool is validated at the API layer.
+            ct.pool = normalize_pool_ref(Some(pool));
         }
 
         // Apply new limits live if the container is running (best-effort).
@@ -458,6 +466,7 @@ impl LxcService {
                 vcpus: 0,
                 memory_mib: 0,
                 tags: Vec::new(),
+                pool: None,
                 created_at: now_ts(),
             });
         }
@@ -752,6 +761,7 @@ fn summary_of(ct: &Lxc) -> LxcSummary {
         vcpus: ct.vcpus,
         memory_mib: ct.memory_mib,
         tags: ct.tags.clone(),
+        pool: ct.pool.clone(),
         created_at: ct.created_at.clone(),
     }
 }

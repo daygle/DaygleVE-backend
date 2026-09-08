@@ -29,7 +29,7 @@ use crate::services::shares::ShareService;
 use crate::services::store::JsonStore;
 use crate::services::{
     command, ensure_safe_cidr, ensure_safe_id, ensure_safe_mac, ensure_safe_pci_address,
-    ensure_safe_zfs_dataset, new_id, now_ts, validate_tags,
+    ensure_safe_zfs_dataset, new_id, normalize_pool_ref, now_ts, validate_tags,
 };
 
 /// How long a console ticket is valid before the client must re-request one.
@@ -159,6 +159,7 @@ impl KvmService {
             autostart: req.autostart && !req.template,
             startup_order: req.startup_order,
             tags: validate_tags(req.tags)?,
+            pool: normalize_pool_ref(req.pool),
             created_at: now_ts(),
             updated_at: None,
         };
@@ -313,6 +314,11 @@ impl KvmService {
         }
         if let Some(tags) = req.tags {
             vm.tags = validate_tags(tags)?;
+        }
+        if let Some(pool) = req.pool {
+            // Existence of a non-empty pool is validated at the API layer; here
+            // we just apply it, treating an empty value as "remove from pool".
+            vm.pool = normalize_pool_ref(Some(pool));
         }
         if let Some(autostart) = req.autostart {
             vm.autostart = autostart;
@@ -492,6 +498,7 @@ impl KvmService {
             autostart: false,
             startup_order: None,
             tags: src.tags.clone(),
+            pool: src.pool.clone(),
             created_at: now_ts(),
             updated_at: None,
         };
@@ -585,6 +592,7 @@ impl KvmService {
                 template: false,
                 autostart: false,
                 tags: Vec::new(),
+                pool: None,
                 created_at: now_ts(),
             });
         }
@@ -1831,6 +1839,7 @@ fn summary_of(vm: &Vm) -> VmSummary {
         template: vm.template,
         autostart: vm.autostart,
         tags: vm.tags.clone(),
+        pool: vm.pool.clone(),
         created_at: vm.created_at.clone(),
     }
 }
@@ -2547,6 +2556,7 @@ mod tests {
             autostart: false,
             startup_order: None,
             tags: vec![],
+            pool: None,
             created_at: now_ts(),
             updated_at: None,
         }
