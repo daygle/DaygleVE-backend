@@ -384,6 +384,8 @@ pub fn program_path(program: &str) -> Option<&'static str> {
         // Cloud-init NoCloud seed ISO generation.
         "genisoimage" => "/usr/bin/genisoimage",
         "xorriso" => "/usr/bin/xorriso",
+        // Disk-image inspection and conversion into a zvol during import.
+        "qemu-img" => "/usr/bin/qemu-img",
         "umount" => "/usr/bin/umount",
         "virsh" => "/usr/bin/virsh",
         "zfs" => "/usr/sbin/zfs",
@@ -509,6 +511,9 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
         // batch file path is path-validated in validate_exec_args below.
         "nft" => args.contains(&"-f".to_string()),
         "genisoimage" | "xorriso" => true,
+        // Disk-image import: inspect a source image or convert it into a zvol.
+        // Paths and the output format are constrained in validate_exec_args.
+        "qemu-img" => matches!(subcommand, Some("info" | "convert")),
         _ => false,
     };
     if !allowed {
@@ -647,6 +652,87 @@ fn safe_abs_path(value: &str, prefix: &str, suffix: Option<&str>) -> bool {
         && !value.contains("/../")
         && !value.ends_with("/..")
         && suffix.is_none_or(|ending| value.ends_with(ending))
+}
+
+/// A ZFS zvol block device: `/dev/zvol/<dataset>` for a constrained dataset.
+/// Import writes the converted image to exactly such a device, never to an
+/// arbitrary host path.
+fn safe_zvol_device(value: &str) -> bool {
+    value.strip_prefix("/dev/zvol/").is_some_and(safe_dataset)
+}
+
+/// Independent validation for the two disk-image-import `qemu-img` invocations:
+/// `info` on an uploaded source image, and `convert` of that source into a
+/// zvol block device. The source is constrained to DaygleVE's state area, the
+/// destination to a `/dev/zvol/<dataset>` device, and the output format to raw.
+fn validate_qemu_img_args(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("info") => {
+            let mut positionals = Vec::new();
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--output=json" => {}
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("qemu-img option `{arg}` is not permitted"));
+                    }
+                    _ => positionals.push(arg.as_str()),
+                }
+            }
+            match positionals.as_slice() {
+                [src] if safe_abs_path(src, "/var/lib/daygleve/", None) => Ok(()),
+                [_] => Err("qemu-img source is outside DaygleVE state".to_string()),
+                _ => Err("qemu-img info requires exactly one source path".to_string()),
+            }
+        }
+        Some("convert") => {
+            let mut format = None;
+            let mut positionals = Vec::new();
+            let mut index = 1;
+            while index < args.len() {
+                let arg = &args[index];
+                match arg.as_str() {
+                    "-O" => {
+                        let value = args
+                            .get(index + 1)
+                            .ok_or_else(|| "qemu-img -O requires a value".to_string())?;
+                        if value != "raw" {
+                            return Err("qemu-img convert output format must be raw".to_string());
+                        }
+                        format = Some(value.as_str());
+                        index += 2;
+                    }
+                    // Progress reporting and out-of-order writes are safe, path-free
+                    // flags used by the import to keep long conversions responsive.
+                    "-p" | "-W" => index += 1,
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("qemu-img option `{arg}` is not permitted"));
+                    }
+                    _ => {
+                        positionals.push(arg.as_str());
+                        index += 1;
+                    }
+                }
+            }
+            if format.is_none() {
+                return Err("qemu-img convert requires -O raw".to_string());
+            }
+            match positionals.as_slice() {
+                [src, dest] => {
+                    if !safe_abs_path(src, "/var/lib/daygleve/", None) {
+                        return Err("qemu-img source is outside DaygleVE state".to_string());
+                    }
+                    if !safe_zvol_device(dest) {
+                        return Err(
+                            "qemu-img destination is not a DaygleVE zvol device".to_string()
+                        );
+                    }
+                    Ok(())
+                }
+                _ => Err("qemu-img convert requires a source and destination".to_string()),
+            }
+        }
+        _ => Err("qemu-img subcommand is not permitted".to_string()),
+    }
 }
 
 fn safe_mount_source(filesystem: &str, source: &str) -> bool {
@@ -804,6 +890,7 @@ fn validate_exec_args(program: &str, args: &[String]) -> Result<(), String> {
                 }
             }
         }
+        "qemu-img" => validate_qemu_img_args(args)?,
         _ => {}
     }
     Ok(())
@@ -1150,6 +1237,84 @@ mod tests {
         .is_err());
         let long_arg = "x".repeat(5000);
         assert!(validate_exec("zfs", std::slice::from_ref(&long_arg)).is_err());
+    }
+
+    #[test]
+    fn qemu_img_import_is_constrained() {
+        // info on an uploaded source image under DaygleVE state.
+        assert!(validate_exec(
+            "qemu-img",
+            &[
+                "info".to_string(),
+                "--output=json".to_string(),
+                "/var/lib/daygleve/disk-images/focal.qcow2".to_string(),
+            ]
+        )
+        .is_ok());
+        // convert of that source into a zvol device, raw format.
+        assert!(validate_exec(
+            "qemu-img",
+            &[
+                "convert".to_string(),
+                "-O".to_string(),
+                "raw".to_string(),
+                "/var/lib/daygleve/disk-images/focal.qcow2".to_string(),
+                "/dev/zvol/tank/vm-imported-disk0".to_string(),
+            ]
+        )
+        .is_ok());
+
+        // Source outside DaygleVE state is rejected for both subcommands.
+        assert!(
+            validate_exec("qemu-img", &["info".to_string(), "/etc/shadow".to_string()]).is_err()
+        );
+        assert!(validate_exec(
+            "qemu-img",
+            &[
+                "convert".to_string(),
+                "-O".to_string(),
+                "raw".to_string(),
+                "/etc/shadow".to_string(),
+                "/dev/zvol/tank/x".to_string(),
+            ]
+        )
+        .is_err());
+        // Destination must be a zvol device, never an arbitrary host path.
+        assert!(validate_exec(
+            "qemu-img",
+            &[
+                "convert".to_string(),
+                "-O".to_string(),
+                "raw".to_string(),
+                "/var/lib/daygleve/disk-images/focal.qcow2".to_string(),
+                "/etc/passwd".to_string(),
+            ]
+        )
+        .is_err());
+        // Only the raw output format is permitted.
+        assert!(validate_exec(
+            "qemu-img",
+            &[
+                "convert".to_string(),
+                "-O".to_string(),
+                "qcow2".to_string(),
+                "/var/lib/daygleve/disk-images/focal.qcow2".to_string(),
+                "/dev/zvol/tank/x".to_string(),
+            ]
+        )
+        .is_err());
+        // Other subcommands (e.g. create) are not part of the import surface.
+        assert!(validate_exec(
+            "qemu-img",
+            &[
+                "create".to_string(),
+                "-f".to_string(),
+                "raw".to_string(),
+                "/var/lib/daygleve/disk-images/x.raw".to_string(),
+                "1G".to_string(),
+            ]
+        )
+        .is_err());
     }
 
     #[test]

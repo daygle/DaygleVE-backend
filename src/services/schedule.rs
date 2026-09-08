@@ -262,6 +262,7 @@ mod tests {
             state_dir: dir.clone(),
             iso_dir: dir.join("isos"),
             template_dir: dir.join("templates"),
+            disk_image_dir: dir.join("disk-images"),
             mounts_dir: dir.join("mounts"),
             max_upload_bytes: 16 * 1024 * 1024 * 1024,
             spice_listen: "127.0.0.1".to_string(),

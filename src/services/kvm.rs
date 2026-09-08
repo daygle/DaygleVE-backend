@@ -1629,6 +1629,75 @@ impl KvmService {
         }
     }
 
+    /// Import an uploaded disk image (already resolved to its absolute host path
+    /// by the library service) into a brand-new ZFS zvol.
+    ///
+    /// The image's virtual size is detected with `qemu-img info` and the zvol is
+    /// provisioned to hold it (or to the larger caller-requested size), then the
+    /// image is written into the zvol block device with `qemu-img convert -O raw`.
+    /// The dataset must not already exist, so an import never overwrites a disk in
+    /// use; a conversion failure destroys the just-created zvol so no empty
+    /// half-written volume is left behind.
+    pub async fn import_disk_image(
+        &self,
+        source_path: &str,
+        dataset: &str,
+        size_gib: Option<u64>,
+    ) -> ApiResult<VmDisk> {
+        let dataset = ensure_safe_zfs_dataset(dataset.trim())?;
+
+        // Refuse to touch an existing dataset: import only ever creates a fresh
+        // zvol. Distinguish "zfs missing" (fail fast) from "does not exist yet".
+        match command::run_optional("zfs", &["list", "-H", "-o", "name", dataset]).await {
+            Ok(Some(_)) => {
+                return Err(AppError::validation(
+                    "target dataset already exists; choose a new dataset for the import",
+                ))
+            }
+            Ok(None) => {
+                return Err(AppError::hypervisor(
+                    "zfs is not installed; cannot import the disk image",
+                ))
+            }
+            Err(e) if is_missing_dataset(&e) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Detect the image's virtual size so the zvol is large enough to hold it.
+        let info = command::run("qemu-img", &["info", "--output=json", source_path]).await?;
+        let virtual_bytes = parse_qemu_img_virtual_size(&info)?;
+        let detected_gib = virtual_bytes.div_ceil(1024 * 1024 * 1024).max(1);
+        let target_gib = match size_gib {
+            Some(0) => return Err(AppError::validation("size_gib must be >= 1")),
+            Some(g) if g < detected_gib => {
+                return Err(AppError::validation(format!(
+                    "size_gib ({g}) is smaller than the image's virtual size ({detected_gib} GiB)"
+                )))
+            }
+            Some(g) => g,
+            None => detected_gib,
+        };
+
+        // Provision the zvol, then stream the image into its block device.
+        let size = format!("{target_gib}G");
+        command::run_ok("zfs", &["create", "-V", &size, dataset]).await?;
+
+        let device = format!("/dev/zvol/{dataset}");
+        if let Err(e) =
+            command::run_ok("qemu-img", &["convert", "-O", "raw", source_path, &device]).await
+        {
+            // Roll back the empty zvol so a failed conversion leaves nothing behind.
+            let _ = command::run_ok("zfs", &["destroy", "-r", dataset]).await;
+            return Err(e);
+        }
+
+        Ok(VmDisk {
+            dataset: dataset.to_string(),
+            size_gib: target_gib,
+            bus: DiskBus::Virtio,
+        })
+    }
+
     /// Enumerate the installer/live ISOs available to the node: the built-in
     /// library (`config.iso_dir`, non-recursive, tagged `local`) plus every
     /// currently-mounted network share (scanned recursively, tagged with the
@@ -1911,6 +1980,18 @@ pub(crate) fn ensure_safe_snapshot(name: &str) -> ApiResult<&str> {
             "invalid snapshot name: {name:?}"
         )))
     }
+}
+
+/// Extract the `virtual-size` (bytes) from `qemu-img info --output=json` output.
+/// This is the logical capacity the image presents, which the imported zvol must
+/// be at least as large as.
+fn parse_qemu_img_virtual_size(json: &str) -> ApiResult<u64> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("virtual-size"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AppError::hypervisor("could not determine the disk image's virtual size"))
 }
 
 /// True when a `zfs` error indicates the target dataset simply does not exist,
@@ -2820,6 +2901,19 @@ mod tests {
         );
         assert_eq!(parse_spice_port("spice://127.0.0.1"), None);
         assert_eq!(parse_spice_port(""), None);
+    }
+
+    #[test]
+    fn qemu_img_virtual_size_is_extracted() {
+        let json = r#"{"virtual-size": 21474836480, "filename": "x.qcow2", "format": "qcow2", "actual-size": 1048576}"#;
+        assert_eq!(parse_qemu_img_virtual_size(json).unwrap(), 21474836480);
+        // A 20 GiB image rounds to exactly 20 GiB.
+        assert_eq!(21474836480u64.div_ceil(1024 * 1024 * 1024).max(1), 20);
+        // A size that isn't a whole GiB rounds up.
+        assert_eq!((21474836480u64 + 1).div_ceil(1024 * 1024 * 1024).max(1), 21);
+        // Missing/garbage output is an error rather than a silent zero.
+        assert!(parse_qemu_img_virtual_size("{}").is_err());
+        assert!(parse_qemu_img_virtual_size("not json").is_err());
     }
 
     #[test]

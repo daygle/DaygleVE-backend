@@ -31,6 +31,10 @@ const CT_TEMPLATE_EXTENSIONS: &[&str] = &[
     ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2",
 ];
 
+/// Allowed extensions for uploaded VM disk images offered for import.
+const DISK_IMAGE_EXTENSIONS: &[&str] =
+    &[".qcow2", ".vmdk", ".raw", ".img", ".vdi", ".vhd", ".vhdx"];
+
 /// Manages the node's local upload libraries.
 #[derive(Clone)]
 pub struct LibraryService {
@@ -47,6 +51,7 @@ impl LibraryService {
         match kind {
             StorageFileKind::Iso => &self.config.iso_dir,
             StorageFileKind::CtTemplate => &self.config.template_dir,
+            StorageFileKind::DiskImage => &self.config.disk_image_dir,
         }
     }
 
@@ -254,6 +259,26 @@ impl LibraryService {
                 )
             })
     }
+
+    /// Resolve an uploaded disk-image file name to its absolute host path.
+    ///
+    /// Like [`Self::resolve_ct_template`], the path is taken from the directory
+    /// listing (so the request value is only compared, never joined), which also
+    /// confirms the file exists. Used by the KVM service when importing an
+    /// uploaded disk image into a new zvol.
+    pub async fn resolve_disk_image(&self, name: &str) -> ApiResult<PathBuf> {
+        let name = validate_library_filename(name, StorageFileKind::DiskImage)?;
+        self.list(StorageFileKind::DiskImage)
+            .await?
+            .into_iter()
+            .find(|f| f.name == name)
+            .map(|f| PathBuf::from(f.path))
+            .ok_or_else(|| {
+                AppError::validation(
+                    "image_name is not an uploaded disk image (see GET /storage/disk-images)",
+                )
+            })
+    }
 }
 
 /// Join a request-supplied `name` into `dir` as a single, verified path
@@ -295,6 +320,7 @@ pub fn validate_library_filename(name: &str, kind: StorageFileKind) -> ApiResult
         StorageFileKind::CtTemplate => CT_TEMPLATE_EXTENSIONS
             .iter()
             .any(|ext| lower.ends_with(ext)),
+        StorageFileKind::DiskImage => DISK_IMAGE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)),
     };
     if !ext_ok {
         return Err(AppError::validation(match kind {
@@ -302,6 +328,10 @@ pub fn validate_library_filename(name: &str, kind: StorageFileKind) -> ApiResult
             StorageFileKind::CtTemplate => format!(
                 "CT-template uploads must be a tarball ({})",
                 CT_TEMPLATE_EXTENSIONS.join(", ")
+            ),
+            StorageFileKind::DiskImage => format!(
+                "disk-image uploads must be a supported disk image ({})",
+                DISK_IMAGE_EXTENSIONS.join(", ")
             ),
         }));
     }
@@ -322,11 +352,18 @@ mod tests {
         )
         .is_ok());
         assert!(validate_library_filename("x.tgz", StorageFileKind::CtTemplate).is_ok());
+        assert!(
+            validate_library_filename("focal-server.qcow2", StorageFileKind::DiskImage).is_ok()
+        );
+        assert!(validate_library_filename("disk.vmdk", StorageFileKind::DiskImage).is_ok());
+        assert!(validate_library_filename("win.vhdx", StorageFileKind::DiskImage).is_ok());
 
         // Wrong extension for the kind.
         assert!(validate_library_filename("debian-13.iso", StorageFileKind::CtTemplate).is_err());
         assert!(validate_library_filename("rootfs.tar.xz", StorageFileKind::Iso).is_err());
         assert!(validate_library_filename("notes.txt", StorageFileKind::Iso).is_err());
+        assert!(validate_library_filename("debian-13.iso", StorageFileKind::DiskImage).is_err());
+        assert!(validate_library_filename("disk.qcow2", StorageFileKind::Iso).is_err());
 
         // Traversal / separators / hidden / control bytes.
         assert!(validate_library_filename("../etc/passwd.iso", StorageFileKind::Iso).is_err());
