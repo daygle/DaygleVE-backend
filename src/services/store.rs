@@ -36,13 +36,19 @@ impl JsonStore {
         // Build the filename from the *sanitizer's returned value*, never the
         // raw input, so the traversal barrier is explicit to static analysis.
         let id = crate::services::ensure_safe_id(id)?;
-        // Defence in depth: the record must be a single filename component, so
-        // reject anything the OS would read as a nested path or traversal.
         let file = format!("{id}.json");
-        if Path::new(&file).file_name() != Some(OsStr::new(file.as_str())) {
-            return Err(AppError::validation(format!("invalid resource id: {id:?}")));
-        }
-        Ok(self.dir.join(file))
+        // Reduce to the single trailing path component and build the record
+        // path from *that value* — extracting via `file_name()` and joining its
+        // output (rather than only comparing against it) is the traversal
+        // barrier static analysis recognises, so no request-controlled string
+        // can reach the join with path structure intact. The equality filter
+        // keeps the defence-in-depth check that the id was already one plain
+        // component.
+        let component = Path::new(&file)
+            .file_name()
+            .filter(|component| *component == OsStr::new(file.as_str()))
+            .ok_or_else(|| AppError::validation(format!("invalid resource id: {id:?}")))?;
+        Ok(self.dir.join(component))
     }
 
     async fn ensure_dir(&self) -> ApiResult<()> {
