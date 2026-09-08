@@ -12,10 +12,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::operations::OperationRecord;
+use daygleve_schema::pci::PciAssignment;
+use daygleve_schema::usb::UsbAssignment;
 use daygleve_schema::vm::{
-    CloneVmRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest, GuestAgentInfo,
-    IsoImage, ResizeVmDiskRequest, UpdateVmRequest, Vm, VmDisk, VmPowerRequest, VmPowerResponse,
-    VmSnapshot, VmSummary,
+    AttachVmPciRequest, AttachVmUsbRequest, CloneVmRequest, ConsoleTicket, CreateVmRequest,
+    CreateVmSnapshotRequest, GuestAgentInfo, IsoImage, ResizeVmDiskRequest, UpdateVmRequest, Vm,
+    VmDisk, VmPowerRequest, VmPowerResponse, VmSnapshot, VmSummary,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -55,6 +57,14 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/vms/{id}/disks/{index}",
             axum::routing::delete(detach_disk),
+        )
+        .route(
+            "/vms/{id}/usb-devices",
+            get(list_usb).post(attach_usb).delete(detach_usb),
+        )
+        .route(
+            "/vms/{id}/pci-devices",
+            get(list_pci).post(attach_pci).delete(detach_pci),
         )
         .route("/vms/{id}/console", post(console))
         .route("/vms/{id}/console/ws", get(console_ws))
@@ -305,6 +315,146 @@ async fn detach_disk(
             Some(&resource_id),
             Some(&actor),
             move || async move { operation_services.kvm.detach_disk(&id, index).await },
+        )
+        .await?;
+    Ok(Json(vm))
+}
+
+/// The VM's USB passthrough assignments (a focused view of the detail data).
+async fn list_usb(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<UsbAssignment>>> {
+    user.require(Permission::VmRead)?;
+    let vm = state.services.kvm.get(&id).await?;
+    Ok(Json(vm.usb_devices))
+}
+
+/// Hot-attach a host USB device (matched by vendor:product) to the VM.
+async fn attach_usb(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AttachVmUsbRequest>,
+) -> ApiResult<(StatusCode, Json<Vm>)> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.attach_usb",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move { operation_services.kvm.attach_usb(&id, req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(vm)))
+}
+
+/// Query parameters for USB detach: the vendor:product id to remove.
+#[derive(Debug, Deserialize)]
+struct DetachUsbQuery {
+    vendor_id: String,
+    product_id: String,
+}
+
+/// Detach a USB passthrough device from the VM (the device stays on the host).
+async fn detach_usb(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<DetachUsbQuery>,
+) -> ApiResult<Json<Vm>> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.detach_usb",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move {
+                operation_services
+                    .kvm
+                    .detach_usb(&id, &q.vendor_id, &q.product_id)
+                    .await
+            },
+        )
+        .await?;
+    Ok(Json(vm))
+}
+
+/// The VM's PCI passthrough assignments (a focused view of the detail data).
+async fn list_pci(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<PciAssignment>>> {
+    user.require(Permission::VmRead)?;
+    let vm = state.services.kvm.get(&id).await?;
+    Ok(Json(vm.pci_devices))
+}
+
+/// Hot-attach a host PCI function to the VM.
+async fn attach_pci(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AttachVmPciRequest>,
+) -> ApiResult<(StatusCode, Json<Vm>)> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.attach_pci",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move { operation_services.kvm.attach_pci(&id, req).await },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(vm)))
+}
+
+/// Query parameters for PCI detach: the device address to remove.
+#[derive(Debug, Deserialize)]
+struct DetachPciQuery {
+    pci_address: String,
+}
+
+/// Detach a PCI passthrough device from the VM.
+async fn detach_pci(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<DetachPciQuery>,
+) -> ApiResult<Json<Vm>> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let operation_services = services.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let vm = operations
+        .run(
+            "vm.detach_pci",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move || async move { operation_services.kvm.detach_pci(&id, &q.pci_address).await },
         )
         .await?;
     Ok(Json(vm))

@@ -17,10 +17,11 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use daygleve_schema::vm::{
-    CloneVmRequest, CloudInitRequest, ConsoleTicket, CreateVmRequest, CreateVmSnapshotRequest,
-    DiskBus, DisplayProtocol, Firmware, GuestAgentInfo, IsoImage, NicModel, ResizeVmDiskRequest,
-    UpdateVmRequest, Vm, VmDisk, VmFirewall, VmFirewallAction, VmFirewallDirection, VmNic,
-    VmPowerAction, VmPowerResponse, VmSnapshot, VmSnapshotType, VmState, VmSummary,
+    AttachVmPciRequest, AttachVmUsbRequest, CloneVmRequest, CloudInitRequest, ConsoleTicket,
+    CreateVmRequest, CreateVmSnapshotRequest, DiskBus, DisplayProtocol, Firmware, GuestAgentInfo,
+    IsoImage, NicModel, ResizeVmDiskRequest, UpdateVmRequest, Vm, VmDisk, VmFirewall,
+    VmFirewallAction, VmFirewallDirection, VmNic, VmPowerAction, VmPowerResponse, VmSnapshot,
+    VmSnapshotType, VmState, VmSummary,
 };
 
 use crate::config::Config;
@@ -1117,6 +1118,147 @@ impl KvmService {
         Ok(vm)
     }
 
+    // --- USB / PCI device hotplug ----------------------------------------
+
+    /// Hot-attach a host USB device to a running (or stopped) VM by
+    /// vendor:product id via `virsh attach-device`. The assignment is appended
+    /// to the VM's record so the next `define` renders it into the persistent
+    /// XML too. USB hostdevs match by id, so a replug or host reboot keeps the
+    /// passthrough intact.
+    pub async fn attach_usb(&self, id: &str, req: AttachVmUsbRequest) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        let assignment = daygleve_schema::usb::UsbAssignment {
+            vendor_id: req.vendor_id,
+            product_id: req.product_id,
+        };
+        validate_usb_assignments(std::slice::from_ref(&assignment))?;
+        if vm.usb_devices.len() >= 10 {
+            return Err(AppError::validation(
+                "the VM already has the maximum of 10 USB passthrough devices",
+            ));
+        }
+        if vm
+            .usb_devices
+            .iter()
+            .any(|u| u.vendor_id == assignment.vendor_id && u.product_id == assignment.product_id)
+        {
+            return Err(AppError::validation(
+                "that USB device is already attached to this VM",
+            ));
+        }
+
+        let running = self.live_state(id).await == Some(VmState::Running);
+        if running {
+            self.attach_device(
+                id,
+                &usb_hostdev_xml(&assignment.vendor_id, &assignment.product_id)
+                    .ok_or_else(|| AppError::validation("USB ids must be four hex digits"))?,
+            )
+            .await?;
+        }
+
+        vm.usb_devices.push(assignment);
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        if !running {
+            self.define(&vm).await?;
+        }
+        Ok(vm)
+    }
+
+    /// Detach a USB passthrough device from a VM by vendor:product id:
+    /// `virsh detach-device` when running, then remove it from the record.
+    /// The device stays plugged into the host.
+    pub async fn detach_usb(&self, id: &str, vendor_id: &str, product_id: &str) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        let position = vm
+            .usb_devices
+            .iter()
+            .position(|u| u.vendor_id == vendor_id && u.product_id == product_id)
+            .ok_or_else(|| {
+                AppError::not_found(format!(
+                    "vm {id} has no USB device {vendor_id}:{product_id} attached"
+                ))
+            })?;
+        let running = self.live_state(id).await == Some(VmState::Running);
+        if running {
+            let xml = usb_hostdev_xml(vendor_id, product_id)
+                .ok_or_else(|| AppError::validation("USB ids must be four hex digits"))?;
+            self.detach_device(id, &xml).await?;
+        }
+        vm.usb_devices.remove(position);
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        if !running {
+            self.define(&vm).await?;
+        }
+        Ok(vm)
+    }
+
+    /// Hot-attach a host PCI function to a running (or stopped) VM via
+    /// `virsh attach-device`. The assignment is appended to the VM's record so
+    /// the next `define` renders it into the persistent XML too.
+    pub async fn attach_pci(&self, id: &str, req: AttachVmPciRequest) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        let assignment = daygleve_schema::pci::PciAssignment {
+            pci_address: req.pci_address,
+        };
+        validate_pci_assignments(std::slice::from_ref(&assignment))?;
+        if vm
+            .pci_devices
+            .iter()
+            .any(|p| p.pci_address.eq_ignore_ascii_case(&assignment.pci_address))
+        {
+            return Err(AppError::validation(
+                "that PCI device is already attached to this VM",
+            ));
+        }
+
+        let running = self.live_state(id).await == Some(VmState::Running);
+        if running {
+            self.attach_device(
+                id,
+                &pci_hostdev_xml(&assignment.pci_address)
+                    .ok_or_else(|| AppError::validation("invalid PCI address"))?,
+            )
+            .await?;
+        }
+
+        vm.pci_devices.push(assignment);
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        if !running {
+            self.define(&vm).await?;
+        }
+        Ok(vm)
+    }
+
+    /// Detach a PCI passthrough device from a VM by address: `virsh
+    /// detach-device` when running, then remove it from the record.
+    pub async fn detach_pci(&self, id: &str, pci_address: &str) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        let position = vm
+            .pci_devices
+            .iter()
+            .position(|p| p.pci_address.eq_ignore_ascii_case(pci_address))
+            .ok_or_else(|| {
+                AppError::not_found(format!("vm {id} has no PCI device {pci_address} attached"))
+            })?;
+        let running = self.live_state(id).await == Some(VmState::Running);
+        if running {
+            let xml = pci_hostdev_xml(pci_address)
+                .ok_or_else(|| AppError::validation("invalid PCI address"))?;
+            self.detach_device(id, &xml).await?;
+        }
+        vm.pci_devices.remove(position);
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        if !running {
+            self.define(&vm).await?;
+        }
+        Ok(vm)
+    }
+
     // --- snapshots -------------------------------------------------------
 
     /// List the VM's snapshots, one entry per snapshot name present on *every*
@@ -1578,6 +1720,39 @@ impl KvmService {
                 }
             }
         }
+    }
+
+    /// Write a device XML fragment to the state dir and live-attach it to the
+    /// running domain (`virsh attach-device`). Not `--persistent`: the stored
+    /// record is the source of truth and is re-defined on the next stop/start.
+    async fn attach_device(&self, id: &str, device_xml: &str) -> ApiResult<()> {
+        self.device_command(id, device_xml, "attach-device").await
+    }
+
+    /// Live-detach a device by its XML fragment (`virsh detach-device`).
+    async fn detach_device(&self, id: &str, device_xml: &str) -> ApiResult<()> {
+        self.device_command(id, device_xml, "detach-device").await
+    }
+
+    /// Shared plumbing for `attach-device`/`detach-device`: stage the device
+    /// XML under the state dir the broker trusts, run virsh, clean up.
+    async fn device_command(&self, id: &str, device_xml: &str, subcommand: &str) -> ApiResult<()> {
+        crate::services::ensure_safe_id(id)?;
+        let dir = self.config.state_dir.join("tmp");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AppError::internal(format!("create {}: {e}", dir.display())))?;
+        let path = dir.join(format!(
+            "{}-{subcommand}.xml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        tokio::fs::write(&path, device_xml)
+            .await
+            .map_err(|e| AppError::internal(format!("write {}: {e}", path.display())))?;
+        let path_str = path.to_string_lossy().into_owned();
+        let result = self.virsh(&[subcommand, id, &path_str]).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        result.map(|_| ())
     }
 
     /// Write the domain XML and (re)define it in libvirt.
@@ -2669,6 +2844,23 @@ mod tests {
                 "{v}:{p} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn usb_and_pci_hostdev_xml_round_trip() {
+        let usb = usb_hostdev_xml("1d6b", "0003").expect("valid ids render xml");
+        assert!(usb.contains("type='usb'"));
+        assert!(usb.contains("vendor id='0x1d6b'"));
+        assert!(usb.contains("product id='0x0003'"));
+        assert!(usb_hostdev_xml("1d6", "0003").is_none());
+
+        let pci = pci_hostdev_xml("0000:01:00.0").expect("valid address renders xml");
+        assert!(pci.contains("type='pci'"));
+        assert!(pci.contains("domain='0x0000'"));
+        assert!(pci.contains("bus='0x01'"));
+        assert!(pci.contains("slot='0x00'"));
+        assert!(pci.contains("function='0x0'"));
+        assert!(pci_hostdev_xml("../../etc").is_none());
     }
 
     #[test]
