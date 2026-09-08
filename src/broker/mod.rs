@@ -476,6 +476,8 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
                     | "blockresize"
                     | "attach-disk"
                     | "detach-disk"
+                    | "attach-device"
+                    | "detach-device"
             )
         ),
         "zfs" => matches!(
@@ -551,6 +553,20 @@ fn validate_zfs_args(args: &[String]) -> Result<(), String> {
                 .ok_or_else(|| format!("{arg} requires a value"))?;
             if !safe_zfs_value(value) {
                 return Err("ZFS option value is unsafe".to_string());
+            }
+            index += 2;
+            continue;
+        }
+        // `zfs send -i <base-snapshot>`: the value must be a full
+        // `dataset@tag` reference, validated more strictly than a plain
+        // option value. Outside `send`, `-i` keeps the generic option
+        // handling (`zfs list -i`).
+        if command == "send" && arg == "-i" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "-i requires a base snapshot value".to_string())?;
+            if command == "send" && !safe_snapshot_ref(value) {
+                return Err("ZFS incremental base snapshot is unsafe".to_string());
             }
             index += 2;
             continue;
@@ -805,6 +821,29 @@ fn validate_exec_args(program: &str, args: &[String]) -> Result<(), String> {
                 .and_then(|i| args.get(i + 2))
                 .map(String::as_str)
                 .ok_or_else(|| "virsh command is missing".to_string())?;
+            // Device hot(mun)plug has a fixed shape — `<domain> <device.xml>`
+            // — and the XML file must live under DaygleVE's state dir.
+            if matches!(command, "attach-device" | "detach-device") {
+                let rest: Vec<&str> = args
+                    .iter()
+                    .skip_while(|arg| arg.as_str() != command)
+                    .skip(1)
+                    .map(String::as_str)
+                    .collect();
+                let [domain, file] = rest[..] else {
+                    return Err(
+                        "virsh attach/detach-device expects exactly a domain and an XML file"
+                            .to_string(),
+                    );
+                };
+                if !safe_cli_name(domain) {
+                    return Err("virsh device target domain is unsafe".to_string());
+                }
+                if !safe_abs_path(file, "/var/lib/daygleve/", Some(".xml")) {
+                    return Err("virsh device XML path is outside DaygleVE state".to_string());
+                }
+                return Ok(());
+            }
             for arg in args
                 .iter()
                 .skip_while(|arg| arg.as_str() != command)
@@ -1164,6 +1203,37 @@ mod tests {
     #[test]
     fn exec_validation_rejects_bad_programs_and_args() {
         assert!(validate_exec("sh", &["-c".to_string(), "id".to_string()]).is_err());
+        // Incremental send: `-i` consumes the following snapshot reference.
+        assert!(validate_exec(
+            "zfs",
+            &[
+                "send".to_string(),
+                "-i".to_string(),
+                "tank/vm@base".to_string(),
+                "tank/vm@new".to_string(),
+            ],
+        )
+        .is_ok());
+        assert!(validate_exec(
+            "zfs",
+            &[
+                "send".to_string(),
+                "-i".to_string(),
+                "bad ref".to_string(),
+                "tank/vm@new".to_string(),
+            ],
+        )
+        .is_err());
+        // `-i` outside `zfs send` is not a shape the broker performs.
+        assert!(validate_exec(
+            "zfs",
+            &[
+                "list".to_string(),
+                "-i".to_string(),
+                "tank/vm@base".to_string(),
+            ],
+        )
+        .is_err());
         assert!(validate_exec(
             "zfs",
             &[
@@ -1215,6 +1285,33 @@ mod tests {
             ]
         )
         .is_err());
+        // Device hot(mun)plug: the XML file must live under DaygleVE's state
+        // dir; the domain id and virsh flags pass the general arg check.
+        let attach = [
+            "-c".to_string(),
+            "qemu:///system".to_string(),
+            "attach-device".to_string(),
+            "vm-123".to_string(),
+            "/var/lib/daygleve/tmp/attach.xml".to_string(),
+        ];
+        assert!(validate_exec("virsh", &attach).is_ok());
+        let mut outside = attach.clone();
+        outside[4] = "/etc/shadow".to_string();
+        assert!(validate_exec("virsh", &outside).is_err());
+        let mut wrong_ext = attach.clone();
+        wrong_ext[4] = "/var/lib/daygleve/tmp/attach.conf".to_string();
+        assert!(validate_exec("virsh", &wrong_ext).is_err());
+        assert!(validate_exec(
+            "virsh",
+            &[
+                "-c".to_string(),
+                "qemu:///system".to_string(),
+                "detach-device".to_string(),
+                "vm-123".to_string(),
+                "/var/lib/daygleve/tmp/detach.xml".to_string()
+            ]
+        )
+        .is_ok());
         assert!(validate_exec(
             "mount",
             &[
