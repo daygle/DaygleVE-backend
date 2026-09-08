@@ -28,6 +28,10 @@ pub struct Config {
     /// container rootfs source. `DAYGLEVE_TEMPLATE_DIR`, default
     /// `<state_dir>/templates`.
     pub template_dir: PathBuf,
+    /// Directory holding uploaded VM disk images (`.qcow2`, `.vmdk`, `.raw`,
+    /// etc.) offered for import into a zvol. `DAYGLEVE_DISK_IMAGE_DIR`, default
+    /// `<state_dir>/disk-images`.
+    pub disk_image_dir: PathBuf,
     /// Parent directory under which network shares (NFS/CIFS) are mounted, one
     /// subdirectory per share id. `DAYGLEVE_MOUNTS_DIR`, default
     /// `<state_dir>/mounts`.
@@ -109,6 +113,12 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| state_dir.join("templates"));
 
+        let disk_image_dir = std::env::var("DAYGLEVE_DISK_IMAGE_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("disk-images"));
+
         let mounts_dir = std::env::var("DAYGLEVE_MOUNTS_DIR")
             .ok()
             .filter(|s| !s.is_empty())
@@ -162,6 +172,7 @@ impl Config {
             state_dir,
             iso_dir,
             template_dir,
+            disk_image_dir,
             mounts_dir,
             max_upload_bytes,
             spice_listen,

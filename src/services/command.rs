@@ -35,6 +35,8 @@ fn program_path(program: &str) -> Option<&'static str> {
         // Cloud-init NoCloud seed ISO generation (make an ISO-9660 filesystem).
         "genisoimage" => "/usr/bin/genisoimage",
         "xorriso" => "/usr/bin/xorriso",
+        // Disk-image inspection and conversion into a zvol during import.
+        "qemu-img" => "/usr/bin/qemu-img",
         "umount" => "/usr/bin/umount",
         "virsh" => "/usr/bin/virsh",
         "zfs" => "/usr/sbin/zfs",
