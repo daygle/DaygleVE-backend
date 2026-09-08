@@ -83,6 +83,7 @@ async fn create(
     Json(req): Json<CreateVmRequest>,
 ) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
     user.require(Permission::VmWrite)?;
+    super::pools::ensure_pool_assignment(&state, &req.pool).await?;
     let services = state.services.clone();
     let operations = services.operations.clone();
     let actor = user.0.user.id.clone();
@@ -120,6 +121,7 @@ async fn update(
     Json(req): Json<UpdateVmRequest>,
 ) -> ApiResult<Json<Vm>> {
     user.require(Permission::VmWrite)?;
+    super::pools::ensure_pool_assignment(&state, &req.pool).await?;
     let services = state.services.clone();
     let operations = services.operations.clone();
     let operation_services = services.clone();

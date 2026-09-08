@@ -528,6 +528,8 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 OperationsWrite,
                 BackupRead,
                 BackupWrite,
+                PoolRead,
+                PoolWrite,
                 UserAdmin,
             ],
             Role::Operator => &[
@@ -548,6 +550,8 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 OperationsWrite,
                 BackupRead,
                 BackupWrite,
+                PoolRead,
+                PoolWrite,
             ],
             Role::Viewer => &[
                 VmRead,
@@ -558,6 +562,7 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 MetricsRead,
                 OperationsRead,
                 BackupRead,
+                PoolRead,
             ],
         };
         for p in granted {
