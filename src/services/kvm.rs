@@ -29,7 +29,7 @@ use crate::services::shares::ShareService;
 use crate::services::store::JsonStore;
 use crate::services::{
     command, ensure_safe_cidr, ensure_safe_id, ensure_safe_mac, ensure_safe_pci_address,
-    ensure_safe_zfs_dataset, new_id, now_ts,
+    ensure_safe_zfs_dataset, new_id, now_ts, validate_tags,
 };
 
 /// How long a console ticket is valid before the client must re-request one.
@@ -158,6 +158,7 @@ impl KvmService {
             template: req.template,
             autostart: req.autostart && !req.template,
             startup_order: req.startup_order,
+            tags: validate_tags(req.tags)?,
             created_at: now_ts(),
             updated_at: None,
         };
@@ -309,6 +310,9 @@ impl KvmService {
 
         if let Some(startup_order) = req.startup_order {
             vm.startup_order = Some(startup_order);
+        }
+        if let Some(tags) = req.tags {
+            vm.tags = validate_tags(tags)?;
         }
         if let Some(autostart) = req.autostart {
             vm.autostart = autostart;
@@ -487,6 +491,7 @@ impl KvmService {
             template: false,
             autostart: false,
             startup_order: None,
+            tags: src.tags.clone(),
             created_at: now_ts(),
             updated_at: None,
         };
@@ -579,6 +584,7 @@ impl KvmService {
                 // Host-only domains carry no DaygleVE template/autostart intent.
                 template: false,
                 autostart: false,
+                tags: Vec::new(),
                 created_at: now_ts(),
             });
         }
@@ -1824,6 +1830,7 @@ fn summary_of(vm: &Vm) -> VmSummary {
         memory_mib: vm.memory_mib,
         template: vm.template,
         autostart: vm.autostart,
+        tags: vm.tags.clone(),
         created_at: vm.created_at.clone(),
     }
 }
@@ -2539,6 +2546,7 @@ mod tests {
             template: false,
             autostart: false,
             startup_order: None,
+            tags: vec![],
             created_at: now_ts(),
             updated_at: None,
         }

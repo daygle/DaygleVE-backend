@@ -312,6 +312,39 @@ pub(crate) fn ensure_safe_cidr<'a>(cidr: &'a str, field: &str) -> crate::error::
     Ok(cidr)
 }
 
+/// Normalize and validate a set of organizational tags.
+///
+/// Each tag is trimmed and must be 1–64 chars of ASCII alphanumerics plus
+/// `-`, `_`, `.`, `:` (matching common tag conventions); duplicates are dropped
+/// keeping first-seen order, and the whole set is capped at 64 tags. Purely
+/// cosmetic metadata, but validated so it can be rendered and filtered safely.
+pub(crate) fn validate_tags(tags: Vec<String>) -> crate::error::ApiResult<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.len() > 64
+            || !tag
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err(crate::error::AppError::validation(format!(
+                "invalid tag: {tag:?} (use letters, digits, and - _ . :)"
+            )));
+        }
+        let tag = tag.to_string();
+        if !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    if out.len() > 64 {
+        return Err(crate::error::AppError::validation("too many tags (max 64)"));
+    }
+    Ok(out)
+}
+
 /// Current time as the schema's RFC-3339 string alias.
 pub(crate) fn now_ts() -> daygleve_schema::common::Timestamp {
     chrono::Utc::now().to_rfc3339()
@@ -352,5 +385,27 @@ mod tests {
         assert!(ensure_safe_cidr("192.168.1.10/24", "address").is_ok());
         assert!(ensure_safe_cidr("192.168.1.10/33", "address").is_err());
         assert!(ensure_safe_cidr("192.168.1.10/24\n", "address").is_err());
+    }
+
+    #[test]
+    fn tags_are_normalized_and_validated() {
+        // Trimmed, de-duplicated, order preserved.
+        assert_eq!(
+            validate_tags(vec![
+                " prod ".into(),
+                "web".into(),
+                "prod".into(),
+                "".into()
+            ])
+            .unwrap(),
+            vec!["prod".to_string(), "web".to_string()]
+        );
+        // Allowed punctuation.
+        assert!(validate_tags(vec!["env:prod".into(), "team-1".into(), "v1.2".into()]).is_ok());
+        // Rejected shapes.
+        assert!(validate_tags(vec!["bad tag".into()]).is_err());
+        assert!(validate_tags(vec!["nope!".into()]).is_err());
+        assert!(validate_tags(vec!["x".repeat(65)]).is_err());
+        assert!(validate_tags((0..65).map(|i| format!("t{i}")).collect()).is_err());
     }
 }

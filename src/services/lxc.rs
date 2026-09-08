@@ -30,6 +30,7 @@ use crate::services::library::LibraryService;
 use crate::services::store::JsonStore;
 use crate::services::{
     command, ensure_safe_cidr, ensure_safe_id, ensure_safe_zfs_dataset, new_id, now_ts,
+    validate_tags,
 };
 
 /// How long a console ticket is valid before the client must re-request one.
@@ -158,6 +159,9 @@ impl LxcService {
         for mount in &req.mounts {
             validate_mount(mount)?;
         }
+        // Validate tags before anything is created on the host, so a bad tag
+        // can't leave an orphaned container behind.
+        let tags = validate_tags(req.tags.clone())?;
 
         // Two rootfs sources: an uploaded CT-template tarball (built with the
         // `local` template's `--fstree`), or a `<dist>-<release>` image pulled
@@ -275,6 +279,7 @@ impl LxcService {
             mounts: req.mounts,
             unprivileged: req.unprivileged,
             description: req.description,
+            tags,
             created_at: now_ts(),
             updated_at: None,
         };
@@ -313,6 +318,9 @@ impl LxcService {
         }
         if req.description.is_some() {
             ct.description = req.description;
+        }
+        if let Some(tags) = req.tags {
+            ct.tags = validate_tags(tags)?;
         }
 
         // Apply new limits live if the container is running (best-effort).
@@ -449,6 +457,7 @@ impl LxcService {
                 state: LxcState::Stopped,
                 vcpus: 0,
                 memory_mib: 0,
+                tags: Vec::new(),
                 created_at: now_ts(),
             });
         }
@@ -742,6 +751,7 @@ fn summary_of(ct: &Lxc) -> LxcSummary {
         state: ct.state,
         vcpus: ct.vcpus,
         memory_mib: ct.memory_mib,
+        tags: ct.tags.clone(),
         created_at: ct.created_at.clone(),
     }
 }
