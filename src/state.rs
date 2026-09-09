@@ -43,6 +43,35 @@ impl AppState {
         services
             .snapshot_schedules
             .start_scheduler(services.clone());
+        // Persist per-VM and per-container samples independently of whether a
+        // dashboard is connected. The loop is intentionally detached from the
+        // request path and degrades gracefully on hosts without libvirt/LXC.
+        {
+            let services = services.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                loop {
+                    tick.tick().await;
+                    let vms = match services.kvm.list().await {
+                        Ok(vms) => vms,
+                        Err(error) => {
+                            tracing::warn!(error = %error.message(), "guest metrics could not list VMs");
+                            Vec::new()
+                        }
+                    };
+                    let containers = match services.lxc.list().await {
+                        Ok(containers) => containers,
+                        Err(error) => {
+                            tracing::warn!(error = %error.message(), "guest metrics could not list containers");
+                            Vec::new()
+                        }
+                    };
+                    if let Err(error) = services.metrics.collect_guests(&vms, &containers).await {
+                        tracing::warn!(error = %error.message(), "guest metrics collection failed");
+                    }
+                }
+            });
+        }
         // Bring up autostart VMs in the background so a slow guest boot never
         // blocks the API from starting to serve.
         {

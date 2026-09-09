@@ -37,6 +37,8 @@ fn program_path(program: &str) -> Option<&'static str> {
         "xorriso" => "/usr/bin/xorriso",
         // Disk-image inspection and conversion into a zvol during import.
         "qemu-img" => "/usr/bin/qemu-img",
+        "smartctl" => "/usr/sbin/smartctl",
+        "wipefs" => "/usr/sbin/wipefs",
         "umount" => "/usr/bin/umount",
         "virsh" => "/usr/bin/virsh",
         "zfs" => "/usr/sbin/zfs",

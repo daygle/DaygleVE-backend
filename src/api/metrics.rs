@@ -4,16 +4,16 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
-use daygleve_schema::metrics::{MetricsEvent, MetricsScope, NodeMetrics};
+use daygleve_schema::metrics::{GuestMetricsSample, MetricsEvent, MetricsScope, NodeMetrics};
 use futures::stream::Stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::IntervalStream;
-use tokio_stream::StreamExt;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
@@ -25,6 +25,9 @@ const STREAM_INTERVAL: Duration = Duration::from_secs(2);
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/metrics/node", get(node))
+        .route("/metrics/guests", get(current_guests))
+        .route("/metrics/history", get(history))
+        .route("/metrics/prometheus", get(prometheus))
         .route("/metrics/stream/ticket", axum::routing::post(stream_ticket))
         .route("/metrics/stream", get(stream))
 }
@@ -32,6 +35,55 @@ pub fn routes() -> Router<AppState> {
 async fn node(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<NodeMetrics>> {
     user.require(Permission::MetricsRead)?;
     Ok(Json(state.services.metrics.node().await))
+}
+
+async fn current_guests(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<GuestMetricsSample>>> {
+    user.require(Permission::MetricsRead)?;
+    Ok(Json(state.services.metrics.current_guests()))
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    scope: Option<MetricsScope>,
+    guest_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+async fn history(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> ApiResult<Json<Vec<GuestMetricsSample>>> {
+    user.require(Permission::MetricsRead)?;
+    Ok(Json(
+        state
+            .services
+            .metrics
+            .history(
+                query.scope,
+                query.guest_id.as_deref(),
+                query.from.as_deref(),
+                query.to.as_deref(),
+            )
+            .await?,
+    ))
+}
+
+async fn prometheus(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<(HeaderMap, String)> {
+    user.require(Permission::MetricsRead)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    Ok((headers, state.services.metrics.prometheus().await?))
 }
 
 /// Short-lived, one-time authorization for opening the SSE metrics stream.
@@ -60,8 +112,8 @@ struct StreamAuth {
     ticket: Option<String>,
 }
 
-/// `text/event-stream` of [`MetricsEvent`] frames. The frontend consumes this
-/// for live dashboards. TODO(metrics): also fan out per-guest frames.
+/// `text/event-stream` of [`MetricsEvent`] frames. The node frame is followed
+/// by the latest retained guest frames when the sampler has produced them.
 ///
 /// Authorized by a one-time `?ticket=` (minted via `POST /metrics/stream/ticket`)
 /// because `EventSource` cannot set an `Authorization` header, or by a bearer
@@ -102,17 +154,32 @@ async fn stream(
         }
     }
 
-    let stream = IntervalStream::new(tokio::time::interval(STREAM_INTERVAL)).then(move |_| {
-        let state = state.clone();
-        async move {
-            let frame = MetricsEvent {
-                scope: MetricsScope::Node,
-                node: Some(state.services.metrics.node().await),
-                guest: None,
-            };
-            Ok(Event::default().json_data(frame).unwrap_or_default())
-        }
-    });
+    let stream =
+        IntervalStream::new(tokio::time::interval(STREAM_INTERVAL))
+            .then(move |_| {
+                let state = state.clone();
+                async move {
+                    let frame = MetricsEvent {
+                        scope: MetricsScope::Node,
+                        node: Some(state.services.metrics.node().await),
+                        guest: None,
+                    };
+                    // Keep the SSE wire shape backwards-compatible: one event per
+                    // frame. Guest samples come from the background collector, so a
+                    // connected dashboard never triggers host sampling or persistence.
+                    let mut frames = vec![frame];
+                    frames.extend(state.services.metrics.current_guests().into_iter().map(
+                        |sample| MetricsEvent {
+                            scope: sample.scope,
+                            node: None,
+                            guest: Some(sample.metrics),
+                        },
+                    ));
+                    frames
+                }
+            })
+            .flat_map(tokio_stream::iter)
+            .map(|frame| Ok(Event::default().json_data(frame).unwrap_or_default()));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

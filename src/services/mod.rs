@@ -170,7 +170,7 @@ impl Services {
             gpu: gpu::GpuService::new(),
             pci: pci::PciService::new(),
             usb: usb::UsbService::new(),
-            metrics: metrics::MetricsService::new(),
+            metrics: metrics::MetricsService::new().with_history_dir(&config.state_dir),
             pools: pool::PoolService::new(config.clone()),
             schedules: Arc::new(schedule::ScheduleService::new(config.clone())),
             snapshot_schedules: Arc::new(snapshot_schedule::SnapshotScheduleService::new(

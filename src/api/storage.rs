@@ -1,6 +1,6 @@
 //! ZFS storage endpoints: pools, datasets, snapshots and clones.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -8,7 +8,8 @@ use daygleve_schema::auth::Permission;
 use daygleve_schema::operations::OperationRecord;
 use daygleve_schema::share::{CreateShareRequest, NetworkShare};
 use daygleve_schema::storage::{
-    CloneSnapshotRequest, CreateDatasetRequest, CreateSnapshotRequest, Dataset, Pool, Snapshot,
+    CloneSnapshotRequest, CreateDatasetRequest, CreatePoolRequest, CreateSnapshotRequest, Dataset,
+    Pool, RawDisk, SmartReport, Snapshot, WipeDiskRequest,
 };
 
 use crate::auth::AuthUser;
@@ -17,7 +18,10 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/storage/pools", get(list_pools))
+        .route("/storage/pools", get(list_pools).post(create_pool))
+        .route("/storage/disks", get(list_disks))
+        .route("/storage/disks/smart", get(smart_disk))
+        .route("/storage/disks/wipe", post(wipe_disk))
         .route("/storage/datasets", get(list_datasets).post(create_dataset))
         .route(
             "/storage/datasets/{id}/snapshots",
@@ -31,6 +35,65 @@ pub fn routes() -> Router<AppState> {
 async fn list_pools(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Vec<Pool>>> {
     user.require(Permission::StorageRead)?;
     Ok(Json(state.services.zfs.list_pools().await?))
+}
+
+async fn create_pool(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<CreatePoolRequest>,
+) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
+    user.require(Permission::StorageWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let actor = user.0.user.id.clone();
+    let record = operations
+        .enqueue(
+            "storage.create_pool",
+            Some("pool"),
+            None,
+            Some(&actor),
+            move |ops, handle| async move {
+                ops.update_progress(&handle.id, 10, Some("creating ZFS pool"))
+                    .await?;
+                let pool = services.zfs.create_pool(req).await?;
+                ops.set_result_id(&handle.id, &pool.name).await?;
+                Ok(Some(format!("created pool {}", pool.name)))
+            },
+        )
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(record)))
+}
+
+async fn list_disks(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<RawDisk>>> {
+    user.require(Permission::StorageRead)?;
+    Ok(Json(state.services.zfs.list_raw_disks().await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiskPathQuery {
+    path: String,
+}
+
+async fn smart_disk(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Query(query): Query<DiskPathQuery>,
+) -> ApiResult<Json<SmartReport>> {
+    user.require(Permission::StorageRead)?;
+    Ok(Json(state.services.zfs.smart_report(&query.path).await?))
+}
+
+async fn wipe_disk(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<WipeDiskRequest>,
+) -> ApiResult<StatusCode> {
+    user.require(Permission::StorageWrite)?;
+    state.services.zfs.wipe_disk(req).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_datasets(

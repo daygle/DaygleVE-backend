@@ -5,11 +5,13 @@
 //! On a host without ZFS installed, the list endpoints degrade to empty rather
 //! than erroring (see [`command::run_optional`]).
 
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use daygleve_schema::storage::{
-    CloneSnapshotRequest, CreateDatasetRequest, CreateSnapshotRequest, Dataset, DatasetKind, Pool,
-    PoolHealth, Snapshot,
+    CloneSnapshotRequest, CreateDatasetRequest, CreatePoolRequest, CreateSnapshotRequest, Dataset,
+    DatasetKind, Pool, PoolHealth, PoolLayout, RawDisk, SmartReport, Snapshot, WipeDiskRequest,
 };
 
 use crate::config::Config;
@@ -58,6 +60,183 @@ impl ZfsService {
             });
         }
         Ok(pools)
+    }
+
+    /// Enumerate physical block devices from sysfs. Virtual devices and
+    /// partitions are excluded; holder links and mounted filesystems mark a
+    /// disk as in use so destructive operations fail closed.
+    pub async fn list_raw_disks(&self) -> ApiResult<Vec<RawDisk>> {
+        let mut out = Vec::new();
+        let mut rd = match tokio::fs::read_dir("/sys/block").await {
+            Ok(rd) => rd,
+            Err(_) => return Ok(out),
+        };
+        let zpool_devices = self.zpool_device_paths().await?;
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .map_err(|e| AppError::internal(format!("read /sys/block: {e}")))?
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let sys = entry.path();
+            if !is_physical_disk_name(&name)
+                || tokio::fs::metadata(sys.join("partition")).await.is_ok()
+            {
+                continue;
+            }
+            let size_bytes = tokio::fs::read_to_string(sys.join("size"))
+                .await
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+                .saturating_mul(512);
+            let model = read_trimmed_file(&sys.join("device/model"))
+                .await
+                .unwrap_or_default();
+            let serial = read_trimmed_file(&sys.join("device/serial")).await;
+            let rotational = read_trimmed_file(&sys.join("queue/rotational"))
+                .await
+                .is_some_and(|v| v == "1");
+            let path = format!("/dev/{name}");
+            let holders = tokio::fs::read_dir(sys.join("holders"))
+                .await
+                .ok()
+                .map(|mut d| async move { d.next_entry().await.ok().flatten().is_some() });
+            let has_holder = match holders {
+                Some(f) => f.await,
+                None => false,
+            };
+            let mounted = mounted_device_names().await.iter().any(|mounted| {
+                mounted == &name
+                    || mounted
+                        .strip_prefix(&name)
+                        .is_some_and(|suffix| suffix.chars().all(|c| c.is_ascii_digit()))
+            });
+            out.push(RawDisk {
+                path: path.clone(),
+                model,
+                serial,
+                size_bytes,
+                rotational,
+                in_use: has_holder || mounted || zpool_devices.contains(&path),
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    pub async fn smart_report(&self, path: &str) -> ApiResult<SmartReport> {
+        let disk = self.raw_disk(path).await?;
+        let checked_at = crate::services::now_ts();
+        let output = match command::run_optional("smartctl", &["-j", "-a", &disk.path]).await? {
+            Some(output) => output,
+            None => {
+                return Ok(SmartReport {
+                    path: disk.path,
+                    supported: false,
+                    passed: None,
+                    health: None,
+                    temperature_c: None,
+                    power_on_hours: None,
+                    checked_at,
+                })
+            }
+        };
+        let value: serde_json::Value = serde_json::from_str(&output)
+            .map_err(|e| AppError::hypervisor(format!("parse smartctl JSON: {e}")))?;
+        let supported = value
+            .pointer("smart_support.available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let passed = value
+            .pointer("smart_status.passed")
+            .and_then(serde_json::Value::as_bool);
+        let health = passed.map(|ok| {
+            if ok {
+                "PASSED".to_string()
+            } else {
+                "FAILED".to_string()
+            }
+        });
+        let temperature_c = value
+            .pointer("temperature.current")
+            .and_then(serde_json::Value::as_i64)
+            .map(|v| v as i32);
+        let power_on_hours = value
+            .pointer("power_on_time.hours")
+            .and_then(serde_json::Value::as_u64);
+        Ok(SmartReport {
+            path: disk.path,
+            supported,
+            passed,
+            health,
+            temperature_c,
+            power_on_hours,
+            checked_at,
+        })
+    }
+
+    pub async fn wipe_disk(&self, req: WipeDiskRequest) -> ApiResult<()> {
+        let disk = self.raw_disk(&req.path).await?;
+        if req.confirm != disk.path {
+            return Err(AppError::validation(
+                "confirm must exactly match the disk path",
+            ));
+        }
+        if disk.in_use {
+            return Err(AppError::conflict("refusing to wipe a disk that is in use"));
+        }
+        command::run_ok("wipefs", &["-a", &disk.path]).await
+    }
+
+    pub async fn create_pool(&self, req: CreatePoolRequest) -> ApiResult<Pool> {
+        ensure_pool_name(&req.name)?;
+        let required = min_devices(req.layout);
+        if req.devices.len() < required {
+            return Err(AppError::validation(format!(
+                "{:?} requires at least {required} devices",
+                req.layout
+            )));
+        }
+        let mut unique = HashSet::new();
+        let disks = self.list_raw_disks().await?;
+        let mut paths = Vec::with_capacity(req.devices.len());
+        for path in &req.devices {
+            let disk = disks
+                .iter()
+                .find(|d| d.path == *path)
+                .ok_or_else(|| AppError::not_found(format!("raw disk {path} not found")))?;
+            if !unique.insert(path) {
+                return Err(AppError::validation("pool devices must be unique"));
+            }
+            if disk.in_use {
+                return Err(AppError::conflict(format!("disk {path} is in use")));
+            }
+            paths.push(disk.path.clone());
+        }
+        let layout = match req.layout {
+            PoolLayout::Stripe => None,
+            PoolLayout::Mirror => Some("mirror"),
+            PoolLayout::Raidz1 => Some("raidz1"),
+            PoolLayout::Raidz2 => Some("raidz2"),
+            PoolLayout::Raidz3 => Some("raidz3"),
+        };
+        let mut args = vec!["create".to_string()];
+        if req.force {
+            args.push("-f".to_string());
+        }
+        args.push(req.name.clone());
+        if let Some(layout) = layout {
+            args.push(layout.to_string());
+        }
+        args.extend(paths);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        command::run_ok("zpool", &argv).await?;
+        self.list_pools()
+            .await?
+            .into_iter()
+            .find(|p| p.name == req.name)
+            .ok_or_else(|| AppError::hypervisor("pool was created but could not be read back"))
     }
 
     pub async fn list_datasets(&self) -> ApiResult<Vec<Dataset>> {
@@ -184,6 +363,28 @@ impl ZfsService {
         self.get_dataset(&req.target).await
     }
 
+    async fn raw_disk(&self, path: &str) -> ApiResult<RawDisk> {
+        self.list_raw_disks()
+            .await?
+            .into_iter()
+            .find(|disk| disk.path == path)
+            .ok_or_else(|| AppError::not_found(format!("raw disk {path} not found")))
+    }
+
+    async fn zpool_device_paths(&self) -> ApiResult<HashSet<String>> {
+        let mut paths = HashSet::new();
+        let output = match command::run_optional("zpool", &["status", "-P", "-L"]).await? {
+            Some(v) => v,
+            None => return Ok(paths),
+        };
+        for token in output.split_whitespace() {
+            if token.starts_with("/dev/") {
+                paths.insert(token.to_string());
+            }
+        }
+        Ok(paths)
+    }
+
     /// Read a single dataset back by name.
     async fn get_dataset(&self, name: &str) -> ApiResult<Dataset> {
         let out = command::run("zfs", &["list", "-Hp", "-o", DATASET_COLS, name]).await?;
@@ -191,6 +392,61 @@ impl ZfsService {
             .next()
             .and_then(parse_dataset_line)
             .ok_or_else(|| AppError::hypervisor(format!("dataset {name} not found after create")))
+    }
+}
+fn is_physical_disk_name(name: &str) -> bool {
+    !(name.starts_with("loop")
+        || name.starts_with("ram")
+        || name.starts_with("zram")
+        || name.starts_with("dm-")
+        || name.starts_with("md")
+        || name.starts_with("sr"))
+}
+
+async fn read_trimmed_file(path: &Path) -> Option<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+async fn mounted_device_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Ok(text) = tokio::fs::read_to_string("/proc/mounts").await {
+        for line in text.lines() {
+            if let Some(device) = line.split_whitespace().next() {
+                if let Some(name) = device.strip_prefix("/dev/") {
+                    names.insert(name.split('/').next().unwrap_or(name).to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn ensure_pool_name(name: &str) -> ApiResult<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with('-')
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(AppError::validation(
+            "pool name must be a safe single component",
+        ));
+    }
+    Ok(())
+}
+
+fn min_devices(layout: PoolLayout) -> usize {
+    match layout {
+        PoolLayout::Stripe => 1,
+        PoolLayout::Mirror => 2,
+        PoolLayout::Raidz1 => 3,
+        PoolLayout::Raidz2 => 4,
+        PoolLayout::Raidz3 => 5,
     }
 }
 

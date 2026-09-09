@@ -386,6 +386,8 @@ pub fn program_path(program: &str) -> Option<&'static str> {
         "xorriso" => "/usr/bin/xorriso",
         // Disk-image inspection and conversion into a zvol during import.
         "qemu-img" => "/usr/bin/qemu-img",
+        "smartctl" => "/usr/sbin/smartctl",
+        "wipefs" => "/usr/sbin/wipefs",
         "umount" => "/usr/bin/umount",
         "virsh" => "/usr/bin/virsh",
         "zfs" => "/usr/sbin/zfs",
@@ -495,7 +497,7 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
                     | "receive"
             )
         ),
-        "zpool" => matches!(subcommand, Some("list" | "status")),
+        "zpool" => matches!(subcommand, Some("list" | "status" | "create")),
         "lxc-create" | "lxc-destroy" | "lxc-start" | "lxc-stop" | "lxc-freeze" | "lxc-unfreeze"
         | "lxc-info" | "lxc-cgroup" | "lxc-ls" => true,
         "ip" => {
@@ -516,6 +518,7 @@ fn validate_exec_shape(program: &str, args: &[String]) -> Result<(), String> {
         // Disk-image import: inspect a source image or convert it into a zvol.
         // Paths and the output format are constrained in validate_exec_args.
         "qemu-img" => matches!(subcommand, Some("info" | "convert")),
+        "smartctl" | "wipefs" => true,
         _ => false,
     };
     if !allowed {
@@ -605,10 +608,38 @@ fn safe_zfs_property(value: &str) -> bool {
 }
 
 fn validate_zpool_args(args: &[String]) -> Result<(), String> {
+    let command = args.first().map(String::as_str).unwrap_or_default();
     let mut index = 1;
+    if command == "create" {
+        if args.get(index).is_some_and(|a| a == "-f") {
+            index += 1;
+        }
+        let name = args
+            .get(index)
+            .ok_or_else(|| "zpool create requires a name".to_string())?;
+        if !safe_cli_name(name) {
+            return Err("zpool name is unsafe".to_string());
+        }
+        index += 1;
+        if matches!(
+            args.get(index).map(String::as_str),
+            Some("mirror" | "raidz1" | "raidz2" | "raidz3")
+        ) {
+            index += 1;
+        }
+        if index >= args.len() {
+            return Err("zpool create requires devices".to_string());
+        }
+        for device in &args[index..] {
+            if !safe_block_device(device) {
+                return Err("zpool device must be a /dev/<disk> path".to_string());
+            }
+        }
+        return Ok(());
+    }
     while index < args.len() {
         let arg = &args[index];
-        if matches!(arg.as_str(), "-H" | "-p" | "-Hp") {
+        if matches!(arg.as_str(), "-H" | "-p" | "-Hp" | "-L" | "-P") {
             index += 1;
         } else if arg == "-o" {
             let value = args
@@ -628,6 +659,32 @@ fn validate_zpool_args(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_smartctl_args(args: &[String]) -> Result<(), String> {
+    match args {
+        [json, all, path] if json == "-j" && all == "-a" && safe_block_device(path) => Ok(()),
+        _ => Err("smartctl requires exactly `-j -a /dev/<disk>`".to_string()),
+    }
+}
+
+fn validate_wipefs_args(args: &[String]) -> Result<(), String> {
+    match args {
+        [flag, path] if flag == "-a" && safe_block_device(path) => Ok(()),
+        _ => Err("wipefs requires exactly `-a /dev/<disk>`".to_string()),
+    }
+}
+
+fn safe_block_device(value: &str) -> bool {
+    let Some(name) = value.strip_prefix("/dev/") else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn safe_cli_name(value: &str) -> bool {
@@ -859,6 +916,8 @@ fn validate_exec_args(program: &str, args: &[String]) -> Result<(), String> {
         }
         "zfs" => validate_zfs_args(args)?,
         "zpool" => validate_zpool_args(args)?,
+        "smartctl" => validate_smartctl_args(args)?,
+        "wipefs" => validate_wipefs_args(args)?,
         name if name.starts_with("lxc-") => {
             if let Some(container) = arg_after(args, "-n") {
                 if validate_lxc_name(container).is_err() {

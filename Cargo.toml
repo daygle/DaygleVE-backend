@@ -53,6 +53,5 @@ hmac = "0.12"
 [target.'cfg(unix)'.dependencies]
 pty-process = { version = "0.4", features = ["async"] }
 
-
 [lints.rust]
 unsafe_code = "forbid"
