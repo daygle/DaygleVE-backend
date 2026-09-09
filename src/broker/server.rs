@@ -13,8 +13,8 @@ use tokio::process::Command;
 
 use super::framing;
 use super::{
-    validate_lxc_config_block, validate_lxc_name, validate_request, Op, PciWriteKind, Request,
-    Response, StreamFrame, CHUNK_PAYLOAD_MAX, EXEC_TIMEOUT_CAP,
+    validate_lxc_config_block, validate_lxc_name, validate_request, validate_zfs_dataset_path, Op,
+    PciWriteKind, Request, Response, StreamFrame, CHUNK_PAYLOAD_MAX, EXEC_TIMEOUT_CAP,
 };
 
 /// Runtime configuration for the broker listener.
