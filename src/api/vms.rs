@@ -16,8 +16,8 @@ use daygleve_schema::pci::PciAssignment;
 use daygleve_schema::usb::UsbAssignment;
 use daygleve_schema::vm::{
     AttachVmPciRequest, AttachVmUsbRequest, CloneVmRequest, ConsoleTicket, CreateVmRequest,
-    CreateVmSnapshotRequest, GuestAgentInfo, IsoImage, ResizeVmDiskRequest, UpdateVmRequest, Vm,
-    VmDisk, VmPowerRequest, VmPowerResponse, VmSnapshot, VmSummary,
+    CreateVmSnapshotRequest, GuestAgentInfo, IsoImage, MigrateVmDiskRequest, ResizeVmDiskRequest,
+    UpdateVmRequest, Vm, VmDisk, VmPowerRequest, VmPowerResponse, VmSnapshot, VmSummary,
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -53,6 +53,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/vms/{id}/guest-agent", get(guest_agent))
         .route("/vms/{id}/disks/{index}/resize", post(resize_disk))
+        .route("/vms/{id}/disks/migrate", post(migrate_disk))
         .route("/vms/{id}/disks", get(list_disks).post(attach_disk))
         .route(
             "/vms/{id}/disks/{index}",
@@ -294,6 +295,41 @@ async fn attach_disk(
         )
         .await?;
     Ok((StatusCode::CREATED, Json(vm)))
+}
+
+/// Move one of the VM's disks to another ZFS dataset/pool (offline).
+async fn migrate_disk(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<MigrateVmDiskRequest>,
+) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
+    user.require(Permission::VmWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let record = operations
+        .enqueue(
+            "vm.migrate_disk",
+            Some("vm"),
+            Some(&resource_id),
+            Some(&actor),
+            move |ops, handle| async move {
+                let disk_index = req.disk_index;
+                ops.update_progress(&handle.id, 10, Some("migrating disk"))
+                    .await?;
+                let vm = services.kvm.migrate_disk(&id, req).await?;
+                let new_dataset = vm
+                    .disks
+                    .get(disk_index)
+                    .map(|d| d.dataset.clone())
+                    .unwrap_or_default();
+                Ok(Some(format!("migrated disk to {new_dataset}")))
+            },
+        )
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(record)))
 }
 
 /// Detach a disk by index (its zvol and data are kept).

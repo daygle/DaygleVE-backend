@@ -96,6 +96,17 @@ pub enum Op {
         /// The config lines to append.
         block: String,
     },
+    /// Re-point a container's `lxc.rootfs.path` (an existing zfs: device path)
+    /// to a new validated `zfs:<dataset>` value inside
+    /// `/var/lib/lxc/{name}/config`. Used by rootfs storage migration. The path
+    /// and value are both derived/validated server-side; the client never
+    /// supplies a free-form file path or config line.
+    LxcRootfsSet {
+        /// Container name (path-safe, validated).
+        name: String,
+        /// The new ZFS dataset backing the rootfs, e.g. `slowpool/lxc/ct1`.
+        dataset: String,
+    },
     /// Attach to a running guest's console pty and bridge it to the client.
     ///
     /// The backend resolves the device with an allowlisted `virsh ttyconsole`
@@ -720,6 +731,17 @@ fn safe_snapshot_ref(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
 }
 
+/// Validate a bare ZFS dataset path for ops that re-point a config value at
+/// one (rootfs migration). Same rules as [`safe_dataset`], surfaced as a
+/// Result for request validation.
+pub fn validate_zfs_dataset_path(value: &str) -> Result<(), String> {
+    if safe_dataset(value) {
+        Ok(())
+    } else {
+        Err("ZFS dataset path is unsafe".to_string())
+    }
+}
+
 fn safe_abs_path(value: &str, prefix: &str, suffix: Option<&str>) -> bool {
     value.starts_with(prefix)
         && !value.contains("/../")
@@ -1181,6 +1203,10 @@ pub fn validate_request(req: &Request) -> Result<(), String> {
         Op::LxcConfigAppend { name, block } => {
             validate_lxc_name(name)?;
             validate_lxc_config_block(block)?;
+        }
+        Op::LxcRootfsSet { name, dataset } => {
+            validate_lxc_name(name)?;
+            validate_zfs_dataset_path(dataset)?;
         }
         Op::ConsoleAttach { pty, timeout_secs } => {
             validate_console_pty(pty)?;

@@ -187,6 +187,13 @@ async fn handle_connection(
             };
             reply_response(&mut stream, response).await
         }
+        Op::LxcRootfsSet { name, dataset } => {
+            let response = match handle_lxc_rootfs_set(&name, &dataset).await {
+                Ok(()) => Response::success(String::new(), String::new(), 0),
+                Err(message) => Response::exec_failed(message, String::new()),
+            };
+            reply_response(&mut stream, response).await
+        }
         Op::ConsoleAttach { pty, timeout_secs } => {
             let (reader, writer) = stream.into_split();
             stream_console(reader, writer, &pty, timeout_secs).await
@@ -646,6 +653,80 @@ async fn handle_lxc_config_append(name: &str, block: &str) -> Result<(), String>
     })
     .await
     .map_err(|e| format!("append task failed: {e}"))?
+}
+
+/// Rewrite the container config's `lxc.rootfs.path` line to point at a new
+/// `zfs:<dataset>` rootfs (rootfs migration). The rewrite is a bounded,
+/// line-filtered edit of the existing config file: any existing
+/// `lxc.rootfs.path`/`lxc.rootfs.device` line is replaced, everything else
+/// passes through untouched. Fails when the config has no rootfs line to
+/// replace (the broker never fabricates one).
+async fn handle_lxc_rootfs_set(name: &str, dataset: &str) -> Result<(), String> {
+    validate_lxc_name(name)?;
+    validate_zfs_dataset_path(dataset)?;
+    if !dataset.contains('/') {
+        return Err("rootfs dataset must include a pool component".to_string());
+    }
+    let path = Path::new("/var/lib/lxc").join(name).join("config");
+    let dataset = dataset.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .write(true);
+        let mut file = options
+            .open(&path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        if metadata.len() > 1024 * 1024 {
+            return Err(format!("{} exceeds 1 MiB", path.display()));
+        }
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let new_path_line = format!("lxc.rootfs.path = zfs:{dataset}");
+        let mut replaced = false;
+        let mut out = String::with_capacity(text.len() + new_path_line.len() + 2);
+        for line in text.split('\n') {
+            // Re-emit every line (minus its \n, which we add back uniformly);
+            // a trailing empty element from a final newline is preserved.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("lxc.rootfs.path") || trimmed.starts_with("lxc.rootfs.device") {
+                if !replaced {
+                    out.push_str(&new_path_line);
+                    out.push('\n');
+                    replaced = true;
+                }
+                // Drop duplicate/old rootfs lines entirely.
+                continue;
+            }
+            out.push_str(line.trim_end_matches('\r'));
+            out.push('\n');
+        }
+        if !replaced {
+            return Err(format!(
+                "{} has no lxc.rootfs.path line to replace",
+                path.display()
+            ));
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek {}: {e}", path.display()))?;
+        file.set_len(0)
+            .map_err(|e| format!("truncate {}: {e}", path.display()))?;
+        file.write_all(out.as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        file.sync_data()
+            .map_err(|e| format!("sync {}: {e}", path.display()))
+    })
+    .await
+    .map_err(|e| format!("rootfs set task failed: {e}"))?
 }
 
 #[cfg(test)]

@@ -315,6 +315,21 @@ impl BrokerClient {
         }
     }
 
+    /// Re-point a container's `lxc.rootfs.path` to a new ZFS dataset.
+    pub async fn lxc_rootfs_set(&self, name: &str, dataset: &str) -> Result<(), BrokerError> {
+        let mut stream = self.connect().await?;
+        let request = self.request(Op::LxcRootfsSet {
+            name: name.to_string(),
+            dataset: dataset.to_string(),
+        });
+        match self.unary(&mut stream, &request).await? {
+            UnaryOutcome::Response(resp) => response_to_unit(resp),
+            UnaryOutcome::Stream(_) => Err(BrokerError::Protocol(
+                "unexpected streaming frame on an LXC rootfs set".to_string(),
+            )),
+        }
+    }
+
     /// Send one request, read the broker's single reply.
     async fn unary(
         &self,

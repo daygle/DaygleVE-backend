@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use daygleve_schema::lxc::{
     CreateLxcRequest, Lxc, LxcMount, LxcNetwork, LxcPowerAction, LxcState, LxcSummary,
-    UpdateLxcRequest,
+    MigrateLxcRootfsRequest, UpdateLxcRequest,
 };
 use daygleve_schema::vm::ConsoleTicket;
 
@@ -355,6 +355,81 @@ impl LxcService {
         let _ = command::run_optional("zfs", &["destroy", "-r", &ct.rootfs_dataset]).await;
         self.store.delete(id).await?;
         Ok(())
+    }
+
+    /// Move the container's rootfs dataset to a different ZFS dataset
+    /// (possibly another pool) by streaming its contents with `zfs send |
+    /// receive`. The container must be stopped. The container config is
+    /// re-pointed at the new dataset and the old dataset is destroyed only
+    /// after the copy succeeds.
+    pub async fn migrate_rootfs(&self, id: &str, req: MigrateLxcRootfsRequest) -> ApiResult<Lxc> {
+        let mut ct = self.get_stored(id).await?;
+        let source_dataset = ct.rootfs_dataset.clone();
+        let source = ensure_safe_zfs_dataset(source_dataset.trim())?;
+        let target = ensure_safe_zfs_dataset(&req.target_dataset)?;
+        if source == target {
+            return Err(AppError::validation(
+                "target dataset is the same as the source",
+            ));
+        }
+        if matches!(self.live_state(&ct.name).await, Some(LxcState::Running)) {
+            return Err(AppError::conflict(
+                "stop the container before migrating its rootfs",
+            ));
+        }
+        let exists = command::run_optional("zfs", &["list", "-H", "-o", "name", target]).await?;
+        if exists.is_some() {
+            return Err(AppError::conflict(format!(
+                "target dataset {target} already exists"
+            )));
+        }
+
+        // Snapshot -> send to temp file -> receive (same broker-safe pattern
+        // as VM disk migration and backups).
+        let tag = format!("migrate-{}", chrono::Utc::now().timestamp());
+        let snapshot = format!("{source}@{tag}");
+        command::run_ok("zfs", &["snapshot", &snapshot]).await?;
+        let temp = self.config.state_dir.join("tmp").join(format!(
+            "ct-migrate-{}-{}.zfs",
+            crate::services::ensure_safe_id(id).map_err(|e| AppError::internal(e.message()))?,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        if let Some(parent) = temp.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let copy = async {
+            command::stream_to_file("zfs", &["send", &snapshot], &temp).await?;
+            command::stream_from_file("zfs", &["receive", "-F", target], &temp).await
+        };
+        if let Err(e) = copy.await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            let _ = command::run_ok("zfs", &["destroy", &snapshot]).await;
+            return Err(e);
+        }
+        let _ = tokio::fs::remove_file(&temp).await;
+
+        // Strip the migration snapshot from the target and confirm it reads
+        // back before touching any configuration.
+        let _ = command::run_ok("zfs", &["destroy", &format!("{target}@{tag}")]).await;
+        command::run_ok("zfs", &["list", "-H", "-o", "name", target]).await?;
+
+        // Re-point the container config, then persist the record.
+        command::set_lxc_rootfs(&ct.name, target).await?;
+        ct.rootfs_dataset = target.to_string();
+        ct.updated_at = Some(now_ts());
+        self.store.put(id, &ct).await?;
+
+        // Only now destroy the old dataset: the container no longer references
+        // it. `lxc-destroy` is not involved; the config edit above is what
+        // makes the next start use the new rootfs.
+        command::run_ok("zfs", &["destroy", "-r", source]).await?;
+        tracing::info!(
+            container = %ct.name,
+            from = %source,
+            to = %target,
+            "migrated container rootfs"
+        );
+        Ok(ct)
     }
 
     pub async fn power(&self, id: &str, action: LxcPowerAction) -> ApiResult<Lxc> {

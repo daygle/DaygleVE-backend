@@ -450,6 +450,48 @@ pub async fn pci_write(kind: crate::broker::PciWriteKind, address: &str) -> ApiR
         .map_err(|e| AppError::hypervisor(format!("write {}: {e}", path.display())))
 }
 
+/// Delegate a constrained LXC rootfs re-point when the broker is enabled.
+/// Without a broker, edit the config file directly (same validation applies).
+pub async fn set_lxc_rootfs(name: &str, dataset: &str) -> ApiResult<()> {
+    crate::broker::validate_lxc_name(name).map_err(AppError::validation)?;
+    crate::broker::validate_zfs_dataset_path(dataset).map_err(AppError::validation)?;
+    #[cfg(unix)]
+    if let Some(client) = broker_client() {
+        return client
+            .lxc_rootfs_set(name, dataset)
+            .await
+            .map_err(broker_error);
+    }
+    let path = Path::new("/var/lib/lxc").join(name).join("config");
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| AppError::hypervisor(format!("read {}: {e}", path.display())))?;
+    let new_line = format!("lxc.rootfs.path = zfs:{dataset}");
+    let mut replaced = false;
+    let mut out = String::with_capacity(text.len() + new_line.len() + 2);
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("lxc.rootfs.path") || trimmed.starts_with("lxc.rootfs.device") {
+            if !replaced {
+                out.push_str(&new_line);
+                out.push('\n');
+                replaced = true;
+            }
+            continue;
+        }
+        out.push_str(line.trim_end_matches('\r'));
+        out.push('\n');
+    }
+    if !replaced {
+        return Err(AppError::hypervisor(
+            "container config has no lxc.rootfs.path line to replace",
+        ));
+    }
+    tokio::fs::write(&path, out)
+        .await
+        .map_err(|e| AppError::hypervisor(format!("write {}: {e}", path.display())))
+}
+
 /// Delegate a constrained LXC config append when the broker is enabled.
 pub async fn append_lxc_config(name: &str, block: &str) -> ApiResult<()> {
     crate::broker::validate_lxc_name(name).map_err(AppError::validation)?;
