@@ -36,10 +36,9 @@ struct BreachState {
 pub struct AlertService {
     store: JsonStore,
     notifications: Arc<NotificationService>,
-    /// Evaluation state keyed by `"<rule_id>|<subject>"`; persisted so sustain
-    /// streaks and cooldowns survive a backend restart.
-    state: JsonStore,
-    /// In-memory mirror of the state store for cheap per-tick reads/writes.
+    /// In-memory breach state keyed by `"<rule_id>|<subject>"`. Not persisted:
+    /// a backend restart resets sustain streaks (the next sustained breach
+    /// re-fires), which is the safe direction for an alerting system.
     breach: tokio::sync::Mutex<HashMap<String, BreachState>>,
 }
 
@@ -61,7 +60,6 @@ impl AlertService {
         Self {
             store: JsonStore::new(&config.state_dir, "alert_rules"),
             notifications,
-            state: JsonStore::new(&config.state_dir, "alert_state"),
             breach: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
