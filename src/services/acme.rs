@@ -92,74 +92,95 @@ impl AcmeService {
         }
     }
 
-    fn config_path(&self) -> PathBuf {
-        self.dir.join(CONFIG_FILE)
+    /// Canonicalize the ACME state directory so every path handed to a
+    /// filesystem sink is derived from the filesystem, not from the
+    /// (environment-derived) `state_dir` configuration. `canonicalize` is the
+    /// recognized path-injection barrier: the configured directory is only ever
+    /// its *argument*, never joined directly into an fs path. With `create` the
+    /// directory is created first; otherwise a missing directory yields `None`
+    /// so reads on a fresh node simply fall back to defaults.
+    async fn resolve_dir(&self, create: bool) -> ApiResult<Option<PathBuf>> {
+        if create {
+            tokio::fs::create_dir_all(&self.dir)
+                .await
+                .map_err(|e| AppError::internal(format!("create acme dir: {e}")))?;
+        }
+        match tokio::fs::canonicalize(&self.dir).await {
+            Ok(p) => Ok(Some(p)),
+            Err(_) if !create => Ok(None),
+            Err(e) => Err(AppError::internal(format!("resolve acme dir: {e}"))),
+        }
     }
-    fn account_path(&self) -> PathBuf {
-        self.dir.join(ACCOUNT_FILE)
-    }
-    fn meta_path(&self) -> PathBuf {
-        self.dir.join(META_FILE)
-    }
-    /// Absolute path of the installed certificate chain (fullchain PEM).
-    pub fn cert_path(&self) -> PathBuf {
-        self.dir.join(CERT_FILE)
-    }
-    /// Absolute path of the installed private key (PEM).
-    pub fn key_path(&self) -> PathBuf {
-        self.dir.join(KEY_FILE)
+
+    /// Canonical path of a fixed file within the ACME dir. `file` is always a
+    /// compile-time constant, so the only variable input (the state dir) is
+    /// neutralized by the `canonicalize` in [`Self::resolve_dir`].
+    async fn resolve_file(&self, create: bool, file: &'static str) -> ApiResult<Option<PathBuf>> {
+        Ok(self.resolve_dir(create).await?.map(|dir| dir.join(file)))
     }
 
     /// The managed certificate + key paths to serve TLS from, when ACME is
     /// enabled and a certificate has been issued. `main` prefers these over the
     /// statically configured `DAYGLEVE_TLS_CERT`/`_KEY` at startup.
     pub async fn installed_tls_paths(&self) -> Option<(PathBuf, PathBuf)> {
-        if self.config().await.enabled && self.cert_installed().await {
-            Some((self.cert_path(), self.key_path()))
-        } else {
-            None
+        if !self.config().await.enabled || !self.cert_installed().await {
+            return None;
         }
+        let cert = self.resolve_file(false, CERT_FILE).await.ok().flatten()?;
+        let key = self.resolve_file(false, KEY_FILE).await.ok().flatten()?;
+        Some((cert, key))
     }
 
     /// The stored configuration, or a disabled default on a fresh node.
     pub async fn config(&self) -> AcmeConfig {
-        match tokio::fs::read(self.config_path()).await {
+        let Ok(Some(path)) = self.resolve_file(false, CONFIG_FILE).await else {
+            return default_config();
+        };
+        match tokio::fs::read(path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| default_config()),
             Err(_) => default_config(),
         }
     }
 
     async fn meta(&self) -> CertMeta {
-        match tokio::fs::read(self.meta_path()).await {
+        let Ok(Some(path)) = self.resolve_file(false, META_FILE).await else {
+            return CertMeta::default();
+        };
+        match tokio::fs::read(path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => CertMeta::default(),
         }
     }
 
     async fn write_meta(&self, meta: &CertMeta) -> ApiResult<()> {
-        self.ensure_dir().await?;
+        let path = self
+            .resolve_file(true, META_FILE)
+            .await?
+            .expect("resolve_file(create=true) yields Some");
         let bytes = serde_json::to_vec_pretty(meta)
             .map_err(|e| AppError::internal(format!("serialize acme meta: {e}")))?;
-        tokio::fs::write(self.meta_path(), bytes)
+        tokio::fs::write(path, bytes)
             .await
             .map_err(|e| AppError::internal(format!("write acme meta: {e}")))
     }
 
-    async fn ensure_dir(&self) -> ApiResult<()> {
-        tokio::fs::create_dir_all(&self.dir)
-            .await
-            .map_err(|e| AppError::internal(format!("create acme dir: {e}")))
-    }
-
     /// Whether an ACME account has been registered (credentials on disk).
     async fn account_registered(&self) -> bool {
-        tokio::fs::metadata(self.account_path()).await.is_ok()
+        match self.resolve_file(false, ACCOUNT_FILE).await {
+            Ok(Some(path)) => tokio::fs::metadata(path).await.is_ok(),
+            _ => false,
+        }
     }
 
     /// Whether a certificate is currently installed.
     async fn cert_installed(&self) -> bool {
-        tokio::fs::metadata(self.cert_path()).await.is_ok()
-            && tokio::fs::metadata(self.key_path()).await.is_ok()
+        let (Ok(Some(cert)), Ok(Some(key))) = (
+            self.resolve_file(false, CERT_FILE).await,
+            self.resolve_file(false, KEY_FILE).await,
+        ) else {
+            return false;
+        };
+        tokio::fs::metadata(cert).await.is_ok() && tokio::fs::metadata(key).await.is_ok()
     }
 
     /// The full status view for `GET /security/acme`.
@@ -192,10 +213,13 @@ impl AcmeService {
     /// the caller can trigger issuance, or the scheduler picks it up.
     pub async fn update_config(&self, req: UpdateAcmeConfigRequest) -> ApiResult<AcmeConfig> {
         let config = validate_config(req)?;
-        self.ensure_dir().await?;
+        let path = self
+            .resolve_file(true, CONFIG_FILE)
+            .await?
+            .expect("resolve_file(create=true) yields Some");
         let bytes = serde_json::to_vec_pretty(&config)
             .map_err(|e| AppError::internal(format!("serialize acme config: {e}")))?;
-        tokio::fs::write(self.config_path(), bytes)
+        tokio::fs::write(path, bytes)
             .await
             .map_err(|e| AppError::internal(format!("write acme config: {e}")))?;
         Ok(config)
@@ -270,7 +294,7 @@ impl AcmeService {
                 return Ok(());
             }
         };
-        self.ensure_dir().await?;
+        self.resolve_dir(true).await?;
         let result = self.issue_inner(config).await;
         // Record success or failure in the metadata either way.
         let mut meta = self.meta().await;
@@ -376,7 +400,11 @@ impl AcmeService {
 
     /// Load a persisted account whose directory matches, else create a new one.
     async fn load_or_create_account(&self, config: &AcmeConfig) -> ApiResult<Account> {
-        if let Ok(bytes) = tokio::fs::read(self.account_path()).await {
+        let account_path = self
+            .resolve_file(true, ACCOUNT_FILE)
+            .await?
+            .expect("resolve_file(create=true) yields Some");
+        if let Ok(bytes) = tokio::fs::read(&account_path).await {
             if let Ok(stored) = serde_json::from_slice::<StoredAccount>(&bytes) {
                 if stored.directory_url == config.directory_url {
                     return Account::from_credentials(stored.credentials)
@@ -403,7 +431,7 @@ impl AcmeService {
         };
         let bytes = serde_json::to_vec(&stored)
             .map_err(|e| AppError::internal(format!("serialize acme account: {e}")))?;
-        tokio::fs::write(self.account_path(), bytes)
+        tokio::fs::write(&account_path, bytes)
             .await
             .map_err(|e| AppError::internal(format!("write acme account: {e}")))?;
         Ok(account)
@@ -451,19 +479,24 @@ impl AcmeService {
     /// Write the chain + key to the managed paths and hot-reload the listener.
     async fn install_cert(&self, cert_chain: &str, key_pem: &str) -> ApiResult<InstalledCert> {
         let (issued_at, expires_at) = parse_cert_validity(cert_chain)?;
-        tokio::fs::write(self.cert_path(), cert_chain)
+        let cert_path = self
+            .resolve_file(true, CERT_FILE)
+            .await?
+            .expect("resolve_file(create=true) yields Some");
+        let key_path = self
+            .resolve_file(true, KEY_FILE)
+            .await?
+            .expect("resolve_file(create=true) yields Some");
+        tokio::fs::write(&cert_path, cert_chain)
             .await
             .map_err(|e| AppError::internal(format!("write acme cert: {e}")))?;
-        tokio::fs::write(self.key_path(), key_pem)
+        tokio::fs::write(&key_path, key_pem)
             .await
             .map_err(|e| AppError::internal(format!("write acme key: {e}")))?;
         // Hot-reload the live listener if HTTPS is already up; a first-ever
         // issuance on an HTTP listener applies on the next restart instead.
         if let Some(handle) = self.reload.read().await.as_ref() {
-            if let Err(e) = handle
-                .reload_from_pem_file(self.cert_path(), self.key_path())
-                .await
-            {
+            if let Err(e) = handle.reload_from_pem_file(&cert_path, &key_path).await {
                 tracing::error!(error = %e, "acme cert written but live reload failed");
             } else {
                 tracing::info!("acme certificate installed and live listener reloaded");
