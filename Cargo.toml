@@ -36,6 +36,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+# TOTP (RFC 6238) second factor: HMAC-SHA1 over the time counter, with a
+# base32-encoded shared secret per the otpauth:// convention.
+sha1 = "0.10"
+base32 = "0.5"
 # Broker protocol: base64 chunk payloads inside JSON frames.
 base64 = "0.22"
 # Unix broker peer-credential and no-follow file operations.

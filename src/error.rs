@@ -65,10 +65,22 @@ impl AppError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
     }
+    /// 401 with a distinct code: the password was valid but the account needs a
+    /// second factor (TOTP or recovery code) to complete the login. The login
+    /// handler treats this specially — it is *not* a failed attempt.
+    pub fn two_factor_required(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::TwoFactorRequired, message)
+    }
 
     /// The human-readable message, for composing higher-level errors.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// True when this error is the "second factor required" signal, so the login
+    /// path can avoid recording a throttle failure for a correct password.
+    pub fn is_two_factor_required(&self) -> bool {
+        matches!(self.code, ErrorCode::TwoFactorRequired)
     }
 
     fn status(&self) -> StatusCode {
@@ -80,6 +92,7 @@ impl AppError {
             ErrorCode::Conflict => StatusCode::CONFLICT,
             ErrorCode::HypervisorError => StatusCode::BAD_GATEWAY,
             ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::TwoFactorRequired => StatusCode::UNAUTHORIZED,
             ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

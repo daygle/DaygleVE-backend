@@ -64,6 +64,7 @@ pub mod schedule;
 pub mod shares;
 pub mod snapshot_schedule;
 pub mod store;
+pub mod totp;
 pub mod usb;
 pub mod zfs;
 

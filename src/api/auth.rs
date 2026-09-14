@@ -16,6 +16,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::audit::AuditOutcome;
 use daygleve_schema::auth::{ChangePasswordRequest, CurrentUser, LoginRequest, LoginResponse};
+use daygleve_schema::two_factor::{
+    ConfirmTwoFactorRequest, DisableTwoFactorRequest, TwoFactorEnabledResponse,
+    TwoFactorSetupResponse,
+};
 use tokio::time::sleep;
 
 use crate::auth::AuthUser;
@@ -33,6 +37,9 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
         .route("/auth/change-password", post(change_password))
+        .route("/auth/2fa/setup", post(two_factor_setup))
+        .route("/auth/2fa/confirm", post(two_factor_confirm))
+        .route("/auth/2fa/disable", post(two_factor_disable))
 }
 
 async fn login(
@@ -67,8 +74,13 @@ async fn login(
             sleep(penalty).await;
         }
     }
-    let outcome = state.services.auth.login(req.clone());
+    let outcome = state.services.auth.login(req.clone()).await;
     let result = match outcome {
+        // A correct password that merely needs a second factor is not a failed
+        // attempt: return the challenge without touching the throttle or the
+        // audit log, so a legitimate 2FA user is never penalized for the extra
+        // round-trip and the log isn't spammed with benign "failures".
+        Err(error) if error.is_two_factor_required() => return Err(error),
         Ok(response) => {
             state
                 .login_throttle
@@ -174,6 +186,71 @@ async fn change_password(
             actor_id: Some(user.0.user.id.clone()),
             actor: user.0.user.username.clone(),
             action: "auth.change_password".to_string(),
+            outcome: AuditOutcome::Success,
+            ..Default::default()
+        })
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Begin TOTP enrollment for the caller: returns a fresh shared secret and
+/// provisioning URI. The second factor is not active until confirmed.
+async fn two_factor_setup(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<TwoFactorSetupResponse>> {
+    let response = state
+        .services
+        .auth
+        .two_factor_setup(&user.0.user.id)
+        .await?;
+    Ok(Json(response))
+}
+
+/// Confirm TOTP enrollment with a code from the authenticator; on success the
+/// second factor is enabled and one-time recovery codes are returned.
+async fn two_factor_confirm(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<ConfirmTwoFactorRequest>,
+) -> ApiResult<Json<TwoFactorEnabledResponse>> {
+    let response = state
+        .services
+        .auth
+        .two_factor_confirm(&user.0.user.id, &req.code)
+        .await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "auth.2fa.enable".to_string(),
+            outcome: AuditOutcome::Success,
+            ..Default::default()
+        })
+        .await;
+    Ok(Json(response))
+}
+
+/// Disable the caller's second factor after verifying a current code.
+async fn two_factor_disable(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<DisableTwoFactorRequest>,
+) -> ApiResult<StatusCode> {
+    state
+        .services
+        .auth
+        .two_factor_disable(&user.0.user.id, &req.code)
+        .await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "auth.2fa.disable".to_string(),
             outcome: AuditOutcome::Success,
             ..Default::default()
         })

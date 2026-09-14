@@ -25,13 +25,22 @@ use daygleve_schema::auth::{
     ChangePasswordRequest, CreateUserRequest, CurrentUser, LoginRequest, LoginResponse, Permission,
     Role, UpdateUserRequest, User,
 };
+use daygleve_schema::two_factor::{TwoFactorEnabledResponse, TwoFactorSetupResponse};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
 use crate::services::store::JsonStore;
-use crate::services::{new_id, now_ts};
+use crate::services::{new_id, now_ts, totp};
+
+/// Issuer label embedded in the `otpauth://` provisioning URI (shown by the
+/// authenticator app next to the account).
+const TOTP_ISSUER: &str = "DaygleVE";
+
+/// Number of one-time recovery codes minted when 2FA is confirmed.
+const RECOVERY_CODE_COUNT: usize = 10;
 
 /// Minimum length enforced for any password set through the API.
 const MIN_PASSWORD_LEN: usize = 8;
@@ -44,6 +53,35 @@ struct StoredUser {
     /// True while the account is still on a seeded/temporary password.
     #[serde(default)]
     must_change_password: bool,
+    /// Optional TOTP second factor. Absent (default) for accounts that have
+    /// never started enrollment.
+    #[serde(default)]
+    two_factor: TwoFactor,
+}
+
+/// Server-side two-factor (TOTP) state for one account.
+///
+/// Enrollment is two-phase: `secret` is populated by *setup* (pending), then
+/// `enabled` is flipped by *confirm* once the user proves the authenticator
+/// works. The shared secret is stored base32-encoded — the same form handed to
+/// the authenticator — because the state directory is already the trust
+/// boundary for password hashes and token material; encryption-at-rest would
+/// need a key-management story this single-node appliance does not yet have.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct TwoFactor {
+    /// The base32 shared secret, present once *setup* has run. Kept while
+    /// enrollment is pending and after it is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    /// True once *confirm* has verified a code and activated the second factor.
+    /// While `secret` is `Some` but this is false, enrollment is pending and
+    /// login is unaffected.
+    #[serde(default)]
+    enabled: bool,
+    /// SHA-256 hashes (hex) of the unused one-time recovery codes. A code is
+    /// removed from this list the moment it is consumed.
+    #[serde(default)]
+    recovery_hashes: Vec<String>,
 }
 
 /// A live bearer-token session.
@@ -124,6 +162,7 @@ impl AuthService {
             },
             password_hash,
             must_change_password,
+            two_factor: TwoFactor::default(),
         };
         self.store.put(&admin.user.id, &admin).await?;
         self.users
@@ -133,7 +172,7 @@ impl AuthService {
         Ok(())
     }
 
-    pub fn login(&self, req: LoginRequest) -> ApiResult<LoginResponse> {
+    pub async fn login(&self, req: LoginRequest) -> ApiResult<LoginResponse> {
         // Snapshot the id + hash under a read lock, then run the CPU-heavy
         // argon2 verification with no lock held, so concurrent logins aren't
         // serialized behind each other's hashing.
@@ -162,6 +201,36 @@ impl AuthService {
         };
 
         verify_password(&req.password, &hash)?;
+
+        // Second-factor gate. The password was accepted; if the account has TOTP
+        // enabled we require a valid code (or an unused recovery code) before a
+        // token is minted. A missing code is reported with the distinct
+        // `two_factor_required` signal so the login handler prompts for it
+        // without counting the (correct-password) attempt as a failure.
+        let second_factor = {
+            let users = self.users.read().expect("user lock");
+            users
+                .get(&user_id)
+                .map(|s| (s.two_factor.enabled, s.two_factor.secret.clone()))
+        };
+        if let Some((true, secret)) = second_factor {
+            match req
+                .totp_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                None => {
+                    return Err(AppError::two_factor_required(
+                        "a two-factor authentication code is required",
+                    ));
+                }
+                Some(code) => {
+                    self.verify_second_factor(&user_id, secret.as_deref(), code)
+                        .await?;
+                }
+            }
+        }
 
         let now = Utc::now();
         let user = {
@@ -221,12 +290,12 @@ impl AuthService {
             }
         };
 
-        let (user, must_change_password) = self
+        let (user, must_change_password, two_factor_enabled) = self
             .users
             .read()
             .expect("user lock")
             .get(&user_id)
-            .map(|s| (s.user.clone(), s.must_change_password))
+            .map(|s| (s.user.clone(), s.must_change_password, s.two_factor.enabled))
             .ok_or_else(|| AppError::unauthorized("unknown user"))?;
 
         let permissions = effective_permissions(&user.roles);
@@ -234,6 +303,7 @@ impl AuthService {
             user,
             permissions,
             must_change_password,
+            two_factor_enabled,
         })
     }
 
@@ -307,6 +377,7 @@ impl AuthService {
             },
             password_hash,
             must_change_password: false,
+            two_factor: TwoFactor::default(),
         };
         self.store.put(&stored.user.id, &stored).await?;
         let user = stored.user.clone();
@@ -433,6 +504,177 @@ impl AuthService {
         Ok(())
     }
 
+    /// Whether the given account has an active (confirmed) second factor.
+    pub fn two_factor_enabled(&self, user_id: &str) -> bool {
+        self.users
+            .read()
+            .expect("user lock")
+            .get(user_id)
+            .map(|s| s.two_factor.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Begin TOTP enrollment: generate a fresh shared secret, store it in a
+    /// *pending* (not-yet-active) state, and return it with an `otpauth://`
+    /// provisioning URI. Idempotent while pending — calling again rotates the
+    /// pending secret. Refused once 2FA is already active (disable it first).
+    pub async fn two_factor_setup(&self, user_id: &str) -> ApiResult<TwoFactorSetupResponse> {
+        let _guard = self.mutate.lock().await;
+        let mut stored = self
+            .users
+            .read()
+            .expect("user lock")
+            .get(user_id)
+            .cloned()
+            .ok_or_else(|| AppError::unauthorized("unknown user"))?;
+        if stored.two_factor.enabled {
+            return Err(AppError::conflict(
+                "two-factor authentication is already enabled; disable it before re-enrolling",
+            ));
+        }
+        let secret = totp::generate_secret();
+        let uri = totp::provisioning_uri(&secret, TOTP_ISSUER, &stored.user.username);
+        stored.two_factor = TwoFactor {
+            secret: Some(secret.clone()),
+            enabled: false,
+            recovery_hashes: Vec::new(),
+        };
+        self.store.put(user_id, &stored).await?;
+        self.users
+            .write()
+            .expect("user lock")
+            .insert(user_id.to_string(), stored);
+        Ok(TwoFactorSetupResponse {
+            secret,
+            otpauth_uri: uri,
+        })
+    }
+
+    /// Finish TOTP enrollment: verify a code against the pending secret,
+    /// activate the second factor, and mint one-time recovery codes (returned
+    /// once; only their hashes are kept).
+    pub async fn two_factor_confirm(
+        &self,
+        user_id: &str,
+        code: &str,
+    ) -> ApiResult<TwoFactorEnabledResponse> {
+        let _guard = self.mutate.lock().await;
+        let mut stored = self
+            .users
+            .read()
+            .expect("user lock")
+            .get(user_id)
+            .cloned()
+            .ok_or_else(|| AppError::unauthorized("unknown user"))?;
+        if stored.two_factor.enabled {
+            return Err(AppError::conflict(
+                "two-factor authentication is already enabled",
+            ));
+        }
+        let secret =
+            stored.two_factor.secret.clone().ok_or_else(|| {
+                AppError::conflict("start two-factor setup before confirming a code")
+            })?;
+        if !totp::verify(&secret, code, now_unix()) {
+            return Err(AppError::validation(
+                "the code is incorrect or has expired; try again",
+            ));
+        }
+        let recovery_codes = generate_recovery_codes();
+        stored.two_factor.enabled = true;
+        stored.two_factor.recovery_hashes = recovery_codes
+            .iter()
+            .map(|c| hash_recovery_code(c))
+            .collect();
+        self.store.put(user_id, &stored).await?;
+        self.users
+            .write()
+            .expect("user lock")
+            .insert(user_id.to_string(), stored);
+        Ok(TwoFactorEnabledResponse { recovery_codes })
+    }
+
+    /// Disable the second factor after verifying a current TOTP (or recovery)
+    /// code, clearing the stored secret and any remaining recovery codes.
+    pub async fn two_factor_disable(&self, user_id: &str, code: &str) -> ApiResult<()> {
+        let secret = {
+            let users = self.users.read().expect("user lock");
+            let stored = users
+                .get(user_id)
+                .ok_or_else(|| AppError::unauthorized("unknown user"))?;
+            if !stored.two_factor.enabled {
+                return Err(AppError::conflict(
+                    "two-factor authentication is not enabled",
+                ));
+            }
+            stored.two_factor.secret.clone()
+        };
+        // Reuse the login verifier so a recovery code works here too (it is
+        // consumed, but the record is cleared immediately afterwards anyway).
+        self.verify_second_factor(user_id, secret.as_deref(), code)
+            .await?;
+
+        let _guard = self.mutate.lock().await;
+        let mut stored = self
+            .users
+            .read()
+            .expect("user lock")
+            .get(user_id)
+            .cloned()
+            .ok_or_else(|| AppError::unauthorized("unknown user"))?;
+        stored.two_factor = TwoFactor::default();
+        self.store.put(user_id, &stored).await?;
+        self.users
+            .write()
+            .expect("user lock")
+            .insert(user_id.to_string(), stored);
+        Ok(())
+    }
+
+    /// Verify a second-factor code for an account: a valid TOTP against the
+    /// shared secret, or an unused recovery code (which is consumed and
+    /// persisted). Returns `unauthorized` with the standard message on failure.
+    async fn verify_second_factor(
+        &self,
+        user_id: &str,
+        secret: Option<&str>,
+        code: &str,
+    ) -> ApiResult<()> {
+        // A valid TOTP is stateless — check it first, no lock or write needed.
+        if let Some(secret) = secret {
+            if totp::verify(secret, code, now_unix()) {
+                return Ok(());
+            }
+        }
+        // Otherwise fall back to consuming a one-time recovery code. Serialize
+        // the read-modify-write so the same code cannot be spent twice by two
+        // concurrent logins.
+        let target = hash_recovery_code(code);
+        let _guard = self.mutate.lock().await;
+        let mut stored = self
+            .users
+            .read()
+            .expect("user lock")
+            .get(user_id)
+            .cloned()
+            .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
+        if let Some(pos) = stored
+            .two_factor
+            .recovery_hashes
+            .iter()
+            .position(|h| h == &target)
+        {
+            stored.two_factor.recovery_hashes.remove(pos);
+            self.store.put(user_id, &stored).await?;
+            self.users
+                .write()
+                .expect("user lock")
+                .insert(user_id.to_string(), stored);
+            return Ok(());
+        }
+        Err(AppError::unauthorized("invalid credentials"))
+    }
+
     /// Number of accounts currently holding the admin role.
     fn admin_count(&self) -> usize {
         self.users
@@ -477,6 +719,47 @@ fn mint_token() -> String {
     OsRng.fill_bytes(&mut bytes);
     let mut s = String::with_capacity(64);
     for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Current Unix time in seconds, for TOTP window selection. Clamped at 0 so a
+/// clock set before the epoch cannot underflow the unsigned counter.
+fn now_unix() -> u64 {
+    Utc::now().timestamp().max(0) as u64
+}
+
+/// Generate the set of one-time recovery codes handed out at 2FA confirmation.
+/// Each is 80 bits of entropy rendered as two dash-separated base32-ish groups
+/// (e.g. `a1b2c-d3e4f`) for legibility.
+fn generate_recovery_codes() -> Vec<String> {
+    (0..RECOVERY_CODE_COUNT).map(|_| recovery_code()).collect()
+}
+
+/// One recovery code: 80 random bits, lower-hex, grouped `xxxxx-xxxxx`.
+fn recovery_code() -> String {
+    let mut bytes = [0u8; 5];
+    OsRng.fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(10);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    format!("{}-{}", &hex[..5], &hex[5..])
+}
+
+/// Normalize and hash a recovery code for storage/comparison: strip formatting
+/// (dashes, whitespace, case) so the stored hash matches whatever the user
+/// types, then SHA-256 it to hex. The plaintext code is never persisted.
+fn hash_recovery_code(code: &str) -> String {
+    let normalized: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut s = String::with_capacity(64);
+    for b in digest {
         s.push_str(&format!("{b:02x}"));
     }
     s
@@ -710,14 +993,18 @@ mod tests {
             .login(LoginRequest {
                 username: "ghost".into(),
                 password: password.clone(),
+                totp_code: None,
             })
+            .await
             .is_err());
         // A known username with the wrong password is rejected.
         assert!(svc
             .login(LoginRequest {
                 username: "admin".into(),
                 password: rand_password(),
+                totp_code: None,
             })
+            .await
             .is_err());
         // Correct credentials succeed - and the username match is
         // case-insensitive and trim-tolerant, consistent with how usernames are
@@ -726,13 +1013,82 @@ mod tests {
             .login(LoginRequest {
                 username: "  ADMIN ".into(),
                 password,
+                totp_code: None,
             })
+            .await
             .unwrap();
         assert_eq!(ok.user.username, "admin");
 
         // The dummy hash must parse as a valid PHC string, or the enumeration
         // hardening would error out early instead of spending argon2 time.
         assert!(PasswordHash::new(dummy_password_hash()).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn two_factor_enrollment_and_login() {
+        let dir = std::env::temp_dir().join(format!("daygleve-2fa-test-{}", new_id()));
+        let password = rand_password();
+        let mut cfg = (*test_config(&dir)).clone();
+        cfg.admin_password = Some(password.clone());
+        let svc = AuthService::new(Arc::new(cfg));
+        svc.load_or_seed().await.unwrap();
+        let admin_id = svc.list_users()[0].id.clone();
+
+        // A login with no 2FA works and needs no code.
+        let login = |code: Option<String>| LoginRequest {
+            username: "admin".into(),
+            password: password.clone(),
+            totp_code: code,
+        };
+        assert!(svc.login(login(None)).await.is_ok());
+        assert!(!svc.two_factor_enabled(&admin_id));
+
+        // Setup returns a secret; the second factor is still inactive, so login
+        // is unaffected until confirmed.
+        let setup = svc.two_factor_setup(&admin_id).await.unwrap();
+        assert!(setup.otpauth_uri.contains("otpauth://totp/"));
+        assert!(!svc.two_factor_enabled(&admin_id));
+        assert!(svc.login(login(None)).await.is_ok());
+
+        // Confirm requires a valid code. A wrong code is rejected; the right one
+        // enables 2FA and yields recovery codes.
+        assert!(svc.two_factor_confirm(&admin_id, "000000").await.is_err());
+        let code = totp::current_code(&setup.secret, now_unix()).unwrap();
+        let recovery = svc.two_factor_confirm(&admin_id, &code).await.unwrap();
+        assert_eq!(recovery.recovery_codes.len(), RECOVERY_CODE_COUNT);
+        assert!(svc.two_factor_enabled(&admin_id));
+
+        // Now login without a code is refused with the two-factor-required
+        // signal, not counted as a bad password.
+        let err = svc.login(login(None)).await.unwrap_err();
+        assert!(err.is_two_factor_required());
+        // A wrong code fails; the correct TOTP succeeds.
+        assert!(svc.login(login(Some("000000".into()))).await.is_err());
+        let code = totp::current_code(&setup.secret, now_unix()).unwrap();
+        assert!(svc.login(login(Some(code))).await.is_ok());
+
+        // A recovery code logs in once and is then consumed.
+        let one = recovery.recovery_codes[0].clone();
+        assert!(svc.login(login(Some(one.clone()))).await.is_ok());
+        assert!(svc.login(login(Some(one))).await.is_err());
+
+        // Disable requires a current code; afterwards login needs no second
+        // factor again.
+        assert!(svc.two_factor_disable(&admin_id, "000000").await.is_err());
+        let code = totp::current_code(&setup.secret, now_unix()).unwrap();
+        svc.two_factor_disable(&admin_id, &code).await.unwrap();
+        assert!(!svc.two_factor_enabled(&admin_id));
+        assert!(svc.login(login(None)).await.is_ok());
+
+        // State survives a restart: re-enroll, then reload from disk.
+        let setup = svc.two_factor_setup(&admin_id).await.unwrap();
+        let code = totp::current_code(&setup.secret, now_unix()).unwrap();
+        svc.two_factor_confirm(&admin_id, &code).await.unwrap();
+        let svc2 = AuthService::new(test_config(&dir));
+        svc2.load_or_seed().await.unwrap();
+        assert!(svc2.two_factor_enabled(&admin_id));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
