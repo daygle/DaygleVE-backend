@@ -544,6 +544,7 @@ pub fn effective_permissions(roles: &[Role]) -> Vec<Permission> {
                 NotificationWrite,
                 TlsRead,
                 TlsWrite,
+                AuditRead,
                 UserAdmin,
             ],
             Role::Operator => &[
