@@ -43,6 +43,7 @@ impl AppState {
         services
             .snapshot_schedules
             .start_scheduler(services.clone());
+        services.acme.start_scheduler();
         // Persist per-VM and per-container samples independently of whether a
         // dashboard is connected. The loop is intentionally detached from the
         // request path and degrades gracefully on hosts without libvirt/LXC.

@@ -39,9 +39,15 @@ async fn main() -> anyhow_lite::Result<()> {
     }
     let addr: SocketAddr = config.listen_addr;
 
+    // rustls 0.23 needs an explicit process-level crypto provider. Install it
+    // unconditionally (not just in the TLS branch) because the ACME client and
+    // the notification transports also build rustls configs.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let state = AppState::new(config.clone())
         .await
         .map_err(|e| anyhow_lite::err(format!("initialize state: {}", e.message())))?;
+    let acme = state.services.acme.clone();
     let app = api::router(state);
 
     // Loudly flag a half-configured TLS setup: exactly one of cert/key set is
@@ -52,15 +58,26 @@ async fn main() -> anyhow_lite::Result<()> {
         );
     }
 
-    // Serve HTTPS when a certificate + key are configured, otherwise plain HTTP
+    // Prefer an ACME-managed certificate when ACME is enabled and one has been
+    // issued; otherwise fall back to the statically configured cert/key.
+    let acme_tls = acme.installed_tls_paths().await;
+    let tls_source = acme_tls
+        .as_ref()
+        .map(|(c, k)| (c.as_path(), k.as_path(), true))
+        .or_else(|| config.tls().map(|(c, k)| (c, k, false)));
+
+    // Serve HTTPS when a certificate + key are available, otherwise plain HTTP
     // (intended to sit behind a TLS-terminating proxy in that case).
-    if let Some((cert, key)) = config.tls() {
-        // rustls 0.23 needs an explicit process-level crypto provider.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    if let Some((cert, key, from_acme)) = tls_source {
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
             .map_err(|e| anyhow_lite::err(format!("load TLS cert/key: {e}")))?;
-        tracing::info!(%addr, "DaygleVE backend listening (HTTPS)");
+        // Hand the ACME service the live reload handle so renewals rotate the
+        // certificate without a restart.
+        if from_acme {
+            acme.set_reload_handle(tls.clone()).await;
+        }
+        tracing::info!(%addr, acme = from_acme, "DaygleVE backend listening (HTTPS)");
         axum_server::bind_rustls(addr, tls)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await

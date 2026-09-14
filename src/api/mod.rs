@@ -75,7 +75,16 @@ pub fn router(state: AppState) -> Router {
     let cors = cors_layer(&state.config.cors_origins);
 
     let versioned = Router::new().merge(api).merge(uploads);
-    let mut app = Router::new().nest(&format!("/api/{API_VERSION}"), versioned);
+    let mut app = Router::new()
+        .nest(&format!("/api/{API_VERSION}"), versioned)
+        // ACME HTTP-01 challenge responder. Unauthenticated and mounted at the
+        // well-known path (outside `/api`) so the CA can validate domain
+        // control over plain HTTP on port 80; returns the key authorization for
+        // an active challenge token, or 404 otherwise.
+        .route(
+            "/.well-known/acme-challenge/{token}",
+            axum::routing::get(acme_challenge),
+        );
 
     // On the appliance, serve the prebuilt frontend SPA for every non-API path,
     // falling back to index.html so client-side routing works. In dev
@@ -101,6 +110,27 @@ pub fn router(state: AppState) -> Router {
         .layer(cors)
         .layer(middleware::from_fn(request_id))
         .with_state(state)
+}
+
+/// Serve the ACME HTTP-01 key authorization for `token`, or 404 when no
+/// challenge with that token is active. The response is plain text, exactly the
+/// key authorization the CA expects — no framing.
+async fn acme_challenge(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.services.acme.challenge_response(&token).await {
+        Some(key_auth) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            key_auth,
+        )
+            .into_response(),
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Add a request correlation id to every response. The value is deliberately
