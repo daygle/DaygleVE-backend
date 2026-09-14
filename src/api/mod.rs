@@ -19,6 +19,7 @@ mod schedules;
 mod security;
 mod snapshot_schedules;
 mod storage;
+mod tokens;
 mod usb;
 mod users;
 mod vms;
@@ -49,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(backups::routes())
         .merge(users::routes())
+        .merge(tokens::routes())
         .merge(vms::routes())
         .merge(containers::routes())
         .merge(storage::routes())

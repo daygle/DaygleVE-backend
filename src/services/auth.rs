@@ -237,6 +237,16 @@ impl AuthService {
         })
     }
 
+    /// A single user account (without secrets) by id, if it exists. Used to
+    /// resolve the owner of an API token into a caller identity.
+    pub fn user_by_id(&self, id: &str) -> Option<User> {
+        self.users
+            .read()
+            .expect("user lock")
+            .get(id)
+            .map(|s| s.user.clone())
+    }
+
     /// All user accounts (without secrets), ordered by username.
     pub fn list_users(&self) -> Vec<User> {
         let mut users: Vec<User> = self

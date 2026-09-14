@@ -44,6 +44,7 @@
 
 pub mod acme;
 pub mod alerts;
+pub mod api_token;
 pub mod auth;
 pub mod backup;
 pub mod command;
@@ -160,6 +161,8 @@ pub struct Services {
     /// ACME (Let's Encrypt) TLS certificate management for the node's own
     /// HTTPS listener. A background tick renews before expiry.
     pub acme: Arc<acme::AcmeService>,
+    /// Long-lived API tokens for programmatic access.
+    pub api_tokens: api_token::ApiTokenService,
 }
 
 impl Services {
@@ -187,6 +190,7 @@ impl Services {
             notifications: notifications.clone(),
             alerts: alerts::AlertService::new(config.clone(), notifications),
             acme: Arc::new(acme::AcmeService::new(config.clone())),
+            api_tokens: api_token::ApiTokenService::new(config.clone()),
             shares,
         }
     }

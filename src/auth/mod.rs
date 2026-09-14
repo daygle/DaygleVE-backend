@@ -53,7 +53,29 @@ impl FromRequestParts<AppState> for AuthUser {
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| AppError::unauthorized("missing bearer token"))?;
 
-        let current = state.services.auth.authenticate(token)?;
+        // An API token (prefixed) resolves to its owner with the token's granted
+        // permissions; anything else is a session token. API tokens never carry
+        // the must-change-password gate — they are non-interactive.
+        let current = if token.starts_with(crate::services::api_token::TOKEN_PREFIX) {
+            let auth = state
+                .services
+                .api_tokens
+                .authenticate(token)
+                .await
+                .ok_or_else(|| AppError::unauthorized("invalid or expired token"))?;
+            let user = state
+                .services
+                .auth
+                .user_by_id(&auth.user_id)
+                .ok_or_else(|| AppError::unauthorized("token owner no longer exists"))?;
+            CurrentUser {
+                user,
+                permissions: auth.permissions,
+                must_change_password: false,
+            }
+        } else {
+            state.services.auth.authenticate(token)?
+        };
         let path = parts.uri.path();
         if current.must_change_password
             && !path.ends_with("/auth/me")
