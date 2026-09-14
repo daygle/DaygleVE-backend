@@ -4,18 +4,63 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
+use daygleve_schema::audit::AuditOutcome;
 use daygleve_schema::auth::Permission;
+use daygleve_schema::firewall::{HostFirewall, UpdateHostFirewallRequest};
 use daygleve_schema::network::{Bridge, CreateBridgeRequest, CreateVlanRequest, Vlan};
 use daygleve_schema::operations::OperationRecord;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
+use crate::services::audit::NewAuditEvent;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/network/bridges", get(list_bridges).post(create_bridge))
         .route("/network/vlans", get(list_vlans).post(create_vlan))
+        .route("/network/firewall", get(get_firewall).put(update_firewall))
+}
+
+/// The current host (node) firewall configuration.
+async fn get_firewall(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<HostFirewall>> {
+    user.require(Permission::NetworkRead)?;
+    Ok(Json(state.services.firewall.get().await?))
+}
+
+/// Replace the host firewall configuration and apply it to the node.
+async fn update_firewall(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<UpdateHostFirewallRequest>,
+) -> ApiResult<Json<HostFirewall>> {
+    user.require(Permission::NetworkWrite)?;
+    let cfg = HostFirewall {
+        enabled: req.enabled,
+        default_input_policy: req.default_input_policy,
+        rules: req.rules,
+    };
+    let outcome = state.services.firewall.update(cfg).await;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "firewall.update".to_string(),
+            resource_type: Some("host_firewall".to_string()),
+            outcome: if outcome.is_ok() {
+                AuditOutcome::Success
+            } else {
+                AuditOutcome::Failure
+            },
+            ..Default::default()
+        })
+        .await;
+    Ok(Json(outcome?))
 }
 
 async fn list_bridges(

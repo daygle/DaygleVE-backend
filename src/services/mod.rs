@@ -49,6 +49,7 @@ pub mod audit;
 pub mod auth;
 pub mod backup;
 pub mod command;
+pub mod firewall;
 pub mod gpu;
 pub mod kvm;
 pub mod library;
@@ -167,6 +168,9 @@ pub struct Services {
     pub api_tokens: api_token::ApiTokenService,
     /// Security audit log of control-plane actions.
     pub audit: Arc<audit::AuditService>,
+    /// Host (node) firewall: nftables `input`-hook filtering of traffic to the
+    /// node itself, independent of the per-VM guest firewall.
+    pub firewall: firewall::HostFirewallService,
 }
 
 impl Services {
@@ -196,6 +200,7 @@ impl Services {
             acme: Arc::new(acme::AcmeService::new(config.clone())),
             api_tokens: api_token::ApiTokenService::new(config.clone()),
             audit: Arc::new(audit::AuditService::new(config.clone())),
+            firewall: firewall::HostFirewallService::new(config.clone()),
             shares,
         }
     }
