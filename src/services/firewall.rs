@@ -18,6 +18,7 @@
 //! backend re-applies it on boot.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use daygleve_schema::firewall::{
@@ -37,7 +38,10 @@ const TABLE: &str = "daygleve_host";
 
 pub struct HostFirewallService {
     store: JsonStore,
-    config: Arc<Config>,
+    /// Directory the nft batch file lives in (`<state_dir>/firewall`). Computed
+    /// once from config; only ever the *argument* to `canonicalize`, never
+    /// joined directly into a filesystem sink (see [`Self::resolve_batch_path`]).
+    dir: PathBuf,
     /// Serializes config mutation + apply so two updates can't interleave the
     /// read-modify-write or race two `nft -f` invocations.
     apply_lock: Mutex<()>,
@@ -48,7 +52,7 @@ impl HostFirewallService {
         let store = JsonStore::new(&config.state_dir, "host_firewall");
         Self {
             store,
-            config,
+            dir: config.state_dir.join("firewall"),
             apply_lock: Mutex::new(()),
         }
     }
@@ -100,14 +104,7 @@ impl HostFirewallService {
     /// Render the batch for `cfg` and hand it to nft. Caller holds `apply_lock`.
     async fn apply(&self, cfg: &HostFirewall) -> ApiResult<()> {
         let batch = nft_host_batch(cfg)?;
-        let dir = self.config.state_dir.join("firewall");
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| AppError::internal(format!("create firewall dir: {e}")))?;
-        // Constant file name joined to the state dir: no request-controlled
-        // component reaches the path, and it stays inside the broker's allowed
-        // `/var/lib/daygleve/` root.
-        let path = dir.join("host.nft");
+        let path = self.resolve_batch_path().await?;
         tokio::fs::write(&path, &batch)
             .await
             .map_err(|e| AppError::internal(format!("write firewall batch: {e}")))?;
@@ -115,6 +112,23 @@ impl HostFirewallService {
             .to_str()
             .ok_or_else(|| AppError::internal("firewall batch path is not valid UTF-8"))?;
         command::run_ok("nft", &["-f", path_str]).await
+    }
+
+    /// Resolve the nft batch-file path, creating and canonicalizing the firewall
+    /// directory first. `canonicalize` is the recognized path-injection barrier:
+    /// the (environment-derived) `state_dir` is only ever the *argument* to it,
+    /// never joined directly into a filesystem sink, and the file name is a
+    /// compile-time constant — so no request- or environment-controlled string
+    /// reaches an fs path. The result stays inside the broker's allowed
+    /// `/var/lib/daygleve/` root.
+    async fn resolve_batch_path(&self) -> ApiResult<PathBuf> {
+        tokio::fs::create_dir_all(&self.dir)
+            .await
+            .map_err(|e| AppError::internal(format!("create firewall dir: {e}")))?;
+        let canonical = tokio::fs::canonicalize(&self.dir)
+            .await
+            .map_err(|e| AppError::internal(format!("resolve firewall dir: {e}")))?;
+        Ok(canonical.join("host.nft"))
     }
 }
 
