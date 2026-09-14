@@ -72,6 +72,10 @@ impl FromRequestParts<AppState> for AuthUser {
                 user,
                 permissions: auth.permissions,
                 must_change_password: false,
+                // The second factor gates the interactive password login, not
+                // API-token auth; surface the token owner's enrollment state
+                // for display only.
+                two_factor_enabled: state.services.auth.two_factor_enabled(&auth.user_id),
             }
         } else {
             state.services.auth.authenticate(token)?
