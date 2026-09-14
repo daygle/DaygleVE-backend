@@ -38,10 +38,11 @@ const TABLE: &str = "daygleve_host";
 
 pub struct HostFirewallService {
     store: JsonStore,
-    /// Directory the nft batch file lives in (`<state_dir>/firewall`). Computed
-    /// once from config; only ever the *argument* to `canonicalize`, never
-    /// joined directly into a filesystem sink (see [`Self::resolve_batch_path`]).
-    dir: PathBuf,
+    /// The (environment-derived) state directory. Only ever the *argument* to
+    /// `canonicalize`, never joined directly into a filesystem sink (see
+    /// [`Self::resolve_batch_path`]); every real path is built from constant
+    /// components on top of the canonicalized form.
+    state_dir: PathBuf,
     /// Serializes config mutation + apply so two updates can't interleave the
     /// read-modify-write or race two `nft -f` invocations.
     apply_lock: Mutex<()>,
@@ -52,7 +53,7 @@ impl HostFirewallService {
         let store = JsonStore::new(&config.state_dir, "host_firewall");
         Self {
             store,
-            dir: config.state_dir.join("firewall"),
+            state_dir: config.state_dir.clone(),
             apply_lock: Mutex::new(()),
         }
     }
@@ -114,21 +115,22 @@ impl HostFirewallService {
         command::run_ok("nft", &["-f", path_str]).await
     }
 
-    /// Resolve the nft batch-file path, creating and canonicalizing the firewall
-    /// directory first. `canonicalize` is the recognized path-injection barrier:
-    /// the (environment-derived) `state_dir` is only ever the *argument* to it,
-    /// never joined directly into a filesystem sink, and the file name is a
-    /// compile-time constant — so no request- or environment-controlled string
-    /// reaches an fs path. The result stays inside the broker's allowed
-    /// `/var/lib/daygleve/` root.
+    /// Resolve the nft batch-file path. `canonicalize` on the always-present
+    /// state directory is the recognized path-injection barrier: the
+    /// (environment-derived) `state_dir` is only ever its *argument*, and every
+    /// filesystem sink below is built from the canonicalized base plus
+    /// compile-time-constant components (`firewall/host.nft`) — so no
+    /// environment- or request-controlled string reaches an fs path. The result
+    /// stays inside the broker's allowed `/var/lib/daygleve/` root.
     async fn resolve_batch_path(&self) -> ApiResult<PathBuf> {
-        tokio::fs::create_dir_all(&self.dir)
+        let base = tokio::fs::canonicalize(&self.state_dir)
+            .await
+            .map_err(|e| AppError::internal(format!("resolve state dir: {e}")))?;
+        let dir = base.join("firewall");
+        tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| AppError::internal(format!("create firewall dir: {e}")))?;
-        let canonical = tokio::fs::canonicalize(&self.dir)
-            .await
-            .map_err(|e| AppError::internal(format!("resolve firewall dir: {e}")))?;
-        Ok(canonical.join("host.nft"))
+        Ok(dir.join("host.nft"))
     }
 }
 
