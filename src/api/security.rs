@@ -4,8 +4,10 @@
 //! surface documented in the service layer. It exists so the "the broker split
 //! is not finished yet" state is machine-checkable rather than prose-only.
 
-use axum::routing::get;
+use axum::extract::State;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use daygleve_schema::acme::{AcmeStatus, UpdateAcmeConfigRequest};
 use daygleve_schema::auth::Permission;
 use daygleve_schema::broker::BrokerSplitInventory;
 
@@ -14,7 +16,38 @@ use crate::error::ApiResult;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/system/broker-split", get(broker_split))
+    Router::new()
+        .route("/system/broker-split", get(broker_split))
+        .route("/security/acme", get(acme_status))
+        .route("/security/acme/config", put(update_acme_config))
+        .route("/security/acme/issue", post(issue_acme))
+}
+
+/// Current ACME/TLS certificate configuration and status.
+async fn acme_status(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<AcmeStatus>> {
+    user.require(Permission::TlsRead)?;
+    Ok(Json(state.services.acme.status().await))
+}
+
+/// Replace the ACME configuration. Returns the resulting status (issuance, if
+/// warranted, is triggered separately via the issue endpoint or the renewal
+/// scheduler).
+async fn update_acme_config(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<UpdateAcmeConfigRequest>,
+) -> ApiResult<Json<AcmeStatus>> {
+    user.require(Permission::TlsWrite)?;
+    state.services.acme.update_config(req).await?;
+    Ok(Json(state.services.acme.status().await))
+}
+
+/// Trigger certificate issuance/renewal now, in the background. Returns the
+/// status with `state` set to `pending` while issuance runs.
+async fn issue_acme(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<AcmeStatus>> {
+    user.require(Permission::TlsWrite)?;
+    let status = state.services.acme.trigger_issue().await?;
+    Ok(Json(status))
 }
 
 async fn broker_split(user: AuthUser) -> ApiResult<Json<BrokerSplitInventory>> {

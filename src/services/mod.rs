@@ -42,6 +42,7 @@
 //! broker protocol independently validates requests; real-host systemd and
 //! AppArmor validation remains a deployment requirement.
 
+pub mod acme;
 pub mod auth;
 pub mod backup;
 pub mod command;
@@ -153,6 +154,9 @@ pub struct Services {
     /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
     /// enumerate ISOs living on mounted shares.
     pub shares: Arc<shares::ShareService>,
+    /// ACME (Let's Encrypt) TLS certificate management for the node's own
+    /// HTTPS listener. A background tick renews before expiry.
+    pub acme: Arc<acme::AcmeService>,
 }
 
 impl Services {
@@ -177,6 +181,7 @@ impl Services {
                 config.clone(),
             )),
             notifications: Arc::new(notification::NotificationService::new(config.clone())),
+            acme: Arc::new(acme::AcmeService::new(config.clone())),
             shares,
         }
     }
