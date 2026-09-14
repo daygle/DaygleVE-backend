@@ -45,6 +45,7 @@
 pub mod acme;
 pub mod alerts;
 pub mod api_token;
+pub mod audit;
 pub mod auth;
 pub mod backup;
 pub mod command;
@@ -163,6 +164,8 @@ pub struct Services {
     pub acme: Arc<acme::AcmeService>,
     /// Long-lived API tokens for programmatic access.
     pub api_tokens: api_token::ApiTokenService,
+    /// Security audit log of control-plane actions.
+    pub audit: Arc<audit::AuditService>,
 }
 
 impl Services {
@@ -191,6 +194,7 @@ impl Services {
             alerts: alerts::AlertService::new(config.clone(), notifications),
             acme: Arc::new(acme::AcmeService::new(config.clone())),
             api_tokens: api_token::ApiTokenService::new(config.clone()),
+            audit: Arc::new(audit::AuditService::new(config.clone())),
             shares,
         }
     }

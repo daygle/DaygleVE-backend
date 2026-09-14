@@ -9,9 +9,11 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use daygleve_schema::api_token::{ApiToken, CreateApiTokenRequest, CreateApiTokenResponse};
+use daygleve_schema::audit::AuditOutcome;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
+use crate::services::audit::NewAuditEvent;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -44,6 +46,20 @@ async fn create_token(
             req,
         )
         .await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "api_token.create".to_string(),
+            resource_type: Some("api_token".to_string()),
+            resource_id: Some(api_token.id.clone()),
+            outcome: AuditOutcome::Success,
+            message: Some(format!("created token {:?}", api_token.name)),
+            ..Default::default()
+        })
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(CreateApiTokenResponse { token, api_token }),
@@ -60,5 +76,18 @@ async fn delete_token(
         .api_tokens
         .delete(&user.0.user.id, &id)
         .await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "api_token.revoke".to_string(),
+            resource_type: Some("api_token".to_string()),
+            resource_id: Some(id.clone()),
+            outcome: AuditOutcome::Success,
+            ..Default::default()
+        })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -8,11 +8,13 @@ use axum::extract::State;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use daygleve_schema::acme::{AcmeStatus, UpdateAcmeConfigRequest};
+use daygleve_schema::audit::AuditOutcome;
 use daygleve_schema::auth::Permission;
 use daygleve_schema::broker::BrokerSplitInventory;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
+use crate::services::audit::NewAuditEvent;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -39,6 +41,18 @@ async fn update_acme_config(
 ) -> ApiResult<Json<AcmeStatus>> {
     user.require(Permission::TlsWrite)?;
     state.services.acme.update_config(req).await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "acme.config.update".to_string(),
+            resource_type: Some("acme".to_string()),
+            outcome: AuditOutcome::Success,
+            ..Default::default()
+        })
+        .await;
     Ok(Json(state.services.acme.status().await))
 }
 
@@ -47,6 +61,18 @@ async fn update_acme_config(
 async fn issue_acme(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<AcmeStatus>> {
     user.require(Permission::TlsWrite)?;
     let status = state.services.acme.trigger_issue().await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "acme.issue".to_string(),
+            resource_type: Some("acme".to_string()),
+            outcome: AuditOutcome::Success,
+            ..Default::default()
+        })
+        .await;
     Ok(Json(status))
 }
 

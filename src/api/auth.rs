@@ -14,11 +14,13 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use daygleve_schema::audit::AuditOutcome;
 use daygleve_schema::auth::{ChangePasswordRequest, CurrentUser, LoginRequest, LoginResponse};
 use tokio::time::sleep;
 
 use crate::auth::AuthUser;
 use crate::error::{ApiResult, AppError};
+use crate::services::audit::NewAuditEvent;
 use crate::state::AppState;
 
 /// Penalties beyond this are rejected outright instead of sleeping, so a
@@ -73,6 +75,18 @@ async fn login(
                 .lock()
                 .await
                 .record_success(ip, &req.username);
+            state
+                .services
+                .audit
+                .record(NewAuditEvent {
+                    actor_id: Some(response.user.id.clone()),
+                    actor: response.user.username.clone(),
+                    action: "auth.login".to_string(),
+                    outcome: AuditOutcome::Success,
+                    source_ip: Some(ip.to_string()),
+                    ..Default::default()
+                })
+                .await;
             Ok(Json(response))
         }
         Err(error) => {
@@ -81,6 +95,18 @@ async fn login(
                 .lock()
                 .await
                 .record_failure(ip, &req.username);
+            state
+                .services
+                .audit
+                .record(NewAuditEvent {
+                    actor: req.username.clone(),
+                    action: "auth.login".to_string(),
+                    outcome: AuditOutcome::Failure,
+                    message: Some("invalid credentials".to_string()),
+                    source_ip: Some(ip.to_string()),
+                    ..Default::default()
+                })
+                .await;
             if retry_after > MAX_ENFORCED_SLEEP {
                 return Err(too_many_attempts(retry_after));
             }
@@ -116,6 +142,17 @@ async fn me(user: AuthUser) -> Json<CurrentUser> {
 
 async fn logout(user: AuthUser, State(state): State<AppState>) -> StatusCode {
     state.services.auth.logout(&user.1);
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "auth.logout".to_string(),
+            outcome: AuditOutcome::Success,
+            ..Default::default()
+        })
+        .await;
     StatusCode::NO_CONTENT
 }
 
@@ -130,5 +167,16 @@ async fn change_password(
         .auth
         .change_password(&user.0.user.id, &user.1, req)
         .await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "auth.change_password".to_string(),
+            outcome: AuditOutcome::Success,
+            ..Default::default()
+        })
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
