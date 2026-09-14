@@ -15,16 +15,21 @@
 //! whole body is written and within the size cap, so a failed or oversized
 //! upload never leaves a half-written file masquerading as a usable image.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
-use daygleve_schema::storage_file::{StorageFile, StorageFileKind};
+use daygleve_schema::storage_file::{
+    DiskImageFetch, DiskImageFetchState, FetchDiskImageRequest, StorageFile, StorageFileKind,
+};
 use futures::Stream;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::error::{ApiResult, AppError};
-use crate::services::new_id;
-use std::sync::Arc;
+use crate::services::{new_id, now_ts};
 
 /// Allowed extensions for uploaded CT-template rootfs tarballs.
 const CT_TEMPLATE_EXTENSIONS: &[&str] = &[
@@ -35,15 +40,28 @@ const CT_TEMPLATE_EXTENSIONS: &[&str] = &[
 const DISK_IMAGE_EXTENSIONS: &[&str] =
     &[".qcow2", ".vmdk", ".raw", ".img", ".vdi", ".vhd", ".vhdx"];
 
+/// Redirect hops a URL fetch will follow before giving up.
+const MAX_FETCH_REDIRECTS: usize = 5;
+/// Overall wall-clock cap for one URL fetch (large images over slow mirrors).
+const FETCH_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// How many finished fetch records to keep in the in-memory status list.
+const MAX_FETCH_HISTORY: usize = 50;
+
 /// Manages the node's local upload libraries.
 #[derive(Clone)]
 pub struct LibraryService {
     config: Arc<Config>,
+    /// In-memory status of disk-image URL fetches (in-progress and recent).
+    /// Completed downloads also appear in the disk-image library listing.
+    fetches: Arc<RwLock<Vec<DiskImageFetch>>>,
 }
 
 impl LibraryService {
     pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+        Self {
+            config,
+            fetches: Arc::new(RwLock::new(Vec::new())),
+        }
     }
 
     /// Directory backing a given library kind.
@@ -279,6 +297,140 @@ impl LibraryService {
                 )
             })
     }
+
+    /// Recent disk-image URL fetches, newest first.
+    pub async fn list_fetches(&self) -> Vec<DiskImageFetch> {
+        let mut list = self.fetches.read().await.clone();
+        list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        list
+    }
+
+    /// Validate a fetch request, register it, and start the download in the
+    /// background. Returns the initial `downloading` status.
+    pub async fn start_fetch(&self, req: FetchDiskImageRequest) -> ApiResult<DiskImageFetch> {
+        let url = parse_fetch_url(&req.url)?;
+        let name = derive_fetch_name(&url, req.name.as_deref())?;
+
+        let fetch = DiskImageFetch {
+            id: new_id(),
+            url: url.to_string(),
+            name: name.clone(),
+            state: DiskImageFetchState::Downloading,
+            bytes_downloaded: 0,
+            total_bytes: None,
+            error: None,
+            started_at: now_ts(),
+            finished_at: None,
+        };
+        {
+            let mut fetches = self.fetches.write().await;
+            fetches.push(fetch.clone());
+            prune_fetches(&mut fetches);
+        }
+
+        let this = self.clone();
+        let id = fetch.id.clone();
+        tokio::spawn(async move {
+            let result = this.run_fetch(&id, url, &name).await;
+            this.finish_fetch(&id, result).await;
+        });
+        Ok(fetch)
+    }
+
+    /// Download the (already-validated) URL into the disk-image library,
+    /// re-validating the host at every redirect hop. Streams the body through
+    /// the same size-capped, temp-then-rename [`Self::upload`] path.
+    async fn run_fetch(&self, id: &str, url: reqwest::Url, name: &str) -> ApiResult<u64> {
+        use futures::StreamExt;
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(FETCH_TIMEOUT)
+            .build()
+            .map_err(|e| AppError::internal(format!("build http client: {e}")))?;
+
+        // Follow redirects manually so each hop's host is re-validated against
+        // the private-address blocklist (a redirect can otherwise point the
+        // fetch at an internal address).
+        let mut current = url;
+        let response = loop_response(&client, &mut current).await?;
+
+        if let Some(total) = response.content_length() {
+            if total > self.config.max_upload_bytes {
+                return Err(AppError::validation(format!(
+                    "remote file is {total} bytes, exceeding the maximum of {}",
+                    self.config.max_upload_bytes
+                )));
+            }
+            self.set_fetch_total(id, total).await;
+        }
+
+        let stream = response.bytes_stream().boxed();
+        let file = self
+            .upload(StorageFileKind::DiskImage, name, stream)
+            .await?;
+        Ok(file.size_bytes)
+    }
+
+    async fn set_fetch_total(&self, id: &str, total: u64) {
+        if let Some(f) = self.fetches.write().await.iter_mut().find(|f| f.id == id) {
+            f.total_bytes = Some(total);
+        }
+    }
+
+    async fn finish_fetch(&self, id: &str, result: ApiResult<u64>) {
+        let mut fetches = self.fetches.write().await;
+        if let Some(f) = fetches.iter_mut().find(|f| f.id == id) {
+            f.finished_at = Some(now_ts());
+            match result {
+                Ok(bytes) => {
+                    f.state = DiskImageFetchState::Completed;
+                    f.bytes_downloaded = bytes;
+                }
+                Err(e) => {
+                    f.state = DiskImageFetchState::Failed;
+                    f.error = Some(e.message().to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Follow redirects manually, validating every hop's host, and return the final
+/// success response. `current` is advanced to the final URL.
+async fn loop_response(
+    client: &reqwest::Client,
+    current: &mut reqwest::Url,
+) -> ApiResult<reqwest::Response> {
+    for _ in 0..=MAX_FETCH_REDIRECTS {
+        validate_public_url(current).await?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| AppError::hypervisor(format!("fetch failed: {e}")))?;
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| AppError::hypervisor("redirect without a location"))?;
+            *current = current
+                .join(location)
+                .map_err(|e| AppError::validation(format!("invalid redirect target: {e}")))?;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(AppError::hypervisor(format!(
+                "remote server returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        return Ok(response);
+    }
+    Err(AppError::hypervisor("too many redirects"))
 }
 
 /// Join a request-supplied `name` into `dir` as a single, verified path
@@ -338,9 +490,223 @@ pub fn validate_library_filename(name: &str, kind: StorageFileKind) -> ApiResult
     Ok(name)
 }
 
+/// Parse and vet a fetch URL: `http`/`https` only, a host present, and no
+/// embedded credentials.
+fn parse_fetch_url(raw: &str) -> ApiResult<reqwest::Url> {
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|e| AppError::validation(format!("invalid url: {e}")))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(AppError::validation(format!(
+                "unsupported url scheme {other:?}; use http or https"
+            )))
+        }
+    }
+    if url.host_str().is_none() {
+        return Err(AppError::validation("url has no host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::validation("url must not contain credentials"));
+    }
+    Ok(url)
+}
+
+/// Determine the destination file name: the caller-provided `name`, else the
+/// URL's last path segment. Either way it must pass the disk-image filename
+/// rules (supported extension, no separators/traversal).
+fn derive_fetch_name(url: &reqwest::Url, provided: Option<&str>) -> ApiResult<String> {
+    let candidate = match provided {
+        Some(n) => n.trim().to_string(),
+        None => url
+            .path_segments()
+            .and_then(|mut s| s.next_back().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppError::validation("could not derive a file name from the url; provide `name`")
+            })?,
+    };
+    validate_library_filename(&candidate, StorageFileKind::DiskImage)?;
+    Ok(candidate)
+}
+
+/// Reject fetching from an address that is not a public unicast address. This
+/// is the SSRF barrier: a literal-IP host is checked directly, and a named host
+/// is DNS-resolved with every resolved address checked. Re-run at each redirect
+/// hop by [`loop_response`].
+async fn validate_public_url(url: &reqwest::Url) -> ApiResult<()> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::validation("url has no host"))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip_is_disallowed(ip) {
+            return Err(AppError::validation(
+                "refusing to fetch from a private, loopback, or link-local address",
+            ));
+        }
+        return Ok(());
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| AppError::validation(format!("could not resolve host {host:?}: {e}")))?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if ip_is_disallowed(addr.ip()) {
+            return Err(AppError::validation(
+                "host resolves to a private, loopback, or link-local address; refusing to fetch",
+            ));
+        }
+    }
+    if !any {
+        return Err(AppError::validation(format!(
+            "host {host:?} did not resolve"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether an IP is one DaygleVE must never fetch from (loopback, private,
+/// link-local, unspecified, multicast, CGNAT, documentation, etc.).
+fn ip_is_disallowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_disallowed(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+            // fe80::/10 link-local
+            {
+                return true;
+            }
+            // A v4-mapped address (::ffff:a.b.c.d) is judged by its v4 rules.
+            match v6.to_ipv4_mapped() {
+                Some(v4) => ipv4_disallowed(v4),
+                None => false,
+            }
+        }
+    }
+}
+
+fn ipv4_disallowed(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+        || v4.is_unspecified()
+        || o[0] == 0                            // 0.0.0.0/8 "this network"
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+}
+
+/// Cap the retained fetch history, dropping the oldest finished entries but
+/// never an in-progress one.
+fn prune_fetches(fetches: &mut Vec<DiskImageFetch>) {
+    while fetches.len() > MAX_FETCH_HISTORY {
+        match fetches
+            .iter()
+            .position(|f| f.state != DiskImageFetchState::Downloading)
+        {
+            Some(pos) => {
+                fetches.remove(pos);
+            }
+            None => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_url_scheme_and_credentials_are_enforced() {
+        assert!(parse_fetch_url("https://mirror.example/focal.qcow2").is_ok());
+        assert!(parse_fetch_url("http://mirror.example/focal.img").is_ok());
+        assert!(parse_fetch_url("file:///etc/passwd").is_err());
+        assert!(parse_fetch_url("ftp://mirror.example/x.raw").is_err());
+        assert!(parse_fetch_url("https://user:pw@mirror.example/x.qcow2").is_err());
+        assert!(parse_fetch_url("not a url").is_err());
+    }
+
+    #[test]
+    fn fetch_name_derivation_and_extension() {
+        let url = reqwest::Url::parse("https://mirror.example/images/focal-server.qcow2").unwrap();
+        assert_eq!(derive_fetch_name(&url, None).unwrap(), "focal-server.qcow2");
+        // Explicit name overrides the URL.
+        assert_eq!(
+            derive_fetch_name(&url, Some("my-disk.img")).unwrap(),
+            "my-disk.img"
+        );
+        // A URL without a disk-image extension needs an explicit, valid name.
+        let bare = reqwest::Url::parse("https://mirror.example/download").unwrap();
+        assert!(derive_fetch_name(&bare, None).is_err());
+        assert!(derive_fetch_name(&bare, Some("disk.raw")).is_ok());
+        assert!(derive_fetch_name(&bare, Some("disk.txt")).is_err());
+        // A separator in an explicit name is rejected (no traversal).
+        assert!(derive_fetch_name(&bare, Some("../x.qcow2")).is_err());
+    }
+
+    #[test]
+    fn private_and_special_addresses_are_blocked() {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.5.5",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "100.64.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fd12::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(
+                ip_is_disallowed(ip.parse().unwrap()),
+                "{ip} should be blocked"
+            );
+        }
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(
+                !ip_is_disallowed(ip.parse().unwrap()),
+                "{ip} should be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_public_url_rejects_private_literals() {
+        assert!(
+            validate_public_url(&reqwest::Url::parse("http://127.0.0.1/x.img").unwrap())
+                .await
+                .is_err()
+        );
+        assert!(validate_public_url(
+            &reqwest::Url::parse("http://169.254.169.254/latest").unwrap()
+        )
+        .await
+        .is_err());
+        assert!(
+            validate_public_url(&reqwest::Url::parse("https://1.1.1.1/x.qcow2").unwrap())
+                .await
+                .is_ok()
+        );
+    }
 
     #[test]
     fn filenames_are_validated_per_kind() {

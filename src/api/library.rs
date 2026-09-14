@@ -13,13 +13,16 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use daygleve_schema::audit::AuditOutcome;
 use daygleve_schema::auth::Permission;
 use daygleve_schema::storage_file::{
-    ImportDiskImageRequest, ImportDiskImageResponse, StorageFile, StorageFileKind,
+    DiskImageFetch, FetchDiskImageRequest, ImportDiskImageRequest, ImportDiskImageResponse,
+    StorageFile, StorageFileKind,
 };
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
+use crate::services::audit::NewAuditEvent;
 use crate::state::AppState;
 
 /// Small (limited-body) library routes: list and delete.
@@ -32,6 +35,8 @@ pub fn routes() -> Router<AppState> {
         .route("/storage/disk-images", get(list_disk_images))
         .route("/storage/disk-images/{name}", delete(delete_disk_image))
         .route("/storage/disk-images/import", post(import_disk_image))
+        .route("/storage/disk-images/fetch", post(fetch_disk_image))
+        .route("/storage/disk-images/fetches", get(list_disk_image_fetches))
 }
 
 /// Large-body upload routes, mounted outside the global request-body limit.
@@ -152,6 +157,41 @@ async fn import_disk_image(
             size_gib: disk.size_gib,
         }),
     ))
+}
+
+/// Start downloading a disk image from a URL into the disk-image library. The
+/// download runs in the background; the response reports the initial status
+/// (`202 Accepted`). Poll `GET /storage/disk-images/fetches` for progress.
+async fn fetch_disk_image(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<FetchDiskImageRequest>,
+) -> ApiResult<(StatusCode, Json<DiskImageFetch>)> {
+    user.require(Permission::StorageWrite)?;
+    let fetch = state.services.library.start_fetch(req).await?;
+    state
+        .services
+        .audit
+        .record(NewAuditEvent {
+            actor_id: Some(user.0.user.id.clone()),
+            actor: user.0.user.username.clone(),
+            action: "disk_image.fetch".to_string(),
+            resource_type: Some("disk_image".to_string()),
+            resource_id: Some(fetch.name.clone()),
+            outcome: AuditOutcome::Success,
+            message: Some(format!("fetching from {}", fetch.url)),
+            ..Default::default()
+        })
+        .await;
+    Ok((StatusCode::ACCEPTED, Json(fetch)))
+}
+
+async fn list_disk_image_fetches(
+    user: AuthUser,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<DiskImageFetch>>> {
+    user.require(Permission::StorageRead)?;
+    Ok(Json(state.services.library.list_fetches().await))
 }
 
 async fn delete_iso(
