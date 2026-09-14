@@ -7,7 +7,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use daygleve_schema::auth::Permission;
-use daygleve_schema::lxc::{CreateLxcRequest, Lxc, LxcPowerRequest, LxcSummary, UpdateLxcRequest};
+use daygleve_schema::lxc::{
+    CreateLxcRequest, Lxc, LxcPowerRequest, LxcSummary, MigrateLxcRootfsRequest, UpdateLxcRequest,
+};
 use daygleve_schema::lxc_snapshot::{CreateLxcSnapshotRequest, LxcSnapshot};
 use daygleve_schema::operations::OperationRecord;
 use daygleve_schema::vm::ConsoleTicket;
@@ -25,6 +27,7 @@ pub fn routes() -> Router<AppState> {
             get(get_one).patch(update).delete(delete),
         )
         .route("/containers/{id}/power", post(power))
+        .route("/containers/{id}/rootfs/migrate", post(migrate_rootfs))
         .route(
             "/containers/{id}/snapshots",
             get(list_snapshots).post(create_snapshot),
@@ -238,4 +241,33 @@ async fn power(
         )
         .await?;
     Ok((StatusCode::ACCEPTED, Json(ct)))
+}
+
+/// Move the container's rootfs to another ZFS dataset/pool (offline).
+async fn migrate_rootfs(
+    user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<MigrateLxcRootfsRequest>,
+) -> ApiResult<(StatusCode, Json<OperationRecord>)> {
+    user.require(Permission::LxcWrite)?;
+    let services = state.services.clone();
+    let operations = services.operations.clone();
+    let resource_id = id.clone();
+    let actor = user.0.user.id.clone();
+    let record = operations
+        .enqueue(
+            "container.migrate_rootfs",
+            Some("container"),
+            Some(&resource_id),
+            Some(&actor),
+            move |ops, handle| async move {
+                ops.update_progress(&handle.id, 10, Some("migrating rootfs"))
+                    .await?;
+                services.lxc.migrate_rootfs(&id, req).await?;
+                Ok(Some("migrated container rootfs".to_string()))
+            },
+        )
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(record)))
 }

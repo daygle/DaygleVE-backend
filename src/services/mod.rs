@@ -43,6 +43,7 @@
 //! AppArmor validation remains a deployment requirement.
 
 pub mod acme;
+pub mod alerts;
 pub mod auth;
 pub mod backup;
 pub mod command;
@@ -151,6 +152,8 @@ pub struct Services {
     pub snapshot_schedules: Arc<snapshot_schedule::SnapshotScheduleService>,
     /// Email/webhook notification channels. Emits event alerts to subscribers.
     pub notifications: Arc<notification::NotificationService>,
+    /// Metric-threshold alert rules, evaluated on the metrics tick.
+    pub alerts: alerts::AlertService,
     /// Network storage shares (NFS/CIFS). Shared with the KVM service so it can
     /// enumerate ISOs living on mounted shares.
     pub shares: Arc<shares::ShareService>,
@@ -162,6 +165,7 @@ pub struct Services {
 impl Services {
     pub fn new(config: Arc<Config>) -> Self {
         let shares = Arc::new(shares::ShareService::new(config.clone()));
+        let notifications = Arc::new(notification::NotificationService::new(config.clone()));
         Self {
             auth: auth::AuthService::new(config.clone()),
             backup: Arc::new(backup::BackupService::new(config.clone())),
@@ -174,13 +178,14 @@ impl Services {
             gpu: gpu::GpuService::new(),
             pci: pci::PciService::new(),
             usb: usb::UsbService::new(),
-            metrics: metrics::MetricsService::new(),
+            metrics: metrics::MetricsService::new().with_history_dir(&config.state_dir),
             pools: pool::PoolService::new(config.clone()),
             schedules: Arc::new(schedule::ScheduleService::new(config.clone())),
             snapshot_schedules: Arc::new(snapshot_schedule::SnapshotScheduleService::new(
                 config.clone(),
             )),
-            notifications: Arc::new(notification::NotificationService::new(config.clone())),
+            notifications: notifications.clone(),
+            alerts: alerts::AlertService::new(config.clone(), notifications),
             acme: Arc::new(acme::AcmeService::new(config.clone())),
             shares,
         }

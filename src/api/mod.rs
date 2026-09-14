@@ -4,6 +4,7 @@
 //! matching the OpenAPI document in DaygleVE-schema. Handlers are thin: they
 //! authenticate, authorize, delegate to a service, and serialise schema types.
 
+mod alerts;
 mod containers;
 mod gpus;
 mod health;
@@ -54,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .merge(library::routes())
         .merge(network::routes())
         .merge(notifications::routes())
+        .merge(alerts::routes())
         .merge(operations::routes())
         .merge(security::routes())
         .merge(gpus::routes())

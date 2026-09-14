@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 use daygleve_schema::vm::{
     AttachVmPciRequest, AttachVmUsbRequest, CloneVmRequest, CloudInitRequest, ConsoleTicket,
     CreateVmRequest, CreateVmSnapshotRequest, DiskBus, DisplayProtocol, Firmware, GuestAgentInfo,
-    IsoImage, NicModel, ResizeVmDiskRequest, UpdateVmRequest, Vm, VmDisk, VmFirewall,
-    VmFirewallAction, VmFirewallDirection, VmNic, VmPowerAction, VmPowerResponse, VmSnapshot,
-    VmSnapshotType, VmState, VmSummary,
+    IsoImage, MigrateVmDiskRequest, NicModel, ResizeVmDiskRequest, UpdateVmRequest, Vm, VmDisk,
+    VmFirewall, VmFirewallAction, VmFirewallDirection, VmNic, VmPowerAction, VmPowerResponse,
+    VmSnapshot, VmSnapshotType, VmState, VmSummary,
 };
 
 use crate::config::Config;
@@ -1115,6 +1115,89 @@ impl KvmService {
         if !running {
             self.define(&vm).await?;
         }
+        Ok(vm)
+    }
+
+    /// Move one of the VM's disks to a different ZFS dataset (possibly another
+    /// pool) by streaming its contents with `zfs send | receive`. The VM must
+    /// be stopped: a consistent point-in-time copy needs no live writes. The
+    /// new dataset inherits the source's volsize; the old dataset is destroyed
+    /// only after the copy verifies, so a failed migration leaves the original
+    /// untouched.
+    pub async fn migrate_disk(&self, id: &str, req: MigrateVmDiskRequest) -> ApiResult<Vm> {
+        let mut vm = self.get_stored(id).await?;
+        let source_dataset = vm
+            .disks
+            .get(req.disk_index)
+            .ok_or_else(|| {
+                AppError::not_found(format!("vm {id} has no disk at index {}", req.disk_index))
+            })?
+            .dataset
+            .clone();
+        let source = ensure_safe_zfs_dataset(source_dataset.trim())?;
+        let target = ensure_safe_zfs_dataset(&req.target_dataset)?;
+        if source == target {
+            return Err(AppError::validation(
+                "target dataset is the same as the source",
+            ));
+        }
+        if self.live_state(id).await == Some(VmState::Running) {
+            return Err(AppError::conflict(
+                "stop the VM before migrating a disk; live migration is not supported",
+            ));
+        }
+        let exists = command::run_optional("zfs", &["list", "-H", "-o", "name", target]).await?;
+        if exists.is_some() {
+            return Err(AppError::conflict(format!(
+                "target dataset {target} already exists"
+            )));
+        }
+
+        // Snapshot -> send to temp file -> receive -> re-point -> destroy old.
+        // The temp file (same pattern as backup send/restore) keeps the broker
+        // protocol happy: `zfs send` and `zfs receive` are separate processes,
+        // never a shell pipeline.
+        let tag = format!("migrate-{}", chrono::Utc::now().timestamp());
+        let snapshot = format!("{source}@{tag}");
+        command::run_ok("zfs", &["snapshot", &snapshot]).await?;
+        let temp = self.config.state_dir.join("tmp").join(format!(
+            "disk-migrate-{}-{}.zfs",
+            crate::services::ensure_safe_id(id).map_err(|e| AppError::internal(e.message()))?,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        if let Some(parent) = temp.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let copy = async {
+            command::stream_to_file("zfs", &["send", &snapshot], &temp).await?;
+            command::stream_from_file("zfs", &["receive", "-F", target], &temp).await
+        };
+        if let Err(e) = copy.await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            let _ = command::run_ok("zfs", &["destroy", &snapshot]).await;
+            return Err(e);
+        }
+        let _ = tokio::fs::remove_file(&temp).await;
+
+        // The received dataset carries the migration snapshot; strip it so the
+        // target is a clean volume, and confirm the new zvol reads back.
+        let _ = command::run_ok("zfs", &["destroy", &format!("{target}@{tag}")]).await;
+        command::run_ok("zfs", &["list", "-H", "-o", "name", target]).await?;
+
+        // Re-point the record and re-define so the persistent XML matches.
+        vm.disks[req.disk_index].dataset = target.to_string();
+        vm.updated_at = Some(now_ts());
+        self.store.put(id, &vm).await?;
+        self.define(&vm).await?;
+
+        // Only now destroy the old dataset: the VM no longer references it.
+        command::run_ok("zfs", &["destroy", "-r", source]).await?;
+        tracing::info!(
+            vm_id = %id,
+            from = %source,
+            to = %vm.disks[req.disk_index].dataset,
+            "migrated vm disk"
+        );
         Ok(vm)
     }
 

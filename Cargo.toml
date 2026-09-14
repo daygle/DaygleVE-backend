@@ -61,6 +61,5 @@ x509-parser = "0.16"
 [target.'cfg(unix)'.dependencies]
 pty-process = { version = "0.4", features = ["async"] }
 
-
 [lints.rust]
 unsafe_code = "forbid"
