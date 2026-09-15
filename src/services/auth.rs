@@ -298,12 +298,16 @@ impl AuthService {
             .map(|s| (s.user.clone(), s.must_change_password, s.two_factor.enabled))
             .ok_or_else(|| AppError::unauthorized("unknown user"))?;
 
+        // Root-scope permissions from the user's own roles. The request
+        // extractor enriches this with path-scoped ACL grants and recomputes the
+        // effective set; this is the sensible default when resolved standalone.
         let permissions = effective_permissions(&user.roles);
         Ok(CurrentUser {
             user,
             permissions,
             must_change_password,
             two_factor_enabled,
+            grants: Vec::new(),
         })
     }
 
@@ -346,9 +350,8 @@ impl AuthService {
                 "username must be 1..=64 characters with no whitespace or control characters",
             ));
         }
-        if req.roles.is_empty() {
-            return Err(AppError::validation("at least one role is required"));
-        }
+        // Empty roles are allowed: such an account has no node-wide access and
+        // acts only where an explicit ACL entry grants it (a scoped-only user).
         if req.password.len() < MIN_PASSWORD_LEN {
             return Err(AppError::validation(format!(
                 "password must be at least {MIN_PASSWORD_LEN} characters"
@@ -400,9 +403,8 @@ impl AuthService {
             .ok_or_else(|| AppError::not_found("user not found"))?;
 
         if let Some(roles) = req.roles {
-            if roles.is_empty() {
-                return Err(AppError::validation("at least one role is required"));
-            }
+            // Empty roles are allowed (scoped-only user); access can still come
+            // from explicit ACL entries.
             // Don't let the last administrator lose their admin role.
             let removes_admin =
                 stored.user.roles.contains(&Role::Admin) && !roles.contains(&Role::Admin);
