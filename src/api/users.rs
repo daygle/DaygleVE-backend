@@ -83,6 +83,9 @@ async fn delete(
 ) -> ApiResult<StatusCode> {
     user.require(Permission::UserAdmin)?;
     state.services.auth.delete_user(&id).await?;
+    // Remove any path-scoped grants for the deleted account so no dangling ACL
+    // entries remain (and can't apply if the id is ever reused).
+    state.services.acl.remove_subject(&id).await?;
     state
         .services
         .audit

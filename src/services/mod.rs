@@ -42,6 +42,7 @@
 //! broker protocol independently validates requests; real-host systemd and
 //! AppArmor validation remains a deployment requirement.
 
+pub mod acl;
 pub mod acme;
 pub mod alerts;
 pub mod api_token;
@@ -171,6 +172,9 @@ pub struct Services {
     /// Host (node) firewall: nftables `input`-hook filtering of traffic to the
     /// node itself, independent of the per-VM guest firewall.
     pub firewall: firewall::HostFirewallService,
+    /// Path-scoped access control (ACL). Resolves a caller's effective
+    /// permissions at a resource path.
+    pub acl: acl::AclService,
 }
 
 impl Services {
@@ -201,6 +205,7 @@ impl Services {
             api_tokens: api_token::ApiTokenService::new(config.clone()),
             audit: Arc::new(audit::AuditService::new(config.clone())),
             firewall: firewall::HostFirewallService::new(config.clone()),
+            acl: acl::AclService::new(config.clone()),
             shares,
         }
     }

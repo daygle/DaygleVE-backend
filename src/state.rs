@@ -31,6 +31,8 @@ impl AppState {
         let config = Arc::new(config);
         let services = Arc::new(Services::new(config.clone()));
         services.auth.load_or_seed().await?;
+        // Load persisted ACL entries into the cache before serving requests.
+        services.acl.load().await?;
         // Re-apply the persisted host firewall so the node's input filtering
         // survives a restart (best-effort; logs on failure).
         services.firewall.apply_persisted().await;
